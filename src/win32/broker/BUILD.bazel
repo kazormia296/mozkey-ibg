@@ -81,8 +81,8 @@ mozc_cc_library(
     tags = MOZC_TAGS.WIN_ONLY,
     target_compatible_with = ["@platforms//os:windows"],
     deps = [
-        "//base:run_level",
         "//base:const",
+        "//base:run_level",
         "//base:system_util",
         "//client",
         "//client:client_interface",
