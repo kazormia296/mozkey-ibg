@@ -84,5 +84,40 @@ TEST(ZenzOutputValidatorTest, RestoreUserVisibleSymbolStyleFullwidthAsciiPunct) 
             "note:A;B,C.");
 }
 
+TEST(ZenzOutputValidatorTest, RejectsReportedPathologicalDoumekiOutput) {
+  ZenzValidationInput input;
+  input.key = "どうめき";
+  input.mozc_value = "百目鬼";
+  input.zenz_value = "⼊⼊彪瞰矜矜矜矜矜";
+  input.min_key_length = 2;
+
+  const ZenzValidationResult result = ZenzOutputValidator().Validate(input);
+  EXPECT_FALSE(result.accept);
+  EXPECT_EQ(result.reason, "unexpected_cjk_component");
+}
+
+TEST(ZenzOutputValidatorTest, RejectsNewRepeatedIdeographRun) {
+  ZenzValidationInput input;
+  input.key = "どうめき";
+  input.mozc_value = "百目鬼";
+  input.zenz_value = "彪瞰矜矜矜矜矜";
+  input.min_key_length = 2;
+
+  const ZenzValidationResult result = ZenzOutputValidator().Validate(input);
+  EXPECT_FALSE(result.accept);
+  EXPECT_EQ(result.reason, "repeated_ideograph");
+}
+
+TEST(ZenzOutputValidatorTest, AllowsOrdinaryRareNameCorrection) {
+  ZenzValidationInput input;
+  input.key = "どうめき";
+  input.mozc_value = "道目木";
+  input.zenz_value = "百目鬼";
+  input.min_key_length = 2;
+
+  const ZenzValidationResult result = ZenzOutputValidator().Validate(input);
+  EXPECT_TRUE(result.accept);
+}
+
 }  // namespace
 }  // namespace mozc::session

@@ -86,6 +86,8 @@ mozc_cc_library(
         "//prediction:__pkg__",
         # For //rewriter:language_aware_rewriter.
         "//rewriter:__pkg__",
+        # For Zenz protection of the pinned project dictionary.
+        "//session:__pkg__",
     ],
     deps = [
         ":dictionary_token",

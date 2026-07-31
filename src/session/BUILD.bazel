@@ -119,6 +119,8 @@ mozc_cc_library(
         "//composer:key_event_util",
         "//composer:table",
         "//converter:converter_interface",
+        "//dictionary:dictionary_interface",
+        "//dictionary:project_dictionary",
         "//engine:engine_converter_interface",
         "//engine:engine_interface",
         "//protocol:commands_cc_proto",

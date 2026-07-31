@@ -125,6 +125,7 @@ class SessionTestPeer : testing::TestPeer<Session> {
   PEER_VARIABLE(live_conversion_preedit_);
   PEER_VARIABLE(live_conversion_value_);
   PEER_VARIABLE(live_conversion_preedit_output_);
+  PEER_VARIABLE(live_conversion_protected_spans_);
   PEER_VARIABLE(pending_live_conversion_suggestion_candidate_window_);
   PEER_VARIABLE(live_conversion_suggestion_candidate_window_);
   PEER_VARIABLE(zenz_live_visible_generation_);
@@ -3174,6 +3175,71 @@ TEST_F(SessionTest,
             commands::SessionCommand::APPLY_ZENZ_LIVE_CORRECTION);
   ASSERT_TRUE(command.output().callback().has_delay_millisec());
   EXPECT_EQ(command.output().callback().delay_millisec(), 1);
+}
+
+TEST_F(SessionTest,
+       ZenzProtectsPinnedProjectDictionaryWithoutCandidateProvenance) {
+  MockEngine engine;
+  std::shared_ptr<MockConverter> converter = CreateEngineConverterMock(&engine);
+
+  Session session(engine);
+  SessionTestPeer session_peer(session);
+  InitSessionToPrecomposition(&session);
+
+  config::Config config;
+  GetSessionTestConfig(&config);
+  config.set_use_live_conversion(true);
+  config.set_live_conversion_delay_msec(0);
+  config.set_live_conversion_min_key_length(4);
+  config.set_use_zenz_live_correction(true);
+  config.set_zenz_live_correction_delay_msec(1);
+  config.set_zenz_live_correction_min_key_length(4);
+  session.SetConfig(config);
+
+  auto snapshot = dictionary::ProjectDictionarySnapshot::Create(
+      1, "grimodex-project", "sha256:doumeki",
+      {dictionary::ProjectDictionaryEntry{
+          .key = "どうめき",
+          .value = "百目鬼",
+          .cost = 100,
+          .lid = 10,
+          .rid = 10,
+          .priority = 3,
+          .entry_id = "doumeki",
+      }});
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status();
+  engine::EngineConverterInterface* engine_converter =
+      session_peer.context_()->mutable_converter();
+  ASSERT_EQ(engine_converter->PublishProjectDictionary(*snapshot),
+            dictionary::ProjectDictionaryRegistry::PublishResult::kApplied);
+
+  // Deliberately omit PROJECT_DICTIONARY from the visible candidate.  The
+  // pinned Grimodex snapshot must still protect its selected surface.
+  Segments segments;
+  Segment* segment = segments.add_segment();
+  segment->set_key("どうめき");
+  AddCandidate("どうめき", "百目鬼", segment);
+
+  EXPECT_CALL(*converter, StartConversion(_, _))
+      .Times(1)
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  commands::Command command;
+  InsertCharacterString("どうめき", "doumeki", &session, &command);
+
+  ASSERT_EQ(session.context().state(), ImeContext::CONVERSION);
+  ASSERT_TRUE(command.output().zenz_live_correction_pending());
+  ASSERT_EQ(session_peer.live_conversion_protected_spans_().size(), 1);
+  const ProtectedConversionSpan& span =
+      session_peer.live_conversion_protected_spans_().front();
+  EXPECT_EQ(span.key, "どうめき");
+  EXPECT_EQ(span.value, "百目鬼");
+  EXPECT_EQ(span.tier, ProtectedConversionSpan::Tier::kUserPreferred);
+  EXPECT_FALSE(span.repairable);
+
+  ASSERT_EQ(session_peer.pending_zenz_live_().protected_spans.size(), 1);
+  EXPECT_EQ(session_peer.pending_zenz_live_().protected_spans.front().value,
+            "百目鬼");
 }
 
 TEST_F(SessionTest,
