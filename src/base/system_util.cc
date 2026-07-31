@@ -507,7 +507,14 @@ std::string GetMozcInstallDirFromRegistry() {
   if (result != ERROR_SUCCESS || type != REG_SZ) {
     return "";
   }
-  return FileUtil::Dirname(win32::WideToUtf8(buffer));
+  const std::string tip_path = win32::WideToUtf8(buffer);
+  // Do not let a stale or malformed COM registration override the known
+  // install directory.  In particular, this lets an upgrade repair a TIP
+  // path written by an older broken installer.
+  if (!FileUtil::FileExists(tip_path).ok()) {
+    return "";
+  }
+  return FileUtil::Dirname(tip_path);
 }
 
 }  // namespace
@@ -531,7 +538,7 @@ std::string SystemUtil::GetServerDirectory() {
       kProductNameInEnglish);
 #else   // GOOGLE_JAPANESE_INPUT_BUILD
   return FileUtil::JoinPath(ProgramFilesX86Cache::GetInstance()->path(),
-                            kProductNameInEnglish);
+                            kProductInstallDirectoryName);
 #endif  // GOOGLE_JAPANESE_INPUT_BUILD
 
 #elif defined(__APPLE__)

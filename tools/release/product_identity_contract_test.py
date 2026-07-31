@@ -104,7 +104,13 @@ class ProductIdentityContractTest(unittest.TestCase):
         self.assertIn('Name="MozkeyIbGCacheService"', installer)
         self.assertIn('Name="Mozkey IbG Prelauncher"', installer)
         self.assertNotIn("Terminal Server\\SysProcs", installer)
+        self.assertIn(
+            'kProductInstallDirectoryName[] = "MozkeyIbG"', constants
+        )
         self.assertIn('L"MozkeyIbGCacheService"', constants)
+        system_util = read("src/base/system_util.cc")
+        self.assertIn("kProductInstallDirectoryName", system_util)
+        self.assertIn("FileUtil::FileExists(tip_path).ok()", system_util)
 
         for upstream_identifier in (
             "10A67BC8-22FA-4A59-90DC-2546652C56BF",

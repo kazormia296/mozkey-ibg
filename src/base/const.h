@@ -101,6 +101,10 @@ inline constexpr wchar_t kElevatedProcessDisabledKey[] =
     L"Software\\Policies\\Google\\Google Japanese Input\\Preferences";
 #else   // !GOOGLE_JAPANESE_INPUT_BUILD
 inline constexpr char kCompanyNameInEnglish[] = "Grimodex";
+// Keep the filesystem identity separate from the user-facing product name.
+// The Windows installer uses this exact directory name under Program Files
+// (x86), including while the TSF COM registration does not exist yet.
+inline constexpr char kProductInstallDirectoryName[] = "MozkeyIbG";
 // Use Local prefix so that modules running under AppContainer can access.
 inline constexpr char kEventPathPrefix[] = "Local\\MozkeyIbG.event.";
 inline constexpr char kMutexPathPrefix[] = "Local\\MozkeyIbG.mutex.";
