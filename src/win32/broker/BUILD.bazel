@@ -33,6 +33,7 @@ load(
     "//:build_defs.bzl",
     "MOZC_TAGS",
     "mozc_cc_library",
+    "mozc_select",
     "mozc_win32_cc_prod_binary",
     "mozc_win32_resource_from_template",
 )
@@ -81,9 +82,15 @@ mozc_cc_library(
     target_compatible_with = ["@platforms//os:windows"],
     deps = [
         "//base:run_level",
+        "//base:const",
         "//base:system_util",
         "//client",
         "//client:client_interface",
+        "//ipc:named_event",
         "//renderer:renderer_client",
-    ],
+        "@com_google_absl//absl/time",
+    ] + mozc_select(
+        oss_windows = ["//grimodex:desktop_consumer_heartbeat"],
+        prod_windows = [],
+    ),
 )

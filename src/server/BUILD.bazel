@@ -104,13 +104,13 @@ mozc_cc_library(
         "//base:system_util",
         "//base:vlog",
         "//config:stats_config_util",
-        "//grimodex:desktop_consumer_heartbeat",
         "//session:session_server",
         "@com_google_absl//absl/base:config",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
     ] + mozc_select(
+        macos = ["//grimodex:desktop_consumer_heartbeat"],
         windows = ["//base/win32:winmain"],
     ),
 )

@@ -114,6 +114,11 @@ inline constexpr char kMozcTIP32[] = "mozc_tip32.dll";
 inline constexpr char kMozcTIP64[] = "mozc_tip64.dll";
 inline constexpr char kMozcTIP64X[] = "mozc_tip64x.dll";
 inline constexpr char kMozcBroker[] = "mozc_broker.exe";
+// The medium-integrity Windows broker owns the Grimodex consumer heartbeat.
+// The MSI notifies this event before proving the exact installed broker
+// process absent and removing the consumer record.
+inline constexpr char kGrimodexConsumerBrokerShutdownEvent[] =
+    "grimodex_consumer_broker_shutdown";
 inline constexpr char kMozcTool[] = "mozc_tool.exe";
 inline constexpr char kMozcRenderer[] = "mozc_renderer.exe";
 inline constexpr char kMozcCacheServiceExeName[] = "mozc_cache_service.exe";

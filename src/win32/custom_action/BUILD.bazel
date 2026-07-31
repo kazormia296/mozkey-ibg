@@ -65,6 +65,7 @@ mozc_win32_cc_prod_binary(
         "//bazel/win32:msi",
         "//client",
         "//client:client_interface",
+        "//ipc:named_event",
         "//renderer:renderer_client",
         "//win32/base:input_dll",
         "//win32/base:omaha_util",

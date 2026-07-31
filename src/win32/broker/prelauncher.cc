@@ -31,10 +31,17 @@
 
 #include <memory>
 
+#include "absl/time/time.h"
+#include "base/const.h"
 #include "base/win32/win_util.h"
 #include "client/client.h"
 #include "client/client_interface.h"
+#include "ipc/named_event.h"
 #include "renderer/renderer_client.h"
+
+#ifndef GOOGLE_JAPANESE_INPUT_BUILD
+#include "grimodex/desktop_consumer_heartbeat.h"
+#endif  // !GOOGLE_JAPANESE_INPUT_BUILD
 
 namespace mozc {
 namespace win32 {
@@ -55,6 +62,21 @@ int RunPrelaunchProcesses(int argc, char *argv[]) {
     return kErrorLevelGeneralError;
   }
 
+#ifndef GOOGLE_JAPANESE_INPUT_BUILD
+  // mozc_server is intentionally launched at low integrity. Publishing the
+  // heartbeat there would either fail against the normal-integrity Roaming
+  // AppData root or require weakening that shared root, which also contains
+  // Grimodex-owned state.json and project snapshots. Keep one medium-integrity
+  // broker alive instead. Named-event ownership makes concurrently launched
+  // prelaunchers one-shot helpers while the owner retains the refresh loop.
+  NamedEventListener shutdown_listener(
+      kGrimodexConsumerBrokerShutdownEvent);
+  std::unique_ptr<grimodex::DesktopConsumerHeartbeat> consumer_heartbeat;
+  if (shutdown_listener.IsOwner()) {
+    consumer_heartbeat = grimodex::StartDesktopConsumerHeartbeat();
+  }
+#endif  // !GOOGLE_JAPANESE_INPUT_BUILD
+
   {
     std::unique_ptr<client::ClientInterface> converter_client(
         client::ClientFactory::NewClient());
@@ -68,6 +90,16 @@ int RunPrelaunchProcesses(int argc, char *argv[]) {
     renderer_client->set_suppress_error_dialog(true);
     renderer_client->Activate();
   }
+
+#ifndef GOOGLE_JAPANESE_INPUT_BUILD
+  if (consumer_heartbeat != nullptr) {
+    // A negative duration means an infinite wait. The MSI signals this event
+    // before replacing/removing the broker and deleting its consumer record.
+    if (!shutdown_listener.Wait(absl::Seconds(-1))) {
+      return kErrorLevelGeneralError;
+    }
+  }
+#endif  // !GOOGLE_JAPANESE_INPUT_BUILD
 
   return kErrorLevelSuccess;
 }

@@ -103,6 +103,7 @@ class ProductIdentityContractTest(unittest.TestCase):
         self.assertIn('Directory Id="MozkeyIbGDir" Name="MozkeyIbG"', installer)
         self.assertIn('Name="MozkeyIbGCacheService"', installer)
         self.assertIn('Name="Mozkey IbG Prelauncher"', installer)
+        self.assertIn("kGrimodexConsumerBrokerShutdownEvent", constants)
         self.assertNotIn("Terminal Server\\SysProcs", installer)
         self.assertIn(
             'kProductInstallDirectoryName[] = "MozkeyIbG"', constants
@@ -121,6 +122,19 @@ class ProductIdentityContractTest(unittest.TestCase):
             "DD94B570-B5E2-4100-9D42-61930C611D8A",
             installer_builder,
         )
+
+    def test_windows_heartbeat_is_owned_by_normal_integrity_broker(self) -> None:
+        prelauncher = read("src/win32/broker/prelauncher.cc")
+        server = read("src/server/mozc_server.cc")
+
+        start = prelauncher.index("StartDesktopConsumerHeartbeat()")
+        launch_server = prelauncher.index("EnsureConnection()")
+        wait = prelauncher.index("shutdown_listener.Wait")
+        self.assertLess(start, launch_server)
+        self.assertLess(launch_server, wait)
+        self.assertIn("kGrimodexConsumerBrokerShutdownEvent", prelauncher)
+        self.assertIn("#if defined(__APPLE__)", server)
+        self.assertNotIn("#if defined(_WIN32)\n  std::unique_ptr<grimodex", server)
 
     def test_macos_bundle_receipt_and_launch_agents_are_fork_specific(self) -> None:
         config = read("src/config.bzl")

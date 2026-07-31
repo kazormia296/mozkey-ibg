@@ -46,18 +46,27 @@ view cannot be rebound to the current composition.
 
 ## Consumer and package lifecycle
 
-Mozkey-branded desktop server processes publish a private, atomic consumer
-heartbeat every 15 minutes:
+Mozkey-branded desktop processes publish a private, atomic consumer heartbeat
+every 15 minutes:
 
 - Windows: `consumers/tsf-mozkey-ibg.json`
 - macOS: `consumers/imkit-mozkey-ibg.json`
 
-The Windows MSI uses a checked commit action for final removal. It stops only
-the exact installed `mozc_server.exe`, protects against PID reuse, and requires
-two consecutive process snapshots proving that executable absent before the
-secure registrar may remove `tsf-mozkey-ibg`. If quiescence or registrar validation
-fails, uninstall reports failure and preserves the heartbeat instead of
-silently completing with an unsafe or immediately republished record.
+On Windows, the normal-integrity `mozc_broker.exe` owns the refresh loop. The
+converter remains low-integrity and never receives write access to the shared
+Grimodex root that also contains `state.json` and `projects/`. The first broker
+started for the user remains resident; concurrent prelaunchers only ensure the
+converter and renderer are available, then exit. On macOS, the converter owns
+the refresh loop.
+
+The Windows MSI uses a checked commit action for final removal. It signals and
+stops the exact installed `mozc_broker.exe`, also stops any legacy heartbeat-
+publishing `mozc_server.exe`, protects against PID reuse, and requires two
+consecutive process snapshots proving those executables absent before the
+secure registrar may remove `tsf-mozkey-ibg`. If quiescence or registrar
+validation fails, uninstall reports failure and preserves the heartbeat
+instead of silently completing with an unsafe or immediately republished
+record.
 
 The macOS uninstaller first boots the per-user Converter LaunchAgent out of
 the GUI domain and verifies that `MozkeyIbGConverter` has exited. It removes the
