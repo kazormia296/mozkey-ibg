@@ -105,6 +105,7 @@ void MozcState::UpdatePreeditMethod() {
   }
   preedit_method_ = config.has_preedit_method() ? config.preedit_method()
                                                 : mozc::config::Config::ROMAN;
+  show_live_conversion_reading_ = config.show_live_conversion_ruby_window();
   std::string error;
   mozc::commands::Output raw_response;
   mozc::commands::CompositionMode mode = composition_mode_;
@@ -523,6 +524,10 @@ void MozcState::SetPreeditInfo(Text preedit_info) {
 
 void MozcState::SetAuxString(const std::string& str) { aux_ = str; }
 
+void MozcState::SetLiveConversionReading(const std::string& reading) {
+  live_conversion_reading_ = reading;
+}
+
 void MozcState::SetCompositionMode(mozc::commands::CompositionMode mode,
                                    bool updateUI) {
   composition_mode_ = mode;
@@ -547,13 +552,20 @@ void MozcState::ClearAll() {
   live_conversion_timer_.reset();
   SetPreeditInfo(Text());
   SetAuxString("");
+  SetLiveConversionReading("");
   ic_->inputPanel().reset();
   url_.clear();
 }
 
 void MozcState::DrawAll() {
   std::string aux;
+  if (show_live_conversion_reading_) {
+    aux = live_conversion_reading_;
+  }
   if (!aux_.empty()) {
+    if (!aux.empty()) {
+      aux += " ";
+    }
     aux += "[";
     aux += aux_;
     aux += "]";
@@ -564,16 +576,18 @@ void MozcState::DrawAll() {
       preedit.setCursor(0);
     }
     ic_->inputPanel().setClientPreedit(preedit);
-    if (!aux_.empty()) {
+    if (!aux.empty()) {
       ic_->inputPanel().setAuxUp(Text(aux));
     }
   } else {
     Text preedit = preedit_;
     if (!preedit.empty()) {
-      preedit.append(" ");
-      preedit.append(aux);
+      if (!aux.empty()) {
+        preedit.append(" ");
+        preedit.append(aux);
+      }
       ic_->inputPanel().setPreedit(preedit);
-    } else if (!aux_.empty()) {
+    } else if (!aux.empty()) {
       ic_->inputPanel().setAuxUp(Text(aux));
     }
   }

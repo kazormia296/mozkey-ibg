@@ -507,7 +507,8 @@ message Config {
   // Empty string means the platform/default font.
   optional string candidate_ruby_font_name = 134 [default = ""];
 
-  // Show ruby window during live conversion on Windows.
+  // Show the typed reading during live conversion. Windows uses a separate
+  // ruby window; Fcitx displays it above the candidate list.
   optional bool show_live_conversion_ruby_window = 135 [default = true];
 
 

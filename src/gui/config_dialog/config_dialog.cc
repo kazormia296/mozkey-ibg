@@ -514,7 +514,10 @@ ConfigDialog::ConfigDialog()
   useDarkModeCandidateWindow->hide();
   candidateRubyFontLabel->hide();
   candidateRubyFontComboBox->hide();
+#ifdef __APPLE__
+  // The shared reading option is implemented by Windows and Fcitx5.
   showLiveConversionRubyWindow->hide();
+#endif  // __APPLE__
 
   // Preedit display color customization is available only on Windows TSF.
   preeditDisplayColorGroupBox->hide();

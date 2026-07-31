@@ -259,6 +259,7 @@ mozc_cc_library(
         "//grimodex:protocol_v1_secure_reader",
         "//protocol:candidate_window_cc_proto",
         "//protocol:commands_cc_proto",
+        "//renderer:live_conversion_reading",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/time",
         "@fcitx5",

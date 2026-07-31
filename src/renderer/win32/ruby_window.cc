@@ -10,6 +10,7 @@
 #include "protocol/commands.pb.h"
 #include "protocol/config.pb.h"
 #include "protocol/renderer_command.pb.h"
+#include "renderer/live_conversion_reading.h"
 #include "renderer/renderer_style_handler.h"
 #include "renderer/win32/win32_dpi_util.h"
 #include "renderer/win32/win32_renderer_util.h"
@@ -216,49 +217,6 @@ void RubyWindow::ClearPlacementTracking() {
 void RubyWindow::Hide() {
   ClearPlacementTracking();
   HideWindowOnly();
-}
-
-bool RubyWindow::BuildReadingText(
-    const commands::RendererCommand& command,
-    std::string* reading) const {
-  reading->clear();
-
-  if (!command.has_output()) {
-    return false;
-  }
-
-  const commands::Output& output = command.output();
-  if (!output.live_conversion()) {
-    return false;
-  }
-
-  if (!output.has_preedit()) {
-    return false;
-  }
-
-  const commands::Preedit& preedit = output.preedit();
-
-  std::string value;
-  for (int i = 0; i < preedit.segment_size(); ++i) {
-    const commands::Preedit::Segment& segment = preedit.segment(i);
-
-    value.append(segment.value());
-
-    if (segment.has_key() && !segment.key().empty()) {
-      reading->append(segment.key());
-    } else {
-      reading->append(segment.value());
-    }
-  }
-
-  if (reading->empty()) {
-    return false;
-  }
-
-  // Always show the ruby overlay during live conversion, even when the
-  // visible text and reading are identical.  This keeps the user's raw kana
-  // input visible while live conversion is active.
-  return true;
 }
 
 bool RubyWindow::GetBasePosition(const commands::RendererCommand& command,
@@ -492,8 +450,9 @@ void RubyWindow::OnUpdate(const commands::RendererCommand& command,
     return;
   }
 
-  std::string reading;
-  if (!BuildReadingText(command, &reading)) {
+  const std::string reading =
+      command.has_output() ? BuildLiveConversionReading(command.output()) : "";
+  if (reading.empty()) {
     Hide();
     return;
   }

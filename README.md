@@ -166,7 +166,7 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
 ### ライブ変換と入力補助
 
 - 入力後の短いdelayを調整できるライブ変換
-- 変換前の読みを表示するruby風overlay
+- 変換前の読みを表示するruby風overlay（Windows）／候補欄上部表示（Linux Fcitx5）
 - 最小文字数、装飾記号、入力途中の口語表現を考慮した過剰変換の抑制
 - ライブ変換を使わない場合の、初回変換操作での候補window表示
 - 曖昧なローマ字規則でも入力途中を表示できるオプション
@@ -414,7 +414,7 @@ for exact dependencies, attestation, rollback, and uninstall behavior.
 
 ### Highlights
 
-- Debounced live conversion with reading overlay and short-input safeguards
+- Debounced live conversion with a Windows ruby overlay or Fcitx5 reading display
 - Local Zenz inference without an external AI service
 - Context-aware ranking while preserving user-dictionary and mixed-script forms
 - Conservative local feedback learning and explicit feedback management
