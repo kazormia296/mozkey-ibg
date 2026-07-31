@@ -269,6 +269,23 @@ jobs:
               | head -n 1
           }
 
+          wait_for_draft_release_id() {
+            local attempt
+            local draft_release_id
+            for attempt in 1 2 3 4 5; do
+              draft_release_id="$(find_draft_release_id)"
+              if [ -n "$draft_release_id" ]; then
+                printf '%s\n' "$draft_release_id"
+                return 0
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                echo "Draft release ${RELEASE_TAG} is not visible yet; retrying (${attempt}/5)." >&2
+                sleep 2
+              fi
+            done
+            return 0
+          }
+
           if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
             > "$current_release" \
             2> "$RUNNER_TEMP/current-release.err"; then
@@ -287,7 +304,7 @@ jobs:
                 --prerelease \
                 --title "Mozkey IbG v${RELEASE_VERSION}" \
                 --notes-file "$RELEASE_NOTES_FILE"
-              release_id="$(find_draft_release_id)"
+              release_id="$(wait_for_draft_release_id)"
             fi
             if [ -z "$release_id" ]; then
               echo "::error::Unable to resolve the draft release ${RELEASE_TAG}." >&2
