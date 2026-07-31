@@ -614,6 +614,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             publish,
         )
         self.assertIn('release_id="$(find_draft_release_id)"', publish)
+        self.assertIn("wait_for_draft_release_id()", publish)
+        self.assertIn('release_id="$(wait_for_draft_release_id)"', publish)
+        self.assertIn("sleep 2", publish)
         self.assertIn(
             'Unable to resolve the draft release ${RELEASE_TAG}',
             publish,
