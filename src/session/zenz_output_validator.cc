@@ -85,6 +85,99 @@ bool DecodeOneUtf8(absl::string_view input, size_t* index, char32_t* cp) {
   return false;
 }
 
+bool ContainsCodepoint(absl::string_view text, char32_t target) {
+  size_t index = 0;
+  while (index < text.size()) {
+    char32_t cp = 0;
+    if (!DecodeOneUtf8(text, &index, &cp)) {
+      return false;
+    }
+    if (cp == target) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsCjkComponentOrDescriptionCharacter(char32_t cp) {
+  // CJK Radicals Supplement, Kangxi Radicals, and Ideographic Description
+  // Characters are useful for describing glyph structure, but are not normal
+  // Japanese conversion surfaces.  A mismatched or unstable model can emit
+  // them as visually deceptive stand-ins for ordinary kanji (for example,
+  // U+2F0A CJK RADICAL ENTER instead of U+5165).
+  return 0x2E80 <= cp && cp <= 0x2FFF;
+}
+
+bool ContainsUnexpectedCjkComponent(absl::string_view value,
+                                    absl::string_view key,
+                                    absl::string_view mozc_value) {
+  size_t index = 0;
+  while (index < value.size()) {
+    char32_t cp = 0;
+    if (!DecodeOneUtf8(value, &index, &cp)) {
+      return false;
+    }
+    if (IsCjkComponentOrDescriptionCharacter(cp) &&
+        !ContainsCodepoint(key, cp) && !ContainsCodepoint(mozc_value, cp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsCjkIdeograph(char32_t cp) {
+  return (0x3400 <= cp && cp <= 0x4DBF) ||
+         (0x4E00 <= cp && cp <= 0x9FFF) ||
+         (0xF900 <= cp && cp <= 0xFAFF) ||
+         (0x20000 <= cp && cp <= 0x2FA1F) ||
+         (0x30000 <= cp && cp <= 0x323AF);
+}
+
+bool ContainsCodepointRun(absl::string_view text, char32_t target,
+                          size_t required_run) {
+  size_t index = 0;
+  size_t run = 0;
+  while (index < text.size()) {
+    char32_t cp = 0;
+    if (!DecodeOneUtf8(text, &index, &cp)) {
+      return false;
+    }
+    run = cp == target ? run + 1 : 0;
+    if (run >= required_run) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ContainsUnexpectedRepeatedIdeograph(absl::string_view value,
+                                         absl::string_view key,
+                                         absl::string_view mozc_value) {
+  constexpr size_t kMaxNaturalRun = 3;
+
+  size_t index = 0;
+  char32_t previous = 0;
+  size_t run = 0;
+  while (index < value.size()) {
+    char32_t cp = 0;
+    if (!DecodeOneUtf8(value, &index, &cp)) {
+      return false;
+    }
+    run = cp == previous ? run + 1 : 1;
+    previous = cp;
+    if (run <= kMaxNaturalRun || !IsCjkIdeograph(cp)) {
+      continue;
+    }
+
+    const size_t required_run = kMaxNaturalRun + 1;
+    if (!ContainsCodepointRun(key, cp, required_run) &&
+        !ContainsCodepointRun(mozc_value, cp, required_run)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 struct Utf8CharForSymbolRestore {
   char32_t cp = 0;
   std::string bytes;
@@ -443,6 +536,16 @@ ZenzValidationResult ZenzOutputValidator::Validate(
 
   if (!Util::IsValidUtf8(input.zenz_value)) {
     return Reject("invalid_utf8");
+  }
+
+  if (ContainsUnexpectedCjkComponent(input.zenz_value, input.key,
+                                     input.mozc_value)) {
+    return Reject("unexpected_cjk_component");
+  }
+
+  if (ContainsUnexpectedRepeatedIdeograph(input.zenz_value, input.key,
+                                          input.mozc_value)) {
+    return Reject("repeated_ideograph");
   }
 
   const size_t key_len = Util::CharsLen(input.key);

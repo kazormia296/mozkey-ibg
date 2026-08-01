@@ -53,6 +53,8 @@
 #include "composer/composer.h"
 #include "composer/key_event_util.h"
 #include "composer/table.h"
+#include "dictionary/dictionary_interface.h"
+#include "dictionary/project_dictionary.h"
 #include "engine/engine_converter_interface.h"
 #include "engine/engine_interface.h"
 #include "protocol/commands.pb.h"
@@ -1882,9 +1884,8 @@ void AddPreeditIdentityProtectedSpans(
   }
 }
 
-
-bool IsSafeDirectUserDictionaryProtectedEntry(absl::string_view key,
-                                              absl::string_view value) {
+bool IsSafeDirectDictionaryProtectedEntry(absl::string_view key,
+                                          absl::string_view value) {
   if (key.empty() || value.empty()) {
     return false;
   }
@@ -1932,7 +1933,7 @@ void AddDirectUserDictionaryEntryProtectedSpans(
     for (const UserDictionaryLookupResult& entry : entries) {
       const absl::string_view entry_key(entry.key);
       const absl::string_view entry_value(entry.value);
-      if (!IsSafeDirectUserDictionaryProtectedEntry(entry_key, entry_value)) {
+      if (!IsSafeDirectDictionaryProtectedEntry(entry_key, entry_value)) {
         continue;
       }
       if (!absl::StartsWith(suffix, entry_key) ||
@@ -1944,6 +1945,42 @@ void AddDirectUserDictionaryEntryProtectedSpans(
           entry_key, entry_value, ProtectedConversionSpan::Tier::kUserPreferred,
           false, mozc_value, protected_spans);
     }
+  }
+}
+
+void AddDirectProjectDictionaryEntryProtectedSpans(
+    const engine::EngineConverterInterface& converter,
+    absl::string_view live_key, absl::string_view mozc_value,
+    std::vector<ProtectedConversionSpan>* protected_spans) {
+  if (protected_spans == nullptr || live_key.empty() || mozc_value.empty()) {
+    return;
+  }
+
+  const std::shared_ptr<const dictionary::ProjectDictionarySnapshot> project =
+      converter.GetPinnedProjectDictionary();
+  if (project == nullptr) {
+    return;
+  }
+
+  for (const absl::string_view suffix :
+       GetUtf8SuffixesForUserDictionaryLookup(live_key)) {
+    dictionary::InlineCallback callback;
+    callback.OnToken(
+        [&](absl::string_view, absl::string_view,
+            const dictionary::Token& token) {
+          const absl::string_view entry_key(token.key);
+          const absl::string_view entry_value(token.value);
+          if (IsSafeDirectDictionaryProtectedEntry(entry_key, entry_value) &&
+              absl::StartsWith(suffix, entry_key) &&
+              absl::StrContains(mozc_value, entry_value)) {
+            AddOrUpdateProtectedSpan(
+                entry_key, entry_value,
+                ProtectedConversionSpan::Tier::kUserPreferred, false,
+                mozc_value, protected_spans);
+          }
+          return dictionary::DictionaryInterface::Callback::TRAVERSE_CONTINUE;
+        });
+    project->LookupPrefix(suffix, &callback);
   }
 }
 
@@ -2022,6 +2059,14 @@ std::vector<ProtectedConversionSpan> BuildZenzProtectedConversionSpans(
                                      &protected_spans);
   }
 
+  // all_candidate_words is a presentation-oriented snapshot and can omit
+  // provenance in lightweight or partially populated conversion paths.  The
+  // pinned project snapshot is the authoritative composition-scoped source,
+  // so consult it directly before Zenz adoption.  This guarantees that a
+  // selected Grimodex surface such as "どうめき" -> "百目鬼" remains protected
+  // even when candidate protocol attributes were not available.
+  AddDirectProjectDictionaryEntryProtectedSpans(
+      converter, live_key, mozc_value, &protected_spans);
   AddDirectUserDictionaryEntryProtectedSpans(converter, live_key, mozc_value,
                                              &protected_spans);
 
