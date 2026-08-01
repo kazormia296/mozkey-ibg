@@ -217,7 +217,7 @@
       <!-- This action invoked only when removal of the old product failed. -->
       <Custom Action="UnregisterTIPRollback64" After="RestoreUserIMEEnvironment" Condition="(REMOVE=&quot;ALL&quot;) AND UPGRADINGPRODUCTCODE AND (VersionNT64)" />
       <Custom Action="UnregisterTIP64" After="UnregisterTIPRollback64" Condition="(REMOVE=&quot;ALL&quot;) AND (NOT UPGRADINGPRODUCTCODE) AND (VersionNT64)" />
-      <!-- Keep consumer discovery across upgrades and failed/rolled-back removals. The checked commit action stops and proves the exact installed server absent before removing tsf-mozkey-ibg. -->
+      <!-- Keep consumer discovery across upgrades and failed/rolled-back removals. The checked commit action stops and proves the exact installed heartbeat broker and legacy server absent before removing tsf-mozkey-ibg. -->
       <Custom Action="UnregisterGrimodexConsumer" After="UnregisterTIP64" Condition="(REMOVE=&quot;ALL&quot;) AND (NOT UPGRADINGPRODUCTCODE)" />
       <Custom Action="RemoveMozcFirewallRules" After="UnregisterGrimodexConsumer" Condition="(REMOVE=&quot;ALL&quot;)" />
       <!--

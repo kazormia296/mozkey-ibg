@@ -56,16 +56,18 @@ UINT __stdcall UnregisterTIPRollback(MSIHANDLE msi_handle);
 // Opens the uninstall survey page with the default browser.
 UINT __stdcall OpenUninstallSurveyPage(MSIHANDLE msi_handle);
 
-// Shuts down mozc_server.exe and mozc_renderer.exe to remove their files.
+// Shuts down the heartbeat broker, mozc_server.exe, mozc_renderer.exe, and
+// packaged Zenz helpers so their files can be replaced or removed.
 UINT __stdcall ShutdownServer(MSIHANDLE msi_handle);
 
 // Restores the IME environment for the current user.  See the comment in
 // uninstall_helper.h for details.
 UINT __stdcall RestoreUserIMEEnvironment(MSIHANDLE msi_handle);
 
-// Stops and proves the exact installed server absent, then removes only
-// Mozkey's per-user Grimodex consumer heartbeat. This checked action is
-// reserved for an explicit uninstall and must not run during an upgrade.
+// Stops and proves the exact installed heartbeat broker and legacy server
+// absent, then removes only Mozkey's per-user Grimodex consumer heartbeat.
+// This checked action is reserved for an explicit uninstall and must not run
+// during an upgrade.
 UINT __stdcall UnregisterGrimodexConsumer(MSIHANDLE msi_handle);
 
 // Hides the cancel button on a progress dialog shown by the installer.

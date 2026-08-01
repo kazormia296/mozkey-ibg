@@ -213,6 +213,8 @@ mozc_cc_library(
         "//client:__pkg__",
         "//renderer:__subpackages__",
         "//session:__pkg__",
+        "//win32/broker:__pkg__",
+        "//win32/custom_action:__pkg__",
     ],
     deps = [
         "//base:const",

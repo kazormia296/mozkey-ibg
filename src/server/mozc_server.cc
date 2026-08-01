@@ -42,7 +42,9 @@
 #include "base/run_level.h"
 #include "base/system_util.h"
 #include "base/vlog.h"
+#if defined(__APPLE__)
 #include "grimodex/desktop_consumer_heartbeat.h"
+#endif  // __APPLE__
 #include "session/session_server.h"
 
 #ifdef _WIN32
@@ -100,12 +102,17 @@ int MozcServer::Run() {
     return -1;
   }
 
-  // The process mutex makes this the only heartbeat owner in mozc_server.
-  // Its destructor stops the timer without unregistering, preserving the
-  // Protocol v1 freshness window across ordinary server restarts.
+#if defined(__APPLE__)
+  // The process mutex makes this the only heartbeat owner in the macOS
+  // converter. Its destructor stops the timer without unregistering,
+  // preserving the Protocol v1 freshness window across ordinary restarts.
+  // Windows intentionally uses the medium-integrity broker because this
+  // server runs at low integrity and must not receive write access to the
+  // shared Grimodex project-data root.
   std::unique_ptr<grimodex::DesktopConsumerHeartbeat>
       grimodex_consumer_heartbeat =
           grimodex::StartDesktopConsumerHeartbeat();
+#endif  // __APPLE__
 
   {
     std::unique_ptr<mozc::SessionServer> session_server =

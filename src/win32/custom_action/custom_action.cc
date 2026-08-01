@@ -60,7 +60,8 @@
 #include "config/config_handler.h"
 #ifndef GOOGLE_JAPANESE_INPUT_BUILD
 #include "grimodex/desktop_consumer_heartbeat.h"
-#endif  // GOOGLE_JAPANESE_INPUT_BUILD
+#include "ipc/named_event.h"
+#endif  // !GOOGLE_JAPANESE_INPUT_BUILD
 #include "renderer/renderer_client.h"
 #include "win32/base/input_dll.h"
 #include "win32/base/omaha_util.h"
@@ -247,6 +248,24 @@ bool StopMozcServer() {
       mozc::win32::Utf8ToWide(mozc::kMozcServerName);
   return TerminateMozcProcessByImageName(image_name.c_str(),
                                          mozc::kMozcServerName);
+}
+
+bool StopMozcBroker() {
+#ifndef GOOGLE_JAPANESE_INPUT_BUILD
+  // Ask the medium-integrity heartbeat owner to stop cleanly first. Exact-path
+  // termination below is the fail-closed fallback and also proves that a
+  // racing/stale installed broker cannot republish after uninstall cleanup.
+  mozc::NamedEventNotifier notifier(
+      mozc::kGrimodexConsumerBrokerShutdownEvent);
+  if (notifier.IsAvailable()) {
+    notifier.Notify();
+    ::Sleep(100);
+  }
+#endif  // !GOOGLE_JAPANESE_INPUT_BUILD
+  const std::wstring image_name =
+      mozc::win32::Utf8ToWide(mozc::kMozcBroker);
+  return TerminateMozcProcessByImageName(image_name.c_str(),
+                                         mozc::kMozcBroker);
 }
 
 // Retrieves the value for an installer property.
@@ -527,6 +546,7 @@ UINT __stdcall OpenUninstallSurveyPage(MSIHANDLE msi_handle) {
 UINT __stdcall ShutdownServer(MSIHANDLE msi_handle) {
   DEBUG_BREAK_FOR_DEBUGGER();
 
+  const bool broker_stopped = StopMozcBroker();
   ShutdownZenzRuntimeProcesses();
 
   std::unique_ptr<mozc::client::ClientInterface> server_client(
@@ -552,7 +572,7 @@ UINT __stdcall ShutdownServer(MSIHANDLE msi_handle) {
   // replacement scorer between the final helper scan and server termination.
   const bool zenz_stopped = ShutdownZenzRuntimeProcesses();
 
-  if (!zenz_stopped || !server_stopped) {
+  if (!broker_stopped || !zenz_stopped || !server_stopped) {
     LogInstallerInfo(
         msi_handle,
         L"Mozkey IbG could not prove that all installed runtime processes stopped.");
@@ -576,13 +596,14 @@ UINT __stdcall UnregisterGrimodexConsumer(MSIHANDLE msi_handle) {
   return ERROR_SUCCESS;
 #else   // GOOGLE_JAPANESE_INPUT_BUILD
   const std::wstring app_data = GetProperty(msi_handle, L"CustomActionData");
-  if (!StopMozcServer()) {
-    // The server owns the tsf-mozkey-ibg heartbeat refresh loop.  Never remove the
-    // record while an exact installed server may still republish it.
+  if (!StopMozcBroker() || !StopMozcServer()) {
+    // The broker owns the tsf-mozkey-ibg heartbeat refresh loop. Never remove
+    // the record while the exact installed broker or legacy server may still
+    // republish it.
     LogInstallerInfo(
         msi_handle,
         L"Mozkey IbG kept its Grimodex consumer heartbeat because the installed "
-        L"mozc_server.exe could not be stopped and proven absent.");
+        L"heartbeat owner could not be stopped and proven absent.");
     return ERROR_INSTALL_FAILURE;
   }
   const absl::Status status =

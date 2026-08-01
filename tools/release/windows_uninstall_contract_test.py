@@ -36,7 +36,7 @@ class WindowsUninstallContractTest(unittest.TestCase):
         self.assertIn('REMOVE="ALL"', condition)
         self.assertIn("NOT UPGRADINGPRODUCTCODE", condition)
 
-    def test_exact_server_quiescence_precedes_unregister(self) -> None:
+    def test_exact_heartbeat_owner_quiescence_precedes_unregister(self) -> None:
         source = CUSTOM_ACTION.read_text(encoding="utf-8")
         action_start = source.index(
             "UINT __stdcall UnregisterGrimodexConsumer"
@@ -45,12 +45,27 @@ class WindowsUninstallContractTest(unittest.TestCase):
             "#endif  // GOOGLE_JAPANESE_INPUT_BUILD", action_start
         )
         action = source[action_start:action_end]
-        stop = action.index("StopMozcServer()")
+        stop_broker = action.index("StopMozcBroker()")
+        stop_server = action.index("StopMozcServer()")
         unregister = action.index(
             "UnregisterWindowsDesktopConsumerForAppData"
         )
-        self.assertLess(stop, unregister)
-        self.assertIn("return ERROR_INSTALL_FAILURE", action[stop:unregister])
+        self.assertLess(stop_broker, unregister)
+        self.assertLess(stop_server, unregister)
+        self.assertIn(
+            "return ERROR_INSTALL_FAILURE",
+            action[min(stop_broker, stop_server):unregister],
+        )
+
+    def test_broker_shutdown_is_signaled_and_exact_path_checked(self) -> None:
+        source = CUSTOM_ACTION.read_text(encoding="utf-8")
+        helper_start = source.index("bool StopMozcBroker()")
+        helper_end = source.index("// Retrieves the value", helper_start)
+        helper = source[helper_start:helper_end]
+        self.assertIn("kGrimodexConsumerBrokerShutdownEvent", helper)
+        self.assertIn("NamedEventNotifier", helper)
+        self.assertIn("mozc::kMozcBroker", helper)
+        self.assertIn("TerminateMozcProcessByImageName", helper)
 
     def test_quiescence_requires_stable_exact_absence(self) -> None:
         source = CUSTOM_ACTION.read_text(encoding="utf-8")
