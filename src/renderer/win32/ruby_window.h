@@ -54,8 +54,6 @@ class RubyWindow
   void ResetFont();
   void UpdateFont(HDC dc);
   SIZE MeasureText() const;
-  bool BuildReadingText(const commands::RendererCommand& command,
-                        std::string* reading) const;
   struct TargetIdentity {
     uint32_t process_id = 0;
     uint32_t thread_id = 0;

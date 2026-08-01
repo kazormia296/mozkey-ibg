@@ -87,6 +87,9 @@ class MozcState : public InputContextProperty {
   // candidate window). If the string is empty (""), hides the message
   // currently being displayed.
   void SetAuxString(const std::string& str);
+  // Displays the typed reading above the candidate list during live
+  // conversion. This state is kept separate from candidate footer text.
+  void SetLiveConversionReading(const std::string& reading);
   // Sets a current composition mode (e.g., Hankaku Katakana).
   void SetCompositionMode(mozc::commands::CompositionMode mode,
                           bool updateUI = true);
@@ -174,8 +177,10 @@ class MozcState : public InputContextProperty {
   const std::unique_ptr<KeyEventHandler> handler_;
 
   bool displayUsage_ = false;
+  bool show_live_conversion_reading_ = true;
   Text preedit_;
   std::string aux_;  // error tooltip, or candidate window title.
+  std::string live_conversion_reading_;
   std::string url_;  // URL to be opened by a browser.
   std::string description_;
   std::string title_;

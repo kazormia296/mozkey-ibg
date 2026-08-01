@@ -1088,10 +1088,10 @@
          <item row="14" column="0" colspan="8">
           <widget class="QCheckBox" name="showLiveConversionRubyWindow">
            <property name="toolTip">
-            <string>Shows the typed reading near the candidate window during live conversion.</string>
+            <string>Shows the typed reading during live conversion. Windows uses a separate ruby window; Fcitx displays it above the candidate list.</string>
            </property>
            <property name="text">
-            <string>Show ruby window during live conversion</string>
+            <string>Show reading during live conversion</string>
            </property>
           </widget>
          </item>

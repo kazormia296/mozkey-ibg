@@ -53,6 +53,7 @@
 #include "base/vlog.h"
 #include "protocol/candidate_window.pb.h"
 #include "protocol/commands.pb.h"
+#include "renderer/live_conversion_reading.h"
 #include "unix/fcitx5/i18nwrapper.h"
 #include "unix/fcitx5/mozc_engine.h"
 #include "unix/fcitx5/mozc_state.h"
@@ -408,6 +409,9 @@ bool MozcResponseParser::ParseResponse(const mozc::commands::Output& response,
     const mozc::commands::Result& result = response.result();
     ParseResult(result, ic);
   }
+
+  mozc_state->SetLiveConversionReading(
+      mozc::renderer::BuildLiveConversionReading(response));
 
   // First, determine the cursor position.
   if (response.has_preedit()) {

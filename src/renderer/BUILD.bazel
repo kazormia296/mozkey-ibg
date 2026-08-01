@@ -50,6 +50,32 @@ load(
 package(default_visibility = ["//visibility:private"])
 
 mozc_cc_library(
+    name = "live_conversion_reading",
+    srcs = ["live_conversion_reading.cc"],
+    hdrs = ["live_conversion_reading.h"],
+    visibility = [
+        "//renderer:__subpackages__",
+        "//unix:__subpackages__",
+    ],
+    deps = [
+        "//base/strings:unicode",
+        "//protocol:commands_cc_proto",
+    ],
+)
+
+mozc_cc_test(
+    name = "live_conversion_reading_test",
+    size = "small",
+    srcs = ["live_conversion_reading_test.cc"],
+    tags = ["noandroid"],
+    deps = [
+        ":live_conversion_reading",
+        "//protocol:commands_cc_proto",
+        "//testing:gunit_main",
+    ],
+)
+
+mozc_cc_library(
     name = "renderer_client",
     srcs = ["renderer_client.cc"],
     hdrs = ["renderer_client.h"],

@@ -240,6 +240,7 @@ mozc_cc_library(
         "//protocol:commands_cc_proto",
         "//protocol:config_cc_proto",
         "//protocol:renderer_cc_proto",
+        "//renderer:live_conversion_reading",
         "//renderer:renderer_style_handler",
     ],
 )
