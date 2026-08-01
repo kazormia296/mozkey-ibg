@@ -286,6 +286,7 @@ MozcEngine::MozcEngine(Instance* instance)
       [refresh_consumer](fcitx::EventSourceTime *timer, uint64_t) {
         refresh_consumer();
         timer->setNextInterval(kGrimodexConsumerHeartbeatUsec);
+        timer->setOneShot();
         return true;
       });
 
