@@ -78,7 +78,12 @@ HRESULT GetReadOnlyAppProperty(ITfRange* range, TfEditCookie read_cookie,
     return result;
   }
   if (!readonly_property) {
-    return E_FAIL;
+    // Most ordinary Win32 text stores, including the classic edit control
+    // used by Notepad, do not publish optional TSF application properties.
+    // This is an authoritative "property not specified" result, not a
+    // failure to resolve the field. Keep the output VARIANT empty so callers
+    // can use their normal defaults (for example, a non-password InputScope).
+    return S_FALSE;
   }
 
   result = readonly_property->GetValue(read_cookie, range, variant_addr);
@@ -201,7 +206,12 @@ HRESULT TipRangeUtil::GetInputScopes(ITfRange* range, TfEditCookie read_cookie,
   HRESULT result = GetReadOnlyAppProperty(
       range, read_cookie, kGuidPropInputscope, variant.reset_and_addressof());
   if (FAILED(result)) {
-    return result;
+    // GUID_PROP_INPUTSCOPE is optional application metadata.  RichEdit and
+    // other ordinary Windows text stores can expose the property object while
+    // still rejecting GetValue for a particular range.  Treat that the same
+    // as an omitted property.  Only a successfully decoded, explicit
+    // IS_PASSWORD scope may put the input-mode manager into password mode.
+    return S_FALSE;
   }
   if (variant.vt != VT_UNKNOWN) {
     return S_OK;
@@ -209,13 +219,13 @@ HRESULT TipRangeUtil::GetInputScopes(ITfRange* range, TfEditCookie read_cookie,
 
   auto input_scope = ComQuery<ITfInputScope>(variant.punkVal);
   if (!input_scope) {
-    return E_NOINTERFACE;
+    return S_FALSE;
   }
   InputScope* input_scopes_buffer = nullptr;
   UINT num_input_scopes = 0;
   result = input_scope->GetInputScopes(&input_scopes_buffer, &num_input_scopes);
   if (FAILED(result)) {
-    return result;
+    return S_FALSE;
   }
   auto owned_input_scopes =
       std::unique_ptr<InputScope, decltype(&::CoTaskMemFree)>(
@@ -223,7 +233,7 @@ HRESULT TipRangeUtil::GetInputScopes(ITfRange* range, TfEditCookie read_cookie,
   constexpr UINT kMaxInputScopeCount = 64;
   if (num_input_scopes > kMaxInputScopeCount ||
       (num_input_scopes != 0 && input_scopes_buffer == nullptr)) {
-    return E_UNEXPECTED;
+    return S_FALSE;
   }
   if (num_input_scopes != 0) {
     input_scopes->assign(input_scopes_buffer,

@@ -1773,13 +1773,13 @@ bool TipEditSession::SendDelayedSessionCommandAsync(
     TipTextService* text_service, ITfContext* context,
     const commands::SessionCommand& session_command,
     uint64_t command_focus_epoch, int32_t command_focus_revision,
-    uint64_t output_application_generation) {
+    uint64_t composition_generation) {
   return OnSessionCommandAsync(
       text_service, context, session_command,
       {.focus_epoch = command_focus_epoch,
        .focus_revision = command_focus_revision},
-      /*expected_output_generation=*/0, output_application_generation,
-      /*expected_composition_generation=*/0);
+      /*expected_output_generation=*/0,
+      /*expected_output_application_generation=*/0, composition_generation);
 }
 
 bool TipEditSession::SendCompositionSessionCommandAsync(

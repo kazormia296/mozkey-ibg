@@ -1629,8 +1629,13 @@ class TipTextServiceImpl
         thread_context->GetGrimodexFocusEpoch();
     pending_delayed_session_focus_revision_ =
         thread_context->GetFocusRevision();
-    pending_delayed_session_output_application_generation_ =
-        output_application_generation;
+    // Output-application generations are intentionally short lived.  In
+    // particular, the key-up following the key-down that produced this
+    // callback reserves the next generation even when it has no output.  Bind
+    // the delayed command to the TSF composition instead so that ordinary key
+    // transitions do not cancel live conversion while commit/cancel still do.
+    pending_delayed_session_composition_generation_ =
+        private_context->composition_generation();
     has_pending_delayed_session_command_ = true;
 
     ::KillTimer(task_window, kDelayedSessionCommandTimerId);
@@ -2309,7 +2314,7 @@ class TipTextServiceImpl
     pending_delayed_session_context_.reset();
     pending_delayed_session_focus_epoch_ = 0;
     pending_delayed_session_focus_revision_ = 0;
-    pending_delayed_session_output_application_generation_ = 0;
+    pending_delayed_session_composition_generation_ = 0;
 
     ::DestroyWindow(task_window_handle_);
     task_window_handle_ = nullptr;
@@ -2366,33 +2371,43 @@ class TipTextServiceImpl
         pending_delayed_session_focus_epoch_;
     const int32_t scheduled_focus_revision =
         pending_delayed_session_focus_revision_;
-    const uint64_t scheduled_output_application_generation =
-        pending_delayed_session_output_application_generation_;
+    uint64_t scheduled_composition_generation =
+        pending_delayed_session_composition_generation_;
 
     has_pending_delayed_session_command_ = false;
     pending_delayed_session_command_.Clear();
     pending_delayed_session_context_.reset();
     pending_delayed_session_focus_epoch_ = 0;
     pending_delayed_session_focus_revision_ = 0;
-    pending_delayed_session_output_application_generation_ = 0;
+    pending_delayed_session_composition_generation_ = 0;
 
     const std::shared_ptr<TipPrivateContext> private_context =
         context ? GetPrivateContext(context.get()) : nullptr;
     if (!context || !private_context || scheduled_focus_epoch == 0 ||
-        scheduled_output_application_generation == 0 ||
         scheduled_focus_epoch != thread_context->GetGrimodexFocusEpoch() ||
         scheduled_focus_revision != thread_context->GetFocusRevision() ||
-        !private_context->IsOutputApplicationForFocusDomain(
-            scheduled_focus_epoch, scheduled_focus_revision,
-            scheduled_output_application_generation) ||
         !IsCurrentActivation(thread_context)) {
+      return;
+    }
+
+    // The first output of a composition can schedule a delayed callback before
+    // UpdateContext starts the TSF composition.  Resolve that one zero token at
+    // timer time; otherwise require the exact composition that scheduled the
+    // callback so a commit/cancel/restart cannot receive stale output.
+    if (scheduled_composition_generation == 0) {
+      scheduled_composition_generation =
+          private_context->composition_generation();
+    }
+    if (!private_context->IsCompositionForFocusDomainAndGeneration(
+            scheduled_focus_epoch, scheduled_focus_revision,
+            scheduled_composition_generation)) {
       return;
     }
 
     TipEditSession::SendDelayedSessionCommandAsync(
         this, context.get(), command, scheduled_focus_epoch,
         scheduled_focus_revision,
-        scheduled_output_application_generation);
+        scheduled_composition_generation);
   }
 
   void OnUpdateUI() {
@@ -2632,7 +2647,7 @@ class TipTextServiceImpl
   wil::com_ptr_nothrow<ITfContext> pending_delayed_session_context_;
   uint64_t pending_delayed_session_focus_epoch_ = 0;
   int32_t pending_delayed_session_focus_revision_ = 0;
-  uint64_t pending_delayed_session_output_application_generation_ = 0;
+  uint64_t pending_delayed_session_composition_generation_ = 0;
 };
 
 }  // namespace
