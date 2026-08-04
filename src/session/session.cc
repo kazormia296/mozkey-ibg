@@ -5544,14 +5544,14 @@ std::string Session::ExtractZenzLeftContext(uint32_t max_chars) const {
   // current line.  Do not concatenate preceding lines when the prompt builder
   // removes line-feed characters.
   const size_t line_break_pos = preceding_text.find_last_of("\r\n");
-  const std::string current_line =
-      line_break_pos == std::string::npos
-          ? preceding_text
-          : preceding_text.substr(line_break_pos + 1);
+  absl::string_view current_line = preceding_text;
+  if (line_break_pos != std::string::npos) {
+    current_line.remove_prefix(line_break_pos + 1);
+  }
 
   const size_t len = Util::CharsLen(current_line);
   if (len <= max_chars) {
-    return current_line;
+    return std::string(current_line);
   }
 
   return std::string(
