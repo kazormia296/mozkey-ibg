@@ -8208,7 +8208,20 @@ bool Session::Commit(commands::Command* command) {
   // committing.  Preserve any stable converted prefix and append the visible
   // unconverted suffix instead.
   if (live_conversion_pending_) {
-    return CommitPendingLiveConversionDisplayDirectly(command);
+    // Keep Enter consistent with the ordinary CommitInternal() path: the
+    // committed result must remain undoable, even though this path commits the
+    // session-owned visible live-conversion overlay directly.  The ImeContext
+    // snapshot intentionally restores the underlying editable reading on
+    // Undo; the temporary converted-prefix display is not converter state.
+    PushUndoContext();
+
+    const bool committed =
+        CommitPendingLiveConversionDisplayDirectly(command);
+    if (committed && command->output().has_result()) {
+      // Undo calculates the deletion range from the previous committed output.
+      *context_->mutable_output() = command->output();
+    }
+    return committed;
   }
 
   return CommitInternal(command,
