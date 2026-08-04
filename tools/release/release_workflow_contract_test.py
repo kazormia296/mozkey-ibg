@@ -8,6 +8,7 @@ import unittest
 
 SUPPORTED_PLATFORMS = ("linux", "macos", "windows")
 MOBILE_PLATFORMS = ("android", "ios")
+ROUTINE_CI_WORKFLOWS = ("lint", *SUPPORTED_PLATFORMS, "secure-offline")
 
 
 class ReleaseWorkflowContractTest(unittest.TestCase):
@@ -120,6 +121,8 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("  pull_request:", preflight)
         self.assertIn("  workflow_dispatch:", preflight)
         self.assertIn("  workflow_call:", preflight)
+        preflight_trigger = preflight.split("\npermissions:\n", maxsplit=1)[0]
+        self.assertNotRegex(preflight_trigger, r"(?m)^  push:")
         self.assertEqual(preflight.count("timeout-minutes: 5"), 3)
         self.assertIn("preflight_release_identity.py", preflight)
         self.assertIn("preflight_release_inputs.py", preflight)
@@ -290,6 +293,53 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 trigger = workflow.split("\npermissions:\n", maxsplit=1)[0]
                 self.assertIn("  pull_request:", trigger)
                 self.assertIn("  push:\n    branches:\n      - main", trigger)
+
+    def test_routine_ci_bypasses_only_version_file_pull_requests(self) -> None:
+        for name in ROUTINE_CI_WORKFLOWS:
+            with self.subTest(workflow=name):
+                trigger = self._workflow(name).split(
+                    "\npermissions:\n", maxsplit=1
+                )[0]
+                event_match = re.search(
+                    r"(?ms)^  pull_request:\n(.*?)(?=^  [a-z_]+:|\Z)",
+                    trigger,
+                )
+                self.assertIsNotNone(event_match)
+                assert event_match is not None
+                paths_match = re.search(
+                    r"(?m)^    paths-ignore:\n"
+                    r"((?:      - [^\n]+\n?)+)",
+                    event_match.group(1),
+                )
+                self.assertIsNotNone(paths_match)
+                assert paths_match is not None
+                self.assertEqual(
+                    re.findall(r"(?m)^      - ([^\n]+)$", paths_match.group(1)),
+                    ["src/version.bzl"],
+                )
+
+        preflight_trigger = self._workflow("release-preflight").split(
+            "\npermissions:\n", maxsplit=1
+        )[0]
+        self.assertNotIn("paths-ignore:", preflight_trigger)
+
+    def test_consecutive_version_only_main_pushes_run_routine_ci(self) -> None:
+        # With no push path filter, a later bump still tests any unsafe state
+        # inherited from an earlier, possibly cancelled, main-branch run.
+        for name in ROUTINE_CI_WORKFLOWS:
+            with self.subTest(workflow=name):
+                trigger = self._workflow(name).split(
+                    "\npermissions:\n", maxsplit=1
+                )[0]
+                event_match = re.search(
+                    r"(?ms)^  push:\n(.*?)(?=^  [a-z_]+:|\Z)",
+                    trigger,
+                )
+                self.assertIsNotNone(event_match)
+                assert event_match is not None
+                push = event_match.group(1)
+                self.assertIn("    branches:\n      - main", push)
+                self.assertNotRegex(push, r"(?m)^    paths(?:-ignore)?:")
 
     def test_intermediate_artifacts_are_namespaced_and_short_lived(self) -> None:
         artifact_names: list[str] = []

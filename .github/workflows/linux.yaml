@@ -3,6 +3,8 @@ name: CI for Linux
 
 on:
   pull_request:
+    paths-ignore:
+      - src/version.bzl
   push:
     branches:
       - main
