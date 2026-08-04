@@ -2,11 +2,6 @@ name: Mozkey Release Preflight
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
-    paths:
-      - src/version.bzl
   workflow_dispatch:
     inputs:
       candidate_tag:
@@ -49,20 +44,6 @@ jobs:
           --repository .
           --main-ref origin/main
 
-      - name: Validate main-branch release identity
-        if: >-
-          ${{ github.event_name == 'push' &&
-              github.ref_type == 'branch' }}
-        env:
-          BASE_REF: ${{ github.event.before }}
-        run: >-
-          python tools/release/preflight_release_identity.py
-          --phase branch
-          --base-ref "$BASE_REF"
-          --version-file src/version.bzl
-          --repository .
-          --main-ref origin/main
-
       - name: Validate pre-tag release identity
         if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
@@ -78,8 +59,7 @@ jobs:
       - name: Revalidate tagged release identity
         if: >-
           ${{ github.event_name != 'pull_request' &&
-              github.event_name != 'workflow_dispatch' &&
-              github.ref_type == 'tag' }}
+              github.event_name != 'workflow_dispatch' }}
         env:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
         run: >-

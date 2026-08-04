@@ -150,22 +150,21 @@ def _require_clean(repository: Path) -> None:
         raise ReleaseValidationError("pre-tag checkout must be clean")
 
 
-def _validate_change_from_base(
+def _validate_pull_request_change(
     *,
     repository: Path,
-    base_commit: str,
+    main_commit: str,
     head_commit: str,
-    base_label: str,
-    change_label: str,
+    main_ref: str,
     version_file: Path,
     working_version: tuple[int, int, int],
     inferred_tag: str,
 ) -> None:
-    base_version = _version_at_ref(repository, base_commit, version_file)
+    main_version = _version_at_ref(repository, main_commit, version_file)
     version_path = _version_path(repository, version_file)
-    if _changed_paths(repository, base_commit, head_commit) == {version_path}:
+    if _changed_paths(repository, main_commit, head_commit) == {version_path}:
         base_source, base_source_label = _version_source_at_ref(
-            repository, base_commit, version_file
+            repository, main_commit, version_file
         )
         head_source, head_source_label = _version_source_at_ref(
             repository, head_commit, version_file
@@ -181,13 +180,13 @@ def _validate_change_from_base(
                 "working release version does not match the committed HEAD"
             )
 
-    if working_version < base_version:
+    if working_version < main_version:
         raise ReleaseValidationError(
-            f"release version {inferred_tag} is older than {base_label}"
+            f"release version {inferred_tag} is older than {main_ref}"
         )
-    if working_version > base_version and _tag_exists(repository, inferred_tag):
+    if working_version > main_version and _tag_exists(repository, inferred_tag):
         raise ReleaseValidationError(
-            f"version-bump {change_label} reuses existing tag {inferred_tag}"
+            f"version-bump PR reuses existing tag {inferred_tag}"
         )
 
 
@@ -198,7 +197,6 @@ def validate_preflight_identity(
     version_file: Path,
     repository: Path,
     main_ref: str,
-    base_ref: str | None = None,
 ) -> PreflightIdentity:
     repository = repository.resolve()
     if not version_file.is_absolute():
@@ -237,12 +235,11 @@ def validate_preflight_identity(
 
     if phase == "pull-request":
         _require_ancestor(repository, main_commit, head_commit)
-        _validate_change_from_base(
+        _validate_pull_request_change(
             repository=repository,
-            base_commit=main_commit,
+            main_commit=main_commit,
             head_commit=head_commit,
-            base_label=main_ref,
-            change_label="PR",
+            main_ref=main_ref,
             version_file=version_file,
             working_version=working_version,
             inferred_tag=inferred_tag,
@@ -252,20 +249,6 @@ def validate_preflight_identity(
             raise ReleaseValidationError(
                 f"branch preflight HEAD {head_commit} is not {main_ref} {main_commit}"
             )
-        if not base_ref:
-            raise ReleaseValidationError("branch phase requires --base-ref")
-        base_commit = _commit(repository, base_ref)
-        _require_ancestor(repository, base_commit, head_commit)
-        _validate_change_from_base(
-            repository=repository,
-            base_commit=base_commit,
-            head_commit=head_commit,
-            base_label=base_ref,
-            change_label="branch update",
-            version_file=version_file,
-            working_version=working_version,
-            inferred_tag=inferred_tag,
-        )
     elif phase == "pre-tag":
         if head_commit != main_commit:
             raise ReleaseValidationError(
@@ -298,7 +281,6 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--version-file", type=Path, required=True)
     parser.add_argument("--repository", type=Path, default=Path("."))
     parser.add_argument("--main-ref", default="origin/main")
-    parser.add_argument("--base-ref")
     return parser.parse_args(argv)
 
 
@@ -311,7 +293,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             version_file=arguments.version_file,
             repository=arguments.repository,
             main_ref=arguments.main_ref,
-            base_ref=arguments.base_ref,
         )
     except ReleaseValidationError as error:
         print(f"release identity preflight failed: {error}", file=sys.stderr)

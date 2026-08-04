@@ -82,7 +82,6 @@ class PreflightReleaseIdentityTest(unittest.TestCase):
         self,
         phase: str,
         candidate_tag: str | None = None,
-        base_ref: str | None = None,
     ):
         return validate_preflight_identity(
             phase=phase,
@@ -90,7 +89,6 @@ class PreflightReleaseIdentityTest(unittest.TestCase):
             version_file=self.version_file,
             repository=self.repository,
             main_ref="main",
-            base_ref=base_ref,
         )
 
     def test_pull_request_accepts_ordinary_change_at_current_version(self) -> None:
@@ -194,30 +192,6 @@ class PreflightReleaseIdentityTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ReleaseValidationError, "not newer than"):
             self._validate("pull-request")
-
-    def test_branch_accepts_version_only_bump_from_push_base(self) -> None:
-        base_ref = _git(self.repository, "rev-parse", "HEAD")
-        _write_version(self.version_file, (0, 9, 5))
-        _git(self.repository, "add", "src/version.bzl")
-        _git(self.repository, "commit", "-m", "version 0.9.5")
-
-        identity = self._validate("branch", base_ref=base_ref)
-
-        self.assertEqual(identity.candidate_tag, "v0.9.5")
-        self.assertEqual(identity.commit, identity.main_commit)
-
-    def test_branch_rejects_non_release_version_change(self) -> None:
-        base_ref = _git(self.repository, "rev-parse", "HEAD")
-        _write_version(
-            self.version_file,
-            (0, 9, 4),
-            build_expression='"broken"',
-        )
-        _git(self.repository, "add", "src/version.bzl")
-        _git(self.repository, "commit", "-m", "break branch identity")
-
-        with self.assertRaisesRegex(ReleaseValidationError, "permits changes only"):
-            self._validate("branch", base_ref=base_ref)
 
     def test_pre_tag_requires_clean_main_and_absent_matching_tag(self) -> None:
         _git(self.repository, "tag", "-d", "v0.9.4")
