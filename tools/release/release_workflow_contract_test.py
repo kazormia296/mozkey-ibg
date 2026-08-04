@@ -119,6 +119,14 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
         preflight = self._workflow("release-preflight")
         self.assertIn("  pull_request:", preflight)
+        self.assertIn(
+            "  push:\n"
+            "    branches:\n"
+            "      - main\n"
+            "    paths:\n"
+            "      - src/version.bzl",
+            preflight,
+        )
         self.assertIn("  workflow_dispatch:", preflight)
         self.assertIn("  workflow_call:", preflight)
         self.assertEqual(preflight.count("timeout-minutes: 5"), 3)
@@ -126,6 +134,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("preflight_release_inputs.py", preflight)
         self.assertIn("check_powershell_preflight.ps1", preflight)
         self.assertIn("--phase pull-request", preflight)
+        self.assertIn("--phase branch", preflight)
+        self.assertIn("--base-ref \"$BASE_REF\"", preflight)
+        self.assertIn("BASE_REF: ${{ github.event.before }}", preflight)
         self.assertIn("--phase pre-tag", preflight)
         self.assertIn("--phase tag", preflight)
         self.assertIn("pacman -Si -- \"$package\"", preflight)
@@ -292,27 +303,30 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 self.assertIn("  pull_request:", trigger)
                 self.assertIn("  push:\n    branches:\n      - main", trigger)
 
-    def test_routine_ci_bypasses_version_only_changes(self) -> None:
+    def test_routine_ci_bypasses_only_version_file_changes(self) -> None:
         for name in ROUTINE_CI_WORKFLOWS:
             with self.subTest(workflow=name):
                 trigger = self._workflow(name).split(
                     "\npermissions:\n", maxsplit=1
                 )[0]
-                self.assertRegex(
-                    trigger,
-                    r"(?m)^  pull_request:\n"
-                    r"    paths-ignore:\n"
-                    r"      - src/version\.bzl$",
-                )
-                self.assertRegex(
-                    trigger,
-                    r"(?m)^  push:\n"
-                    r"    branches:\n"
-                    r"      - main\n"
-                    r"    paths-ignore:\n"
-                    r"      - src/version\.bzl$",
-                )
-                self.assertEqual(trigger.count("- src/version.bzl"), 2)
+                for event in ("pull_request", "push"):
+                    event_match = re.search(
+                        rf"(?ms)^  {event}:\n(.*?)(?=^  [a-z_]+:|\Z)",
+                        trigger,
+                    )
+                    self.assertIsNotNone(event_match)
+                    assert event_match is not None
+                    paths_match = re.search(
+                        r"(?m)^    paths-ignore:\n"
+                        r"((?:      - [^\n]+\n?)+)",
+                        event_match.group(1),
+                    )
+                    self.assertIsNotNone(paths_match)
+                    assert paths_match is not None
+                    self.assertEqual(
+                        re.findall(r"(?m)^      - ([^\n]+)$", paths_match.group(1)),
+                        ["src/version.bzl"],
+                    )
 
         preflight_trigger = self._workflow("release-preflight").split(
             "\npermissions:\n", maxsplit=1

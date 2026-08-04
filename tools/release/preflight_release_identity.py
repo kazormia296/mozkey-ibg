@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,7 @@ try:
         parse_version_file,
         parse_version_source,
         validate_release,
+        validate_version_only_release_change,
     )
 except ModuleNotFoundError:  # Direct execution sets sys.path to tools/release.
     from validate_mozkey_release import (  # type: ignore[no-redef]
@@ -25,6 +27,7 @@ except ModuleNotFoundError:  # Direct execution sets sys.path to tools/release.
         parse_version_file,
         parse_version_source,
         validate_release,
+        validate_version_only_release_change,
     )
 
 
@@ -90,18 +93,45 @@ def _tag_exists(repository: Path, tag: str) -> bool:
     return result.returncode == 0
 
 
-def _version_at_ref(
-    repository: Path, ref: str, version_file: Path
-) -> tuple[int, int, int]:
+def _version_path(repository: Path, version_file: Path) -> str:
     repository = repository.resolve()
     try:
-        relative = version_file.resolve().relative_to(repository)
+        relative = version_file.relative_to(repository)
     except ValueError as error:
         raise ReleaseValidationError(
             f"version file must be inside the repository: {version_file}"
         ) from error
-    source = _git(repository, "show", f"{ref}:{relative.as_posix()}").stdout
-    return parse_version_source(source, f"{ref}:{relative.as_posix()}")
+    return relative.as_posix()
+
+
+def _version_source_at_ref(
+    repository: Path, ref: str, version_file: Path
+) -> tuple[str, str]:
+    relative = _version_path(repository, version_file)
+    label = f"{ref}:{relative}"
+    return _git(repository, "show", label).stdout, label
+
+
+def _version_at_ref(
+    repository: Path, ref: str, version_file: Path
+) -> tuple[int, int, int]:
+    source, label = _version_source_at_ref(repository, ref, version_file)
+    return parse_version_source(source, label)
+
+
+def _changed_paths(
+    repository: Path, base_commit: str, head_commit: str
+) -> frozenset[str]:
+    output = _git(
+        repository,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        base_commit,
+        head_commit,
+    ).stdout
+    return frozenset(path for path in output.split("\0") if path)
 
 
 def _candidate_tag(version: tuple[int, int, int]) -> str:
@@ -120,6 +150,47 @@ def _require_clean(repository: Path) -> None:
         raise ReleaseValidationError("pre-tag checkout must be clean")
 
 
+def _validate_change_from_base(
+    *,
+    repository: Path,
+    base_commit: str,
+    head_commit: str,
+    base_label: str,
+    change_label: str,
+    version_file: Path,
+    working_version: tuple[int, int, int],
+    inferred_tag: str,
+) -> None:
+    base_version = _version_at_ref(repository, base_commit, version_file)
+    version_path = _version_path(repository, version_file)
+    if _changed_paths(repository, base_commit, head_commit) == {version_path}:
+        base_source, base_source_label = _version_source_at_ref(
+            repository, base_commit, version_file
+        )
+        head_source, head_source_label = _version_source_at_ref(
+            repository, head_commit, version_file
+        )
+        committed_version = validate_version_only_release_change(
+            base_source=base_source,
+            candidate_source=head_source,
+            base_label=base_source_label,
+            candidate_label=head_source_label,
+        )
+        if committed_version != working_version:
+            raise ReleaseValidationError(
+                "working release version does not match the committed HEAD"
+            )
+
+    if working_version < base_version:
+        raise ReleaseValidationError(
+            f"release version {inferred_tag} is older than {base_label}"
+        )
+    if working_version > base_version and _tag_exists(repository, inferred_tag):
+        raise ReleaseValidationError(
+            f"version-bump {change_label} reuses existing tag {inferred_tag}"
+        )
+
+
 def validate_preflight_identity(
     *,
     phase: str,
@@ -127,9 +198,13 @@ def validate_preflight_identity(
     version_file: Path,
     repository: Path,
     main_ref: str,
+    base_ref: str | None = None,
 ) -> PreflightIdentity:
     repository = repository.resolve()
-    version_file = version_file.resolve()
+    if not version_file.is_absolute():
+        version_file = repository / version_file
+    # Preserve symlink identity so parse_version_file can reject it fail-closed.
+    version_file = Path(os.path.abspath(version_file))
     head_commit = _commit(repository, "HEAD")
     main_commit = _commit(repository, main_ref)
 
@@ -162,20 +237,35 @@ def validate_preflight_identity(
 
     if phase == "pull-request":
         _require_ancestor(repository, main_commit, head_commit)
-        main_version = _version_at_ref(repository, main_ref, version_file)
-        if working_version < main_version:
-            raise ReleaseValidationError(
-                f"release version {inferred_tag} is older than {main_ref}"
-            )
-        if working_version > main_version and _tag_exists(repository, inferred_tag):
-            raise ReleaseValidationError(
-                f"version-bump PR reuses existing tag {inferred_tag}"
-            )
+        _validate_change_from_base(
+            repository=repository,
+            base_commit=main_commit,
+            head_commit=head_commit,
+            base_label=main_ref,
+            change_label="PR",
+            version_file=version_file,
+            working_version=working_version,
+            inferred_tag=inferred_tag,
+        )
     elif phase == "branch":
         if head_commit != main_commit:
             raise ReleaseValidationError(
                 f"branch preflight HEAD {head_commit} is not {main_ref} {main_commit}"
             )
+        if not base_ref:
+            raise ReleaseValidationError("branch phase requires --base-ref")
+        base_commit = _commit(repository, base_ref)
+        _require_ancestor(repository, base_commit, head_commit)
+        _validate_change_from_base(
+            repository=repository,
+            base_commit=base_commit,
+            head_commit=head_commit,
+            base_label=base_ref,
+            change_label="branch update",
+            version_file=version_file,
+            working_version=working_version,
+            inferred_tag=inferred_tag,
+        )
     elif phase == "pre-tag":
         if head_commit != main_commit:
             raise ReleaseValidationError(
@@ -208,6 +298,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--version-file", type=Path, required=True)
     parser.add_argument("--repository", type=Path, default=Path("."))
     parser.add_argument("--main-ref", default="origin/main")
+    parser.add_argument("--base-ref")
     return parser.parse_args(argv)
 
 
@@ -220,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             version_file=arguments.version_file,
             repository=arguments.repository,
             main_ref=arguments.main_ref,
+            base_ref=arguments.base_ref,
         )
     except ReleaseValidationError as error:
         print(f"release identity preflight failed: {error}", file=sys.stderr)

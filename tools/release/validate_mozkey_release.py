@@ -22,6 +22,12 @@ _VERSION_FIELDS = (
     "MOZKEY_RELEASE_VERSION_MINOR",
     "MOZKEY_RELEASE_VERSION_PATCH",
 )
+_VERSION_ASSIGNMENT_PATTERN = re.compile(
+    rf"^({'|'.join(re.escape(field) for field in _VERSION_FIELDS)}) = "
+    r"(?:0|[1-9][0-9]*)$",
+    re.MULTILINE,
+)
+_VERSION_VALUE_SENTINEL = "<RELEASE_VERSION>"
 
 
 class ReleaseValidationError(RuntimeError):
@@ -96,6 +102,46 @@ def parse_version_source(source: str, label: str) -> tuple[int, int, int]:
             )
         values.append(value)
     return tuple(values)  # type: ignore[return-value]
+
+
+def validate_version_only_release_change(
+    *,
+    base_source: str,
+    candidate_source: str,
+    base_label: str,
+    candidate_label: str,
+) -> tuple[int, int, int]:
+    """Allows only a strict release-version bump between two source files."""
+    base_version = parse_version_source(base_source, base_label)
+    candidate_version = parse_version_source(candidate_source, candidate_label)
+
+    def normalize(source: str, label: str) -> str:
+        normalized, replacements = _VERSION_ASSIGNMENT_PATTERN.subn(
+            lambda match: f"{match.group(1)} = {_VERSION_VALUE_SENTINEL}",
+            source,
+        )
+        if replacements != len(_VERSION_FIELDS):
+            raise ReleaseValidationError(
+                f"{label} must use the three canonical release-version assignments"
+            )
+        return normalized
+
+    if normalize(base_source, base_label) != normalize(
+        candidate_source, candidate_label
+    ):
+        raise ReleaseValidationError(
+            "version-only CI bypass permits changes only to "
+            "MOZKEY_RELEASE_VERSION_MAJOR, MOZKEY_RELEASE_VERSION_MINOR, "
+            "and MOZKEY_RELEASE_VERSION_PATCH"
+        )
+    if candidate_version <= base_version:
+        base_tag = "v" + ".".join(str(value) for value in base_version)
+        candidate_tag = "v" + ".".join(str(value) for value in candidate_version)
+        raise ReleaseValidationError(
+            f"version-only release change must increase the version: "
+            f"{candidate_tag} is not newer than {base_tag}"
+        )
+    return candidate_version
 
 
 def parse_version_file(version_file: Path) -> tuple[int, int, int]:

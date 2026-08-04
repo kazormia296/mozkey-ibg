@@ -19,17 +19,40 @@ def _git(repository: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
-def _write_version(path: Path, version: tuple[int, int, int]) -> None:
+def _write_version(
+    path: Path,
+    version: tuple[int, int, int],
+    *,
+    build_expression: str = "BUILD_OSS",
+    engine_version: int = 24,
+    data_version: int = 11,
+    suffix: str = "",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(
             (
+                "# Representative src/version.bzl content used by CI preflight.",
+                "MAJOR = 3",
+                "MINOR = 33",
+                "BUILD_OSS = 6154",
+                f"BUILD = {build_expression}",
+                "REVISION = 100",
+                "",
+                "# User-facing release identity.",
                 f"MOZKEY_RELEASE_VERSION_MAJOR = {version[0]}",
                 f"MOZKEY_RELEASE_VERSION_MINOR = {version[1]}",
                 f"MOZKEY_RELEASE_VERSION_PATCH = {version[2]}",
                 "",
+                'DEFAULT_BUILD_LABEL_MACOS = "%d.%d.%d.%d" % (',
+                "    MAJOR, MINOR, BUILD, REVISION + 1",
+                ")",
+                f"ENGINE_VERSION = {engine_version}",
+                f"DATA_VERSION = {data_version}",
+                "",
             )
-        ),
+        )
+        + suffix,
         encoding="utf-8",
     )
 
@@ -56,7 +79,10 @@ class PreflightReleaseIdentityTest(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def _validate(
-        self, phase: str, candidate_tag: str | None = None
+        self,
+        phase: str,
+        candidate_tag: str | None = None,
+        base_ref: str | None = None,
     ):
         return validate_preflight_identity(
             phase=phase,
@@ -64,6 +90,7 @@ class PreflightReleaseIdentityTest(unittest.TestCase):
             version_file=self.version_file,
             repository=self.repository,
             main_ref="main",
+            base_ref=base_ref,
         )
 
     def test_pull_request_accepts_ordinary_change_at_current_version(self) -> None:
@@ -90,14 +117,107 @@ class PreflightReleaseIdentityTest(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseValidationError, "reuses existing"):
             self._validate("pull-request")
 
+    def test_pull_request_rejects_build_change_in_version_only_diff(self) -> None:
+        _git(self.repository, "switch", "-c", "broken-build")
+        _write_version(
+            self.version_file,
+            (0, 9, 4),
+            build_expression='"broken"',
+        )
+        _git(self.repository, "add", "src/version.bzl")
+        _git(self.repository, "commit", "-m", "break build identity")
+
+        with self.assertRaisesRegex(ReleaseValidationError, "permits changes only"):
+            self._validate("pull-request")
+
+    def test_pull_request_rejects_compatibility_version_changes(self) -> None:
+        _git(self.repository, "switch", "-c", "compatibility")
+        _write_version(
+            self.version_file,
+            (0, 9, 4),
+            engine_version=25,
+            data_version=0,
+        )
+        _git(self.repository, "add", "src/version.bzl")
+        _git(self.repository, "commit", "-m", "change compatibility identity")
+
+        with self.assertRaisesRegex(ReleaseValidationError, "permits changes only"):
+            self._validate("pull-request")
+
+    def test_pull_request_rejects_comment_in_version_only_diff(self) -> None:
+        _git(self.repository, "switch", "-c", "comment")
+        _write_version(
+            self.version_file,
+            (0, 9, 4),
+            suffix="# unexpected release comment\n",
+        )
+        _git(self.repository, "add", "src/version.bzl")
+        _git(self.repository, "commit", "-m", "add version comment")
+
+        with self.assertRaisesRegex(ReleaseValidationError, "permits changes only"):
+            self._validate("pull-request")
+
+    def test_pull_request_rejects_statement_in_version_only_diff(self) -> None:
+        _git(self.repository, "switch", "-c", "statement")
+        _write_version(
+            self.version_file,
+            (0, 9, 4),
+            suffix="UNEXPECTED_VERSION_STATE = True\n",
+        )
+        _git(self.repository, "add", "src/version.bzl")
+        _git(self.repository, "commit", "-m", "add version statement")
+
+        with self.assertRaisesRegex(ReleaseValidationError, "permits changes only"):
+            self._validate("pull-request")
+
+    def test_pull_request_defers_mixed_version_change_to_full_ci(self) -> None:
+        _git(self.repository, "switch", "-c", "mixed")
+        _write_version(
+            self.version_file,
+            (0, 9, 4),
+            build_expression='"broken"',
+        )
+        (self.repository / "feature.txt").write_text("feature\n", encoding="utf-8")
+        _git(self.repository, "add", "src/version.bzl", "feature.txt")
+        _git(self.repository, "commit", "-m", "mixed change")
+
+        self.assertEqual(
+            self._validate("pull-request").candidate_tag,
+            "v0.9.4",
+        )
+
     def test_pull_request_rejects_version_older_than_main(self) -> None:
         _git(self.repository, "switch", "-c", "old-release")
         _write_version(self.version_file, (0, 9, 3))
         _git(self.repository, "add", "src/version.bzl")
         _git(self.repository, "commit", "-m", "old version")
 
-        with self.assertRaisesRegex(ReleaseValidationError, "older than"):
+        with self.assertRaisesRegex(ReleaseValidationError, "not newer than"):
             self._validate("pull-request")
+
+    def test_branch_accepts_version_only_bump_from_push_base(self) -> None:
+        base_ref = _git(self.repository, "rev-parse", "HEAD")
+        _write_version(self.version_file, (0, 9, 5))
+        _git(self.repository, "add", "src/version.bzl")
+        _git(self.repository, "commit", "-m", "version 0.9.5")
+
+        identity = self._validate("branch", base_ref=base_ref)
+
+        self.assertEqual(identity.candidate_tag, "v0.9.5")
+        self.assertEqual(identity.commit, identity.main_commit)
+
+    def test_branch_rejects_non_release_version_change(self) -> None:
+        base_ref = _git(self.repository, "rev-parse", "HEAD")
+        _write_version(
+            self.version_file,
+            (0, 9, 4),
+            build_expression='"broken"',
+        )
+        _git(self.repository, "add", "src/version.bzl")
+        _git(self.repository, "commit", "-m", "break branch identity")
+
+        with self.assertRaisesRegex(ReleaseValidationError, "permits changes only"):
+            self._validate("branch", base_ref=base_ref)
 
     def test_pre_tag_requires_clean_main_and_absent_matching_tag(self) -> None:
         _git(self.repository, "tag", "-d", "v0.9.4")
