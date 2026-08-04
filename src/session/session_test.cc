@@ -4285,6 +4285,122 @@ TEST_F(SessionTest,
   Mock::VerifyAndClearExpectations(converter.get());
 }
 
+TEST_F(SessionTest, EnterCommitsPendingLiveConversionWithoutMaterializingIt) {
+  MockEngine engine;
+  std::shared_ptr<MockConverter> converter = CreateEngineConverterMock(&engine);
+
+  Session session(engine);
+  SessionTestPeer session_peer(session);
+  InitSessionToPrecomposition(&session);
+
+  config::Config config;
+  GetSessionTestConfig(&config);
+  config.set_use_live_conversion(true);
+  config.set_live_conversion_delay_msec(100);
+  session.SetConfig(config);
+
+  commands::Capability capability;
+  capability.set_text_deletion(commands::Capability::DELETE_PRECEDING_TEXT);
+  session.set_client_capability(capability);
+
+  EXPECT_CALL(*converter, StartConversion(_, _)).Times(0);
+
+  commands::Command command;
+  InsertCharacterString("かき", "aa", &session, &command);
+  ASSERT_TRUE(session_peer.live_conversion_pending_());
+  ASSERT_TRUE(command.output().live_conversion_pending());
+  EXPECT_PREEDIT("かき", command);
+
+  command.Clear();
+  ASSERT_TRUE(SendSpecialKey(commands::KeyEvent::ENTER, &session, &command));
+
+  EXPECT_FALSE(session_peer.live_conversion_pending_());
+  EXPECT_EQ(session.context().state(), ImeContext::PRECOMPOSITION);
+  EXPECT_RESULT_AND_KEY("かき", "かき", command);
+
+  EXPECT_TRUE(TryUndoAndAssertSuccess(&session));
+
+  command.Clear();
+  ASSERT_TRUE(session.Undo(&command));
+  ASSERT_TRUE(command.output().has_deletion_range());
+  EXPECT_EQ(command.output().deletion_range().offset(), -2);
+  EXPECT_EQ(command.output().deletion_range().length(), 2);
+  EXPECT_PREEDIT("かき", command);
+}
+
+TEST_F(SessionTest, EnterCommitsVisibleStablePrefixAndPendingSuffix) {
+  MockEngine engine;
+  std::shared_ptr<MockConverter> converter = CreateEngineConverterMock(&engine);
+
+  Session session(engine);
+  SessionTestPeer session_peer(session);
+  InitSessionToPrecomposition(&session);
+
+  config::Config config;
+  GetSessionTestConfig(&config);
+  config.set_use_live_conversion(true);
+  config.set_live_conversion_delay_msec(100);
+  session.SetConfig(config);
+
+  commands::Capability capability;
+  capability.set_text_deletion(commands::Capability::DELETE_PRECEDING_TEXT);
+  session.set_client_capability(capability);
+
+  Segments segments;
+  Segment* segment = segments.add_segment();
+  segment->set_key("きょうは");
+  AddCandidate("きょうは", "今日は", segment);
+
+  EXPECT_CALL(*converter, StartConversion(_, _))
+      .Times(1)
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  commands::Command command;
+  InsertCharacterString("きょうは", "aaaa", &session, &command);
+  ASSERT_TRUE(session_peer.live_conversion_pending_());
+  ASSERT_TRUE(command.output().has_callback());
+  ASSERT_TRUE(command.output().callback().has_session_command());
+
+  const commands::SessionCommand delayed_command =
+      command.output().callback().session_command();
+
+  command.Clear();
+  command.mutable_input()->set_type(commands::Input::SEND_COMMAND);
+  *command.mutable_input()->mutable_command() = delayed_command;
+  ASSERT_TRUE(session.SendCommand(&command));
+  ASSERT_TRUE(session_peer.live_conversion_active_());
+  EXPECT_PREEDIT("今日は", command);
+
+  Mock::VerifyAndClearExpectations(converter.get());
+  EXPECT_CALL(*converter, StartConversion(_, _)).Times(0);
+
+  command.Clear();
+  InsertCharacterString("まだ", "aa", &session, &command);
+  ASSERT_TRUE(session_peer.live_conversion_pending_());
+  ASSERT_TRUE(command.output().live_conversion_pending());
+  EXPECT_PREEDIT("今日はまだ", command);
+  const std::string visible_preedit = GetComposition(command);
+
+  command.Clear();
+  ASSERT_TRUE(SendSpecialKey(commands::KeyEvent::ENTER, &session, &command));
+
+  EXPECT_FALSE(session_peer.live_conversion_pending_());
+  EXPECT_EQ(session.context().state(), ImeContext::PRECOMPOSITION);
+  EXPECT_RESULT_AND_KEY("今日はまだ", "きょうはまだ", command);
+  EXPECT_EQ(command.output().result().value(), visible_preedit);
+
+  EXPECT_TRUE(TryUndoAndAssertSuccess(&session));
+
+  command.Clear();
+  ASSERT_TRUE(session.Undo(&command));
+  ASSERT_TRUE(command.output().has_deletion_range());
+  EXPECT_EQ(command.output().deletion_range().offset(), -5);
+  EXPECT_EQ(command.output().deletion_range().length(), 5);
+  // Undo restores the editable composer reading.  The stable converted prefix
+  // was a temporary Session overlay rather than converter-owned state.
+  EXPECT_PREEDIT("きょうはまだ", command);
+}
+
 TEST_F(SessionTest,
        LiveConversionShiftAsciiCommitsVisibleResultBeforeAsciiInput) {
   MockEngine engine;

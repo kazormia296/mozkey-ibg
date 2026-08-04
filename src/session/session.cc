@@ -5524,30 +5524,6 @@ bool Session::ApplyDelayedLiveConversion(commands::Command* command) {
   return MaybeStartLiveConversion(command);
 }
 
-bool Session::FlushPendingLiveConversion() {
-  if (!live_conversion_pending_) {
-    return false;
-  }
-
-  if (context_->state() != ImeContext::COMPOSITION) {
-    CancelPendingLiveConversion();
-    return false;
-  }
-
-  const std::string current_key = context_->composer().GetQueryForConversion();
-  if (current_key != pending_live_conversion_key_ ||
-      ShouldSkipLiveConversionForCompositionKey(
-          current_key,
-          GetLiveConversionCommittedLeftBoundary(*context_),
-          GetLiveConversionMinKeyLength(context_->GetConfig()))) {
-    CancelPendingLiveConversion();
-    return false;
-  }
-
-  commands::Command dummy_command;
-  return MaybeStartLiveConversion(&dummy_command);
-}
-
 std::string Session::ExtractZenzLeftContext(uint32_t max_chars) const {
   if (IsGrimodexSecureInput()) {
     return "";
@@ -8227,7 +8203,27 @@ bool Session::Commit(commands::Command* command) {
     return true;
   }
 
-  FlushPendingLiveConversion();
+  // Enter confirms what the user can currently see.  A pending delayed live
+  // conversion has not been shown yet, so do not materialize it just before
+  // committing.  Preserve any stable converted prefix and append the visible
+  // unconverted suffix instead.
+  if (live_conversion_pending_) {
+    // Keep Enter consistent with the ordinary CommitInternal() path: the
+    // committed result must remain undoable, even though this path commits the
+    // session-owned visible live-conversion overlay directly.  The ImeContext
+    // snapshot intentionally restores the underlying editable reading on
+    // Undo; the temporary converted-prefix display is not converter state.
+    PushUndoContext();
+
+    const bool committed =
+        CommitPendingLiveConversionDisplayDirectly(command);
+    if (committed && command->output().has_result()) {
+      // Undo calculates the deletion range from the previous committed output.
+      *context_->mutable_output() = command->output();
+    }
+    return committed;
+  }
+
   return CommitInternal(command,
                         context_->GetRequest().zero_query_suggestion());
 }

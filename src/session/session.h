@@ -575,7 +575,6 @@ class Session {
   bool MaybeStartLiveConversion(mozc::commands::Command* command);
   bool MaybeScheduleLiveConversion(mozc::commands::Command* command);
   bool ApplyDelayedLiveConversion(mozc::commands::Command* command);
-  bool FlushPendingLiveConversion();
   bool IgnoreStaleDelayedLiveConversion(mozc::commands::Command* command);
   void CancelPendingLiveConversion();
   void ClearLiveConversionState();
