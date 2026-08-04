@@ -4285,6 +4285,76 @@ TEST_F(SessionTest,
   Mock::VerifyAndClearExpectations(converter.get());
 }
 
+TEST_F(SessionTest, EnterCommitsPendingLiveConversionWithoutMaterializingIt) {
+  MockEngine engine;
+  std::shared_ptr<MockConverter> converter = CreateEngineConverterMock(&engine);
+
+  Session session(engine);
+  SessionTestPeer session_peer(session);
+  InitSessionToPrecomposition(&session);
+
+  config::Config config;
+  GetSessionTestConfig(&config);
+  config.set_use_live_conversion(true);
+  config.set_live_conversion_delay_msec(100);
+  session.SetConfig(config);
+
+  EXPECT_CALL(*converter, StartConversion(_, _)).Times(0);
+
+  commands::Command command;
+  InsertCharacterString("かき", "aa", &session, &command);
+  ASSERT_TRUE(session_peer.live_conversion_pending_());
+  ASSERT_TRUE(command.output().live_conversion_pending());
+  EXPECT_PREEDIT("かき", command);
+
+  command.Clear();
+  ASSERT_TRUE(SendSpecialKey(commands::KeyEvent::ENTER, &session, &command));
+
+  EXPECT_FALSE(session_peer.live_conversion_pending_());
+  EXPECT_EQ(session.context().state(), ImeContext::PRECOMPOSITION);
+  EXPECT_RESULT_AND_KEY("かき", "かき", command);
+}
+
+TEST_F(SessionTest, EnterCommitsVisibleStablePrefixAndPendingSuffix) {
+  MockEngine engine;
+  std::shared_ptr<MockConverter> converter = CreateEngineConverterMock(&engine);
+
+  Session session(engine);
+  SessionTestPeer session_peer(session);
+  InitSessionToPrecomposition(&session);
+
+  config::Config config;
+  GetSessionTestConfig(&config);
+  config.set_use_live_conversion(true);
+  config.set_live_conversion_delay_msec(100);
+  session.SetConfig(config);
+
+  EXPECT_CALL(*converter, StartConversion(_, _)).Times(0);
+
+  commands::Command command;
+  InsertCharacterString("きょうはまだ", "aaaaaa", &session, &command);
+  ASSERT_TRUE(session_peer.live_conversion_pending_());
+
+  session_peer.live_conversion_key_() = "きょうは";
+  session_peer.live_conversion_preedit_() = "きょうは";
+  session_peer.live_conversion_value_() = "今日は";
+
+  commands::Preedit& live_preedit =
+      session_peer.live_conversion_preedit_output_();
+  live_preedit.Clear();
+  commands::Preedit::Segment* segment = live_preedit.add_segment();
+  segment->set_key("きょうは");
+  segment->set_value("今日は");
+  segment->set_value_length(Util::CharsLen("今日は"));
+
+  command.Clear();
+  ASSERT_TRUE(SendSpecialKey(commands::KeyEvent::ENTER, &session, &command));
+
+  EXPECT_FALSE(session_peer.live_conversion_pending_());
+  EXPECT_EQ(session.context().state(), ImeContext::PRECOMPOSITION);
+  EXPECT_RESULT_AND_KEY("今日はまだ", "きょうはまだ", command);
+}
+
 TEST_F(SessionTest,
        LiveConversionShiftAsciiCommitsVisibleResultBeforeAsciiInput) {
   MockEngine engine;
