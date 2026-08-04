@@ -8,6 +8,7 @@ import unittest
 
 SUPPORTED_PLATFORMS = ("linux", "macos", "windows")
 MOBILE_PLATFORMS = ("android", "ios")
+ROUTINE_CI_WORKFLOWS = ("lint", *SUPPORTED_PLATFORMS, "secure-offline")
 
 
 class ReleaseWorkflowContractTest(unittest.TestCase):
@@ -290,6 +291,33 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 trigger = workflow.split("\npermissions:\n", maxsplit=1)[0]
                 self.assertIn("  pull_request:", trigger)
                 self.assertIn("  push:\n    branches:\n      - main", trigger)
+
+    def test_routine_ci_bypasses_version_only_changes(self) -> None:
+        for name in ROUTINE_CI_WORKFLOWS:
+            with self.subTest(workflow=name):
+                trigger = self._workflow(name).split(
+                    "\npermissions:\n", maxsplit=1
+                )[0]
+                self.assertRegex(
+                    trigger,
+                    r"(?m)^  pull_request:\n"
+                    r"    paths-ignore:\n"
+                    r"      - src/version\.bzl$",
+                )
+                self.assertRegex(
+                    trigger,
+                    r"(?m)^  push:\n"
+                    r"    branches:\n"
+                    r"      - main\n"
+                    r"    paths-ignore:\n"
+                    r"      - src/version\.bzl$",
+                )
+                self.assertEqual(trigger.count("- src/version.bzl"), 2)
+
+        preflight_trigger = self._workflow("release-preflight").split(
+            "\npermissions:\n", maxsplit=1
+        )[0]
+        self.assertNotIn("paths-ignore:", preflight_trigger)
 
     def test_intermediate_artifacts_are_namespaced_and_short_lived(self) -> None:
         artifact_names: list[str] = []

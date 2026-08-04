@@ -4,7 +4,11 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - src/version.bzl
   pull_request:
+    paths-ignore:
+      - src/version.bzl
   workflow_dispatch:
   workflow_call:
 
