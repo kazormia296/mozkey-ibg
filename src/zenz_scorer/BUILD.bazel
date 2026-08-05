@@ -44,6 +44,7 @@ mozc_cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":json_parser",
+        "//session:zenz_diagnostic",
         "//session:zenz_named_pipe_endpoint",
     ],
 )

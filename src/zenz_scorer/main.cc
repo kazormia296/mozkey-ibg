@@ -47,6 +47,7 @@
 #include <thread>
 #include <vector>
 
+#include "session/zenz_diagnostic.h"
 #include "session/zenz_named_pipe_endpoint.h"
 #include "zenz_scorer/json_parser.h"
 
@@ -809,6 +810,148 @@ std::string JsonEscapeUtf8(const std::string& input) {
   return output;
 }
 
+std::string GetDiagnosticEnvironmentValue(const char* name) {
+  const char* value = std::getenv(name);
+  return value == nullptr ? std::string() : std::string(value);
+}
+
+std::string GetDiagnosticFileSha256(const char* environment_name,
+                                    absl::string_view path) {
+  const std::string override = GetDiagnosticEnvironmentValue(environment_name);
+  if (!override.empty()) {
+    return override;
+  }
+  return mozc::session::ZenzDiagnosticCapture::Sha256File(path);
+}
+
+class ScorerHttpDiagnosticScope final {
+ public:
+  ScorerHttpDiagnosticScope(uint32_t generation,
+                            std::string request_kind,
+                            std::string prompt,
+                            std::string http_json,
+                            int ctx,
+                            int threads,
+                            int n_predict,
+                            uint32_t max_output_chars,
+                            std::string backend_device,
+                            std::string runtime_path,
+                            std::string model_path,
+                            std::string endpoint,
+                            std::string* value,
+                            std::string* debug)
+      : enabled_(mozc::session::ZenzDiagnosticCapture::IsEnabled()),
+        generation_(generation),
+        request_kind_(std::move(request_kind)),
+        value_(value),
+        debug_(debug),
+        start_(std::chrono::steady_clock::now()) {
+    if (!enabled_) {
+      return;
+    }
+
+    mozc::session::ZenzDiagnosticJson diagnostic;
+    diagnostic.AddString("event", "scorer_request");
+    diagnostic.AddUint64("generation", generation_);
+    diagnostic.AddString("request_kind", request_kind_);
+    diagnostic.AddBase64("prompt_base64", prompt);
+    diagnostic.AddCodepoints("prompt_codepoints", prompt);
+    diagnostic.AddBase64("http_json_base64", http_json);
+    diagnostic.AddString("runtime_path", runtime_path);
+    diagnostic.AddString("model_path", model_path);
+    diagnostic.AddString("endpoint", endpoint);
+    diagnostic.AddString(
+        "runtime_sha256",
+        GetDiagnosticFileSha256("MOZC_ZENZ_RUNTIME_SHA256", runtime_path));
+    diagnostic.AddString(
+        "model_sha256",
+        GetDiagnosticFileSha256("MOZC_ZENZ_MODEL_SHA256", model_path));
+
+    mozc::session::ZenzDiagnosticJson runtime_args;
+    runtime_args.AddUint64("ctx", static_cast<uint64_t>(ctx));
+    runtime_args.AddUint64("threads", static_cast<uint64_t>(threads));
+    runtime_args.AddUint64("n_predict", static_cast<uint64_t>(n_predict));
+    runtime_args.AddUint64("max_output_chars", max_output_chars);
+    runtime_args.AddString("device", backend_device.empty()
+                                          ? "auto"
+                                          : backend_device);
+    const std::string flash_attention = GetDiagnosticEnvironmentValue(
+        "MOZC_ZENZ_FLASH_ATTENTION");
+    runtime_args.AddString("flash_attention",
+                           flash_attention.empty() ? "auto" : flash_attention);
+    diagnostic.AddObject("runtime_args", runtime_args.Build());
+    mozc::session::ZenzDiagnosticCapture::Write(diagnostic);
+  }
+
+  ScorerHttpDiagnosticScope(const ScorerHttpDiagnosticScope&) = delete;
+  ScorerHttpDiagnosticScope& operator=(const ScorerHttpDiagnosticScope&) =
+      delete;
+
+  ~ScorerHttpDiagnosticScope() {
+    if (!enabled_) {
+      return;
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_);
+    mozc::session::ZenzDiagnosticJson diagnostic;
+    diagnostic.AddString("event", "scorer_response");
+    diagnostic.AddUint64("generation", generation_);
+    diagnostic.AddString("request_kind", request_kind_);
+    diagnostic.AddBool("ok", ok_);
+    diagnostic.AddString("debug", debug_ == nullptr ? "" : *debug_);
+    diagnostic.AddUint64("latency_msec",
+                         static_cast<uint64_t>(std::max<int64_t>(
+                             0, elapsed.count())));
+    diagnostic.AddBase64("raw_http_response_body_base64",
+                         raw_http_response_body_);
+    diagnostic.AddBase64("raw_model_output_base64", raw_model_output_);
+    diagnostic.AddBase64("clean_generated_text_base64",
+                         clean_generated_text_);
+    if (value_ != nullptr) {
+      diagnostic.AddBase64("value_base64", *value_);
+    }
+    mozc::session::ZenzDiagnosticCapture::Write(diagnostic);
+  }
+
+  void SetRawHttpResponseBody(std::string body) {
+    if (enabled_) {
+      raw_http_response_body_ = std::move(body);
+    }
+  }
+
+  void SetRawModelOutput(std::string output) {
+    if (enabled_) {
+      raw_model_output_ = std::move(output);
+    }
+  }
+
+  void SetCleanGeneratedText(std::string output) {
+    if (enabled_) {
+      clean_generated_text_ = std::move(output);
+    }
+  }
+
+  void MarkSuccess() {
+    if (enabled_) {
+      ok_ = true;
+    }
+  }
+
+ private:
+  const bool enabled_;
+  const uint32_t generation_;
+  const std::string request_kind_;
+  std::string* const value_;
+  std::string* const debug_;
+  const std::chrono::steady_clock::time_point start_;
+
+  bool ok_ = false;
+  std::string raw_http_response_body_;
+  std::string raw_model_output_;
+  std::string clean_generated_text_;
+};
+
 std::string TrimAsciiWhitespace(std::string s) {
   while (!s.empty()) {
     const unsigned char c = static_cast<unsigned char>(s.front());
@@ -1237,6 +1380,8 @@ bool HttpPostCompletion(
     const std::string& prompt,
     uint32_t timeout_msec,
     uint32_t max_output_chars,
+    uint32_t generation,
+    const std::string& request_kind,
     std::string* value,
     std::string* debug) {
   value->clear();
@@ -1304,6 +1449,9 @@ bool HttpPostCompletion(
   body += "\"top_p\":1.0,";
   body += "\"stream\":false,";
   body += "\"cache_prompt\":true,";
+  if (mozc::session::ZenzDiagnosticCapture::IsEnabled()) {
+    body += "\"n_probs\":5,";
+  }
   body += "\"stop\":["
           "\"\\uee00\","
           "\"\\uee01\","
@@ -1325,6 +1473,14 @@ bool HttpPostCompletion(
           "\"\\r\""
           "]";
   body += "}";
+
+  ScorerHttpDiagnosticScope diagnostic(
+      generation, request_kind, prompt, body, options.ctx, options.threads,
+      n_predict, max_output_chars, options.backend_device,
+      WideToUtf8(options.llama_server_path),
+      WideToUtf8(options.model_path),
+      WideToUtf8(options.host) + ":" + std::to_string(options.port), value,
+      debug);
 
   std::wstring headers = L"Content-Type: application/json; charset=utf-8\r\n";
   headers += L"Authorization: Bearer ";
@@ -1404,6 +1560,8 @@ bool HttpPostCompletion(
   WinHttpCloseHandle(connect);
   WinHttpCloseHandle(session);
 
+  diagnostic.SetRawHttpResponseBody(response_body);
+
   std::string content;
   if (!mozc::zenz_scorer::ExtractJsonStringField(response_body, "content",
                                                   &content)) {
@@ -1411,7 +1569,9 @@ bool HttpPostCompletion(
     return false;
   }
 
+  diagnostic.SetRawModelOutput(content);
   content = CleanGeneratedText(content, max_output_chars);
+  diagnostic.SetCleanGeneratedText(content);
   if (content.empty()) {
     *debug = "empty_content";
     return false;
@@ -1419,6 +1579,7 @@ bool HttpPostCompletion(
 
   *value = std::move(content);
   *debug = "ok";
+  diagnostic.MarkSuccess();
   return true;
 }
 
@@ -1470,6 +1631,8 @@ void StartLlamaReadyProbeInBackground(const Options& options) {
               "\xEE\xB8\x82\xEE\xB8\x80テスト\xEE\xB8\x81",
               kLlamaReadyProbeTimeoutMsec,
               8,
+              0,
+              "ready_probe",
               &value,
               &local_debug)) {
         if (runtime_generation != g_llama_runtime_generation.load()) {
@@ -1692,6 +1855,8 @@ void HandleClient(HANDLE pipe, const Options& options) {
           prompt,
           timeout_msec,
           max_output_chars,
+          request_header.generation,
+          "client_request",
           &value,
           &debug)) {
     const DWORD latency = GetTickCount() - start;
@@ -2015,6 +2180,8 @@ bool HttpPostCompletion(
     const std::string& prompt,
     uint32_t timeout_msec,
     uint32_t max_output_chars,
+    uint32_t generation,
+    const std::string& request_kind,
     std::string* value,
     std::string* debug) {
   value->clear();
@@ -2066,6 +2233,9 @@ bool HttpPostCompletion(
   body += "\"top_p\":1.0,";
   body += "\"stream\":false,";
   body += "\"cache_prompt\":true,";
+  if (mozc::session::ZenzDiagnosticCapture::IsEnabled()) {
+    body += "\"n_probs\":5,";
+  }
   body += "\"stop\":["
           "\"\\uee00\","
           "\"\\uee01\","
@@ -2087,6 +2257,13 @@ bool HttpPostCompletion(
           "\"\\r\""
           "]";
   body += "}";
+
+  ScorerHttpDiagnosticScope diagnostic(
+      generation, request_kind, prompt, body, options.ctx, options.threads,
+      n_predict, max_output_chars, options.backend_device,
+      options.llama_server_path,
+      options.model_path, options.host + ":" + std::to_string(options.port),
+      value, debug);
 
   std::string request = "POST /completion HTTP/1.1\r\n";
   request += "Host: " + options.host + ":" + std::to_string(options.port) + "\r\n";
@@ -2143,18 +2320,25 @@ bool HttpPostCompletion(
 
   size_t header_end = response_body.find("\r\n\r\n");
   if (header_end == std::string::npos) {
+    diagnostic.SetRawHttpResponseBody(response_body);
     *debug = "invalid_http_response";
     return false;
   }
 
+  const std::string response_body_json =
+      response_body.substr(header_end + 4);
+  diagnostic.SetRawHttpResponseBody(response_body_json);
+
   std::string content;
   if (!mozc::zenz_scorer::ExtractJsonStringField(
-          response_body.substr(header_end + 4), "content", &content)) {
+          response_body_json, "content", &content)) {
     *debug = "content_field_not_found";
     return false;
   }
 
+  diagnostic.SetRawModelOutput(content);
   content = CleanGeneratedText(content, max_output_chars);
+  diagnostic.SetCleanGeneratedText(content);
   if (content.empty()) {
     *debug = "empty_content";
     return false;
@@ -2162,6 +2346,7 @@ bool HttpPostCompletion(
 
   *value = std::move(content);
   *debug = "ok";
+  diagnostic.MarkSuccess();
   return true;
 }
 
@@ -2206,6 +2391,8 @@ void StartLlamaReadyProbeInBackground(const Options& options) {
               "\xEE\xB8\x82\xEE\xB8\x80テスト\xEE\xB8\x81",
               kLlamaReadyProbeTimeoutMsec,
               8,
+              0,
+              "ready_probe",
               &value,
               &local_debug)) {
         if (runtime_generation != g_llama_runtime_generation.load()) {
@@ -2391,7 +2578,8 @@ void HandleClient(ZenzSocketHandle pipe, const Options& options) {
 
   std::string value;
   if (!HttpPostCompletion(request_options, prompt, timeout_msec,
-                          max_output_chars, &value, &debug)) {
+                          max_output_chars, request_header.generation,
+                          "client_request", &value, &debug)) {
     const uint64_t latency = GetTickCountMsec() - start;
     SendResponse(pipe, request_header.generation, kStatusError, latency, "", debug);
     return;

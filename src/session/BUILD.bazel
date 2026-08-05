@@ -45,6 +45,29 @@ load("//bazel:run_build_tool.bzl", "mozc_run_build_tool")
 package(default_visibility = ["//visibility:private"])
 
 mozc_cc_library(
+    name = "zenz_diagnostic",
+    srcs = ["zenz_diagnostic.cc"],
+    hdrs = ["zenz_diagnostic.h"],
+    visibility = [
+        "//session:__pkg__",
+        "//zenz_scorer:__pkg__",
+    ],
+    deps = [
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+mozc_cc_test(
+    name = "zenz_diagnostic_test",
+    size = "small",
+    srcs = ["zenz_diagnostic_test.cc"],
+    deps = [
+        ":zenz_diagnostic",
+        "//testing:gunit_main",
+    ],
+)
+
+mozc_cc_library(
     name = "zenz_named_pipe_endpoint",
     hdrs = ["zenz_named_pipe_endpoint.h"],
     visibility = ["//zenz_scorer:__pkg__"],
@@ -112,6 +135,7 @@ mozc_cc_library(
         ":key_event_transformer",
         ":keymap",
         ":zenz_adoption_policy",
+        ":zenz_diagnostic",
         ":zenz_feedback_store",
         "//base:clock",
         "//base:util",

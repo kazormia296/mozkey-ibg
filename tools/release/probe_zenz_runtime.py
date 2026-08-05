@@ -871,6 +871,10 @@ def run_probe(
             "MOZC_ZENZ_CTX",
             "MOZC_ZENZ_THREADS",
             "MOZC_ZENZ_N_PREDICT",
+            "MOZC_ZENZ_DIAGNOSTIC_JSONL",
+            "MOZC_ZENZ_RUNTIME_SHA256",
+            "MOZC_ZENZ_MODEL_SHA256",
+            "MOZC_ZENZ_FLASH_ATTENTION",
         ):
             environment.pop(name, None)
 

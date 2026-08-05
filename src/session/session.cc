@@ -62,6 +62,7 @@
 #include "session/ime_context.h"
 #include "session/key_event_transformer.h"
 #include "session/keymap.h"
+#include "session/zenz_diagnostic.h"
 #include "session/zenz_named_pipe_client.h"
 #include "session/zenz_prompt_builder.h"
 #include "transliteration/transliteration.h"
@@ -174,6 +175,42 @@ std::string ZenzSafeDebugReason(absl::string_view debug) {
   }
 
   return std::string(debug);
+}
+
+void CaptureZenzSessionStage(uint32_t generation,
+                             absl::string_view stage,
+                             absl::string_view text) {
+  if (!ZenzDiagnosticCapture::IsEnabled()) {
+    return;
+  }
+
+  ZenzDiagnosticJson diagnostic;
+  diagnostic.AddString("event", "session_stage");
+  diagnostic.AddUint64("generation", generation);
+  diagnostic.AddString("stage", stage);
+  diagnostic.AddString("text", text);
+  diagnostic.AddBase64("text_base64", text);
+  ZenzDiagnosticCapture::Write(diagnostic);
+}
+
+void CaptureZenzSessionDecision(uint32_t generation,
+                               absl::string_view stage,
+                               bool accepted,
+                               absl::string_view reason,
+                               absl::string_view value) {
+  if (!ZenzDiagnosticCapture::IsEnabled()) {
+    return;
+  }
+
+  ZenzDiagnosticJson diagnostic;
+  diagnostic.AddString("event", "session_decision");
+  diagnostic.AddUint64("generation", generation);
+  diagnostic.AddString("stage", stage);
+  diagnostic.AddBool("accepted", accepted);
+  diagnostic.AddString("reason", reason);
+  diagnostic.AddString("value", value);
+  diagnostic.AddBase64("value_base64", value);
+  ZenzDiagnosticCapture::Write(diagnostic);
 }
 
 // Maximum size of multiple undo stack.
@@ -6402,7 +6439,7 @@ bool Session::MaybeApplyZenzFeedbackLiveCorrection(
     }
 
     ZenzAdoptionInput adoption_input;
-    adoption_input.key = std::string(zenz_key);
+    adoption_input.key = zenz_key;
     adoption_input.mozc_value = live_conversion_value_;
     adoption_input.zenz_value = feedback_value;
     adoption_input.protected_spans = live_conversion_protected_spans_;
@@ -6563,7 +6600,7 @@ bool Session::MaybeScheduleZenzLiveCorrection(commands::Command* command) {
   }
 
   ZenzProtectedPromptInput protected_prompt_input;
-  protected_prompt_input.key = std::string(zenz_key);
+  protected_prompt_input.key = zenz_key;
   protected_prompt_input.protected_spans = live_conversion_protected_spans_;
   const ZenzProtectedPromptResult protected_prompt =
       zenz_adoption_policy_.ProtectPromptKey(protected_prompt_input);
@@ -6576,13 +6613,19 @@ bool Session::MaybeScheduleZenzLiveCorrection(commands::Command* command) {
 
   pending_zenz_live_.generation = zenz_live_generation_;
   pending_zenz_live_.key = std::string(zenz_key);
+  pending_zenz_live_.raw_left_context = raw_left_context;
   pending_zenz_live_.left_context = left_context_for_prompt;
+  pending_zenz_live_.raw_right_context = raw_right_context;
   pending_zenz_live_.right_context = right_context_for_prompt;
   pending_zenz_live_.context_class = context_result.context_class;
   pending_zenz_live_.mozc_value = live_conversion_value_;
   pending_zenz_live_.symbol_style_source =
       live_conversion_preedit_.empty() ? std::string(zenz_key)
                                        : live_conversion_preedit_;
+  pending_zenz_live_.profile = prompt_options.profile;
+  pending_zenz_live_.topic = prompt_options.topic;
+  pending_zenz_live_.style = prompt_options.style;
+  pending_zenz_live_.settings = prompt_options.settings;
   pending_zenz_live_.prompt = prompt;
   pending_zenz_live_.protected_spans = protected_prompt.protected_spans;
   pending_zenz_live_.issued_at = Clock::GetAbslTime();
@@ -6901,6 +6944,35 @@ bool Session::AdvancePendingZenzLiveCorrection(
     request.reading_katakana =
         prompt_builder.HiraganaToKatakana(pending_zenz_live_.key);
 
+    if (ZenzDiagnosticCapture::IsEnabled()) {
+      ZenzDiagnosticJson diagnostic;
+      diagnostic.AddString("event", "session_request");
+      diagnostic.AddUint64("generation", pending_zenz_live_.generation);
+      diagnostic.AddString("reading", pending_zenz_live_.key);
+      diagnostic.AddString("mozc_value", pending_zenz_live_.mozc_value);
+      diagnostic.AddString("raw_left_context",
+                           pending_zenz_live_.raw_left_context);
+      diagnostic.AddString("left_context_for_prompt",
+                           pending_zenz_live_.left_context);
+      diagnostic.AddString("raw_right_context",
+                           pending_zenz_live_.raw_right_context);
+      diagnostic.AddString("right_context_for_prompt",
+                           pending_zenz_live_.right_context);
+      diagnostic.AddString("context_class", pending_zenz_live_.context_class);
+      diagnostic.AddString("profile", pending_zenz_live_.profile);
+      diagnostic.AddString("topic", pending_zenz_live_.topic);
+      diagnostic.AddString("style", pending_zenz_live_.style);
+      diagnostic.AddString("settings", pending_zenz_live_.settings);
+      diagnostic.AddBase64("prompt_base64", pending_zenz_live_.prompt);
+      diagnostic.AddCodepoints("prompt_codepoints", pending_zenz_live_.prompt);
+      diagnostic.AddUint64("protected_span_count",
+                           pending_zenz_live_.protected_spans.size());
+      diagnostic.AddUint64("timeout_msec", request.timeout_msec);
+      diagnostic.AddUint64("max_output_chars", request.max_output_chars);
+      diagnostic.AddString("backend_device", request.backend_device);
+      ZenzDiagnosticCapture::Write(diagnostic);
+    }
+
     ZenzDebugOutput(absl::StrCat(
         "[zenz] async submit pipe_configured=",
         config.zenz_live_correction_pipe_name().empty() ? "false" : "true",
@@ -6999,12 +7071,18 @@ bool Session::ApplyZenzLiveCorrectionResult(
     const ZenzLiveResponse& response,
     commands::Command* command) {
   const config::Config& config = context_->GetConfig();
+  const uint32_t generation = pending_zenz_live_.generation;
+
+  CaptureZenzSessionStage(generation, "raw_response", response.value);
 
   if (!response.ok || response.timeout) {
     const std::string debug =
         response.debug.empty()
             ? "zenz_response_not_ok"
             : ZenzSafeDebugReason(response.debug);
+
+    CaptureZenzSessionDecision(
+        generation, "response", false, debug, response.value);
 
     CancelPendingZenzLiveCorrection();
     Output(command);
@@ -7037,6 +7115,7 @@ bool Session::ApplyZenzLiveCorrectionResult(
         ZenzRedactedTextStats("value", zenz_value),
         " context_class=", pending_zenz_live_.context_class));
   }
+  CaptureZenzSessionStage(generation, "after_left_context_strip", zenz_value);
 
   const std::string zenz_value_before_placeholder_restore = zenz_value;
   zenz_value = zenz_adoption_policy_.RestorePlaceholders(
@@ -7049,6 +7128,7 @@ bool Session::ApplyZenzLiveCorrectionResult(
                  "raw_value", zenz_value_before_placeholder_restore),
         " context_class=", pending_zenz_live_.context_class));
   }
+  CaptureZenzSessionStage(generation, "after_placeholder_restore", zenz_value);
 
   const absl::string_view zenz_symbol_style_source =
       pending_zenz_live_.symbol_style_source.empty()
@@ -7073,6 +7153,7 @@ bool Session::ApplyZenzLiveCorrectionResult(
                                    zenz_value_before_symbol_restore),
         " context_class=", pending_zenz_live_.context_class));
   }
+  CaptureZenzSessionStage(generation, "after_symbol_style_restore", zenz_value);
 
   const std::string context_class =
       pending_zenz_live_.context_class.empty()
@@ -7090,6 +7171,9 @@ bool Session::ApplyZenzLiveCorrectionResult(
 
   const ZenzValidationResult validation =
       zenz_output_validator_.Validate(validation_input);
+
+  CaptureZenzSessionDecision(generation, "validator", validation.accept,
+                             validation.reason, zenz_value);
 
   if (!validation.accept) {
     ZenzDebugOutput(absl::StrCat(
@@ -7131,6 +7215,10 @@ bool Session::ApplyZenzLiveCorrectionResult(
                               pending_zenz_live_.mozc_value),
         " context_class=", context_class));
 
+    CaptureZenzSessionDecision(
+        generation, "key_privacy", false,
+        absl::StrCat("key_privacy_", key_privacy.reason), zenz_value);
+
     CancelPendingZenzLiveCorrection();
     Output(command);
 
@@ -7163,6 +7251,10 @@ bool Session::ApplyZenzLiveCorrectionResult(
                               pending_zenz_live_.mozc_value),
         " context_class=", context_class));
 
+    CaptureZenzSessionDecision(
+        generation, "value_privacy", false,
+        absl::StrCat("value_privacy_", value_privacy.reason), zenz_value);
+
     CancelPendingZenzLiveCorrection();
     Output(command);
 
@@ -7190,6 +7282,10 @@ bool Session::ApplyZenzLiveCorrectionResult(
 
   const ZenzAdoptionResult adoption =
       zenz_adoption_policy_.Decide(adoption_input);
+  CaptureZenzSessionDecision(
+      generation, "adoption_policy",
+      adoption.action != ZenzAdoptionResult::Action::kReject,
+      adoption.reason, adoption.value.empty() ? zenz_value : adoption.value);
   if (adoption.action == ZenzAdoptionResult::Action::kReject) {
     ZenzDebugOutput(absl::StrCat(
         "[zenz] adoption rejected reason=", adoption.reason,
@@ -7227,6 +7323,12 @@ bool Session::ApplyZenzLiveCorrectionResult(
         " ", ZenzRedactedTextStats("value", zenz_value),
         " context_class=", context_class));
 
+    CaptureZenzSessionDecision(
+        generation, "adopted_value_privacy", false,
+        absl::StrCat("adopted_value_privacy_",
+                     adopted_value_privacy.reason),
+        zenz_value);
+
     CancelPendingZenzLiveCorrection();
     Output(command);
     command->mutable_output()->set_live_conversion(true);
@@ -7255,6 +7357,9 @@ bool Session::ApplyZenzLiveCorrectionResult(
           " context_class=", context_class,
           " accepted_count=", feedback_decision.accepted_count,
           " rejected_count=", feedback_decision.rejected_count));
+
+      CaptureZenzSessionDecision(
+          generation, "feedback", false, feedback_decision.reason, zenz_value);
 
       CancelPendingZenzLiveCorrection();
       Output(command);
@@ -7319,6 +7424,8 @@ bool Session::OutputZenzLiveCorrection(
       ZenzRedactedTextStats("key", zenz_live_key_),
       " ", ZenzRedactedTextStats("value", value),
       " context_class=", zenz_live_context_class_));
+
+  CaptureZenzSessionStage(zenz_live_visible_generation_, "display", value);
 
   // Do not record acceptance here. Displaying a zenz correction is not the same
   // as user acceptance. Acceptance must be recorded only when the user commits
