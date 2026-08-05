@@ -31,21 +31,28 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
             "57321",
             "--api-key",
             "a" * 64,
+            "--flash-attn",
+            "auto",
         ]
-        port, key = probe._inspect_llama_argv(
-            arguments,
-            expected_link=link,
-            expected_model=model,
-        )
-        self.assertEqual(port, 57321)
-        self.assertEqual(len(key), 64)
+        for flash_attention in ("auto", "on", "off"):
+            with self.subTest(flash_attention=flash_attention):
+                candidate = list(arguments)
+                candidate[14] = flash_attention
+                port, key = probe._inspect_llama_argv(
+                    candidate,
+                    expected_link=link,
+                    expected_model=model,
+                )
+                self.assertEqual(port, 57321)
+                self.assertEqual(key, "a" * 64)
         device_port, device_key = probe._inspect_llama_argv(
             arguments + ["--device", "Vulkan0"],
             expected_link=link,
             expected_model=model,
+            expected_backend_device="Vulkan0",
         )
-        self.assertEqual(device_port, port)
-        self.assertEqual(device_key, key)
+        self.assertEqual(device_port, 57321)
+        self.assertEqual(device_key, "a" * 64)
 
     def test_rejects_non_loopback_or_malformed_llama_arguments(self):
         link = Path("/private/stage/usr/lib/mozkey-ibg/llama-server")
@@ -64,6 +71,8 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
             "57321",
             "--api-key",
             "b" * 64,
+            "--flash-attn",
+            "auto",
         ]
         exposed = list(base)
         exposed[8] = "0.0.0.0"
@@ -75,6 +84,41 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
             probe._inspect_llama_argv(
                 duplicate, expected_link=link, expected_model=model
+            )
+        duplicate_flash_attention = list(base) + ["--flash-attn", "auto"]
+        with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
+            probe._inspect_llama_argv(
+                duplicate_flash_attention,
+                expected_link=link,
+                expected_model=model,
+            )
+        extra = list(base) + ["--device", "Vulkan0", "extra"]
+        with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
+            probe._inspect_llama_argv(
+                extra, expected_link=link, expected_model=model
+            )
+        missing_flash_attention = base[:-2]
+        with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
+            probe._inspect_llama_argv(
+                missing_flash_attention,
+                expected_link=link,
+                expected_model=model,
+            )
+        invalid_flash_attention = list(base)
+        invalid_flash_attention[14] = "enabled"
+        with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
+            probe._inspect_llama_argv(
+                invalid_flash_attention,
+                expected_link=link,
+                expected_model=model,
+            )
+        invalid_flash_attention_flag = list(base)
+        invalid_flash_attention_flag[13] = "--flash-attention"
+        with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
+            probe._inspect_llama_argv(
+                invalid_flash_attention_flag,
+                expected_link=link,
+                expected_model=model,
             )
         weak_key = list(base)
         weak_key[12] = "not-a-release-key"

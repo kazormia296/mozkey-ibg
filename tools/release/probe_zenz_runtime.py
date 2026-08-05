@@ -331,7 +331,7 @@ def _inspect_llama_argv(
     expected_model: Path,
     expected_backend_device: str | None = None,
 ) -> tuple[int, str]:
-    if len(argv) not in {13, 15}:
+    if len(argv) not in {15, 17}:
         raise ProbeFailure("llama_arguments_invalid")
     if argv[0] != str(expected_link):
         raise ProbeFailure("llama_arguments_invalid")
@@ -341,11 +341,13 @@ def _inspect_llama_argv(
         raise ProbeFailure("llama_arguments_invalid")
     if argv[7:12:2] != ["--host", "--port", "--api-key"]:
         raise ProbeFailure("llama_arguments_invalid")
+    if argv[13] != "--flash-attn" or argv[14] not in {"auto", "on", "off"}:
+        raise ProbeFailure("llama_arguments_invalid")
     backend_device = ""
-    if len(argv) == 15:
-        backend_device = argv[14]
+    if len(argv) == 17:
+        backend_device = argv[16]
         if (
-            argv[13] != "--device"
+            argv[15] != "--device"
             or not backend_device
             or len(backend_device) > 128
             or any(
