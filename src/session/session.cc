@@ -5539,13 +5539,23 @@ std::string Session::ExtractZenzLeftContext(uint32_t max_chars) const {
 
   const std::string& preceding_text =
       context_->client_context().preceding_text();
-  const size_t len = Util::CharsLen(preceding_text);
+
+  // Left context should describe only the text before the cursor on the
+  // current line.  Do not concatenate preceding lines when the prompt builder
+  // removes line-feed characters.
+  const size_t line_break_pos = preceding_text.find_last_of("\r\n");
+  absl::string_view current_line = preceding_text;
+  if (line_break_pos != std::string::npos) {
+    current_line.remove_prefix(line_break_pos + 1);
+  }
+
+  const size_t len = Util::CharsLen(current_line);
   if (len <= max_chars) {
-    return preceding_text;
+    return std::string(current_line);
   }
 
   return std::string(
-    Util::Utf8SubString(preceding_text, len - max_chars, max_chars));
+      Util::Utf8SubString(current_line, len - max_chars, max_chars));
 }
 
 std::string Session::ExtractZenzRightContext(uint32_t max_chars) const {

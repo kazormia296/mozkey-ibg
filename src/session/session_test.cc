@@ -112,6 +112,7 @@ class SessionTestPeer : testing::TestPeer<Session> {
   PEER_METHOD(MaybeStartLiveConversion);
   PEER_METHOD(AttachLiveConversionSuggestionCandidateWindow);
   PEER_METHOD(AttachCachedLiveConversionSuggestionCandidateWindow);
+  PEER_METHOD(ExtractZenzLeftContext);
 
   PEER_VARIABLE(context_);
   PEER_VARIABLE(grimodex_domain_);
@@ -3128,6 +3129,35 @@ TEST_F(SessionTest,
   EXPECT_FALSE(command.output().live_conversion());
   EXPECT_FALSE(command.output().has_candidate_window());
   EXPECT_TRUE(EnsurePreedit("あ", command));
+}
+
+TEST_F(SessionTest, ExtractZenzLeftContextUsesOnlyCurrentLine) {
+  Session session(*mock_data_engine_);
+  SessionTestPeer session_peer(session);
+
+  struct TestCase {
+    absl::string_view preceding_text;
+    uint32_t max_chars;
+    absl::string_view expected;
+  };
+  const TestCase test_cases[] = {
+      {"今日は的", 24, "今日は的"},
+      {"的\n的", 24, "的"},
+      {"的\r的", 24, "的"},
+      {"的\r\n敵", 24, "敵"},
+      {"的\n", 24, ""},
+      {"前の行\nあいうえお", 3, "うえお"},
+  };
+
+  for (const TestCase& test_case : test_cases) {
+    SCOPED_TRACE(::testing::Message()
+                 << "preceding_text=" << test_case.preceding_text
+                 << " max_chars=" << test_case.max_chars);
+    session_peer.context_()->mutable_client_context()->set_preceding_text(
+        std::string(test_case.preceding_text));
+    EXPECT_EQ(session_peer.ExtractZenzLeftContext(test_case.max_chars),
+              test_case.expected);
+  }
 }
 
 TEST_F(SessionTest,
