@@ -17,7 +17,10 @@ jobs:
   release-gate:
     name: Validate release identity and main ancestry
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # The repository history is large. Preserve complete ancestry and tags while
+    # avoiding historical blob downloads, and leave room for hosted-runner
+    # network variance before any product build starts.
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.validate.outputs.tag }}
       version: ${{ steps.validate.outputs.version }}
@@ -27,6 +30,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
         with:
           fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
 
       - name: Validate tag, version.bzl, checkout, and main ancestry
