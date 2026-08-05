@@ -8,11 +8,23 @@ on:
         description: New vX.Y.Z tag to validate before creating it
         required: true
         type: string
+      identity_phase:
+        description: Identity phase for a direct release preflight
+        required: true
+        default: pre-tag
+        type: choice
+        options:
+          - pre-tag
   workflow_call:
     inputs:
       candidate_tag:
         description: Existing release tag being checked before product builds
         required: true
+        type: string
+      identity_phase:
+        description: Identity phase selected by reusable workflow callers
+        required: false
+        default: tag
         type: string
 
 permissions:
@@ -38,6 +50,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Validate identity phase contract
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          IDENTITY_PHASE: ${{ inputs.identity_phase }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$IDENTITY_PHASE" in
+            pre-tag|tag) ;;
+            *)
+              echo "::error::Unsupported release identity phase: $IDENTITY_PHASE" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Validate pull-request release identity
         if: ${{ github.event_name == 'pull_request' }}
         run: >-
@@ -48,7 +75,7 @@ jobs:
           --main-ref origin/main
 
       - name: Validate pre-tag release identity
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+        if: ${{ inputs.identity_phase == 'pre-tag' }}
         env:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
         run: >-
@@ -60,9 +87,7 @@ jobs:
           --main-ref origin/main
 
       - name: Revalidate tagged release identity
-        if: >-
-          ${{ github.event_name != 'pull_request' &&
-              github.event_name != 'workflow_dispatch' }}
+        if: ${{ inputs.identity_phase == 'tag' }}
         env:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
         run: >-
@@ -86,6 +111,7 @@ jobs:
             tools.release.preflight_release_identity_test \
             tools.release.preflight_release_inputs_test \
             tools.release.product_identity_contract_test \
+            tools.release.release_preflight_phase_contract_test \
             tools.release.release_workflow_contract_test \
             tools.release.validate_mozkey_release_test
 
