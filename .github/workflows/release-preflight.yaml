@@ -26,7 +26,10 @@ jobs:
   portable:
     name: Identity, pinned inputs, PowerShell, and workflow contract
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # This job fetches the complete repository history and tags. GitHub-hosted
+    # runner checkout time can vary substantially, so keep the job timeout
+    # above the normal one-minute checkout without weakening step contracts.
+    timeout-minutes: 10
 
     steps:
       - name: Checkout with main history and tags
