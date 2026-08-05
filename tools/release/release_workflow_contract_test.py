@@ -566,6 +566,28 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn(
             "pacman -Syy --noconfirm --disable-download-timeout", arch_snapshot
         )
+        for command, workflow in (
+            (
+                "pacman -S --noconfirm --disable-download-timeout git",
+                linux,
+            ),
+            (
+                "pacman -S --noconfirm --disable-download-timeout --needed "
+                '"${release_packages[@]}"',
+                linux,
+            ),
+            (
+                "pacman -S --noconfirm --disable-download-timeout --needed git",
+                preflight,
+            ),
+            (
+                "pacman -S --noconfirm --disable-download-timeout --needed "
+                "curl gcc binutils",
+                preflight,
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, workflow)
         self.assertIn(
             "Server = https://archive.archlinux.org/repos/2026/07/17/"
             "$repo/os/$arch",
