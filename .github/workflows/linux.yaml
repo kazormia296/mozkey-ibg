@@ -311,8 +311,8 @@ jobs:
           cat > /etc/pacman.d/mirrorlist <<'EOF'
           Server = https://archive.archlinux.org/repos/2026/07/17/$repo/os/$arch
           EOF
-          pacman -Syy --noconfirm
-          pacman -S --noconfirm git
+          pacman -Syy --noconfirm --disable-download-timeout
+          pacman -S --noconfirm --disable-download-timeout git
 
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
@@ -325,7 +325,7 @@ jobs:
           tools/release/use_archlinux_snapshot.sh
           mapfile -t release_packages \
             < tools/release/archlinux_release_packages.txt
-          pacman -S --noconfirm --needed "${release_packages[@]}"
+          pacman -S --noconfirm --disable-download-timeout --needed "${release_packages[@]}"
 
       - name: Download release-approved dictionary
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6
@@ -427,6 +427,7 @@ jobs:
           python tools/release/normalize_zenz_gguf.py verify --root .
           python -m unittest \
             tools.check_no_network_checks_test \
+            tools.replay_zenz_diagnostic_test \
             scripts.install_mozkey_linux_bazel_test \
             scripts.install_zenz_runtime_test \
             scripts.package_mozkey_linux_bazel_test \

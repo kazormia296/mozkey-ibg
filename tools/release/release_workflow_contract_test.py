@@ -123,7 +123,14 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("  workflow_call:", preflight)
         preflight_trigger = preflight.split("\npermissions:\n", maxsplit=1)[0]
         self.assertNotRegex(preflight_trigger, r"(?m)^  push:")
-        self.assertEqual(preflight.count("timeout-minutes: 5"), 3)
+        # Only the full-history portable job needs the extended checkout budget.
+        preflight_jobs = self._split_job_blocks(preflight)
+        self.assertIn("timeout-minutes: 10", preflight_jobs["portable"])
+        self.assertNotIn("timeout-minutes: 5", preflight_jobs["portable"])
+        self.assertIn("timeout-minutes: 5", preflight_jobs["archlinux"])
+        self.assertNotIn("timeout-minutes: 10", preflight_jobs["archlinux"])
+        self.assertIn("timeout-minutes: 5", preflight_jobs["fedora"])
+        self.assertNotIn("timeout-minutes: 10", preflight_jobs["fedora"])
         self.assertIn("preflight_release_identity.py", preflight)
         self.assertIn("preflight_release_inputs.py", preflight)
         self.assertIn("check_powershell_preflight.ps1", preflight)
@@ -550,6 +557,37 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("fedora/linux/updates/42/Everything/", linux)
         self.assertIn("RPM-GPG-KEY-fedora-42-primary", linux)
         self.assertIn('readonly SNAPSHOT_DATE="2026/07/17"', arch_snapshot)
+        self.assertIn(
+            "pacman -Syy --noconfirm --disable-download-timeout", linux
+        )
+        self.assertIn(
+            "pacman -Syy --noconfirm --disable-download-timeout", preflight
+        )
+        self.assertIn(
+            "pacman -Syy --noconfirm --disable-download-timeout", arch_snapshot
+        )
+        for command, workflow in (
+            (
+                "pacman -S --noconfirm --disable-download-timeout git",
+                linux,
+            ),
+            (
+                "pacman -S --noconfirm --disable-download-timeout --needed "
+                '"${release_packages[@]}"',
+                linux,
+            ),
+            (
+                "pacman -S --noconfirm --disable-download-timeout --needed git",
+                preflight,
+            ),
+            (
+                "pacman -S --noconfirm --disable-download-timeout --needed "
+                "curl gcc binutils",
+                preflight,
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, workflow)
         self.assertIn(
             "Server = https://archive.archlinux.org/repos/2026/07/17/"
             "$repo/os/$arch",

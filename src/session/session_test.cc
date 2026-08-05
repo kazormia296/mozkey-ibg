@@ -14668,6 +14668,10 @@ TEST_F(SessionTest, GrimodexPinnedProjectConditionsOverrideZenzPrompt) {
   commands::Command command;
   ASSERT_TRUE(session_peer.MaybeScheduleZenzLiveCorrection(&command));
   const std::string& prompt = session_peer.pending_zenz_live_().prompt;
+  EXPECT_EQ(prompt.find('\0'), std::string::npos);
+  EXPECT_NE(prompt.find(std::string("\xEE\xB8\x80") + "アイ" +
+                        "\xEE\xB8\x81"),
+            std::string::npos);
   EXPECT_NE(prompt.find(std::string("\xEE\xB8\x83") + "config-profile"),
             std::string::npos);
   EXPECT_NE(prompt.find(std::string("\xEE\xB8\x84") + "project-topic"),

@@ -28,6 +28,17 @@ class ZenzScorerSecurityContractTest(unittest.TestCase):
         self.assertIn("same-user residual risk is explicit", policy)
         self.assertIn("--api-key", policy)
 
+    def test_diagnostic_runtime_and_http_request_are_reproducible(self) -> None:
+        source = (ROOT / "src/zenz_scorer/main.cc").read_text(encoding="utf-8")
+        for marker in (
+            "MOZC_ZENZ_FLASH_ATTENTION",
+            "--flash-attn",
+            "runtime_args.AddString(\"flash_attention\", flash_attention)",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, source)
+        self.assertNotIn('body += "\\\"n_probs\\\":5,"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

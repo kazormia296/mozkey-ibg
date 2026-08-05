@@ -383,11 +383,17 @@ class Session {
   struct PendingZenzLiveCorrection {
     uint32_t generation = 0;
     std::string key;
+    std::string raw_left_context;
     std::string left_context;
+    std::string raw_right_context;
     std::string right_context;
     std::string context_class;
     std::string mozc_value;
     std::string symbol_style_source;
+    std::string profile;
+    std::string topic;
+    std::string style;
+    std::string settings;
     std::string prompt;
     std::vector<ProtectedConversionSpan> protected_spans;
     absl::Time issued_at;

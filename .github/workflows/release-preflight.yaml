@@ -26,7 +26,10 @@ jobs:
   portable:
     name: Identity, pinned inputs, PowerShell, and workflow contract
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # This job fetches the complete repository history and tags. GitHub-hosted
+    # runner checkout time can vary substantially, so keep the job timeout
+    # above the normal one-minute checkout without weakening step contracts.
+    timeout-minutes: 10
 
     steps:
       - name: Checkout with main history and tags
@@ -98,8 +101,8 @@ jobs:
           cat > /etc/pacman.d/mirrorlist <<'EOF'
           Server = https://archive.archlinux.org/repos/2026/07/17/$repo/os/$arch
           EOF
-          pacman -Syy --noconfirm
-          pacman -S --noconfirm --needed git
+          pacman -Syy --noconfirm --disable-download-timeout
+          pacman -S --noconfirm --disable-download-timeout --needed git
 
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
@@ -110,7 +113,7 @@ jobs:
       - name: Verify snapshot URLs, package DB, and assembler option
         run: |
           tools/release/use_archlinux_snapshot.sh
-          pacman -S --noconfirm --needed curl gcc binutils
+          pacman -S --noconfirm --disable-download-timeout --needed curl gcc binutils
           for repository in core extra; do
             curl --fail --silent --show-error --location --head \
               --retry 2 --max-time 20 \
