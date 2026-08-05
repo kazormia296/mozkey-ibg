@@ -558,6 +558,15 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("RPM-GPG-KEY-fedora-42-primary", linux)
         self.assertIn('readonly SNAPSHOT_DATE="2026/07/17"', arch_snapshot)
         self.assertIn(
+            "pacman -Syy --noconfirm --disable-download-timeout", linux
+        )
+        self.assertIn(
+            "pacman -Syy --noconfirm --disable-download-timeout", preflight
+        )
+        self.assertIn(
+            "pacman -Syy --noconfirm --disable-download-timeout", arch_snapshot
+        )
+        self.assertIn(
             "Server = https://archive.archlinux.org/repos/2026/07/17/"
             "$repo/os/$arch",
             linux,
