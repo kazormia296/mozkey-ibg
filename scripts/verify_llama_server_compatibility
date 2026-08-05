@@ -137,12 +137,13 @@ file_limit_blocks=128
 
 run_bounded_probe() {
   probe_name="$1"
-  probe_argument="$2"
+  shift
+  probe_arguments="$*"
   probe_output="${probe_dir}/${probe_name}.txt"
   if (
     ulimit -f "${file_limit_blocks}"
     exec "${timeout_command}" --signal=TERM --kill-after=1 \
-      "${probe_timeout}" "${resolved_server}" "${probe_argument}"
+      "${probe_timeout}" "${resolved_server}" "$@"
   ) >"${probe_output}" 2>&1; then
     probe_status=0
   else
@@ -150,21 +151,24 @@ run_bounded_probe() {
   fi
   probe_size="$(wc -c < "${probe_output}")"
   if [ "${probe_size}" -gt "${max_output_bytes}" ]; then
-    echo "llama-server ${probe_argument} exceeded the output limit" >&2
+    echo "llama-server ${probe_arguments} exceeded the output limit" >&2
     return 1
   fi
   if [ "${probe_status}" -eq 124 ] || [ "${probe_status}" -eq 137 ]; then
-    echo "llama-server ${probe_argument} timed out" >&2
+    echo "llama-server ${probe_arguments} timed out" >&2
     return 1
   fi
   if [ "${probe_status}" -ne 0 ]; then
-    echo "llama-server ${probe_argument} failed (status ${probe_status})" >&2
+    echo "llama-server ${probe_arguments} failed (status ${probe_status})" >&2
     return 1
   fi
 }
 
 run_bounded_probe version --version
 run_bounded_probe help --help
+run_bounded_probe flash_attention_auto --flash-attn auto --version
+run_bounded_probe flash_attention_on --flash-attn on --version
+run_bounded_probe flash_attention_off --flash-attn off --version
 if [ -n "${attested_sha256}" ]; then
   post_probe_sha256="$(sha256sum -- "${resolved_server}" | awk '{print $1}')"
   if [ "${post_probe_sha256}" != "${attested_sha256}" ]; then
@@ -177,7 +181,7 @@ help_output="${probe_dir}/help.txt"
 
 for required_flag in \
   '--api-key' '--host' '--port' '--model' '--ctx-size' '--threads' \
-  '--device' '--list-devices'
+  '--device' '--list-devices' '--flash-attn'
 do
   grep -Fq -- "${required_flag}" "${help_output}" || {
     echo "llama-server is missing required CLI flag: ${required_flag}" >&2

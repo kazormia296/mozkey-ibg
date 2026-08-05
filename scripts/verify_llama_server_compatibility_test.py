@@ -10,7 +10,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("verify_llama_server_compatibility")
 FLAGS = (
     "--api-key --host --port --model --ctx-size --threads "
-    "--device --list-devices"
+    "--device --list-devices --flash-attn"
 )
 
 
@@ -33,17 +33,27 @@ class VerifyLlamaServerCompatibilityTest(unittest.TestCase):
             check=False,
         )
 
+    def value_form_server_body(self, version: str) -> str:
+        return f'''\
+        case "$1" in
+          --version) echo "version: {version}" ;;
+          --help) echo "{FLAGS}" ;;
+          --flash-attn)
+            case "$2" in
+              auto|on|off) [ "$3" = --version ] || exit 2 ;;
+              *) exit 2 ;;
+            esac
+            echo "version: {version}"
+            ;;
+          *) exit 2 ;;
+        esac
+        '''
+
     def test_accepts_bounded_compatible_cli_under_test_override(self):
         with tempfile.TemporaryDirectory() as temporary:
             server = self.make_server(
                 Path(temporary),
-                f'''\
-                case "$1" in
-                  --version) echo "version: test" ;;
-                  --help) echo "{FLAGS}" ;;
-                  *) exit 2 ;;
-                esac
-                ''',
+                self.value_form_server_body("test"),
             )
             result = self.run_verifier(
                 server, MOZKEY_LLAMA_ALLOW_UNTRUSTED_FOR_TESTS="1"
@@ -65,13 +75,7 @@ class VerifyLlamaServerCompatibilityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             server = self.make_server(
                 Path(temporary),
-                f'''\
-                case "$1" in
-                  --version) echo "version: attested" ;;
-                  --help) echo "{FLAGS}" ;;
-                  *) exit 2 ;;
-                esac
-                ''',
+                self.value_form_server_body("attested"),
             )
             digest = hashlib.sha256(server.read_bytes()).hexdigest()
             result = self.run_verifier(
@@ -133,6 +137,28 @@ class VerifyLlamaServerCompatibilityTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("missing required CLI flag", result.stderr)
+
+    def test_rejects_boolean_only_flash_attention(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = self.make_server(
+                Path(temporary),
+                f'''\
+                case "$1" in
+                  --version) echo "version: boolean-only" ;;
+                  --help) echo "{FLAGS}" ;;
+                  --flash-attn)
+                    [ "$2" = --version ] || exit 2
+                    echo "version: boolean-only"
+                    ;;
+                  *) exit 2 ;;
+                esac
+                ''',
+            )
+            result = self.run_verifier(
+                server, MOZKEY_LLAMA_ALLOW_UNTRUSTED_FOR_TESTS="1"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--flash-attn auto --version failed", result.stderr)
 
 
 if __name__ == "__main__":
