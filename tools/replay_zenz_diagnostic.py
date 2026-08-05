@@ -44,10 +44,21 @@ STOP_MARKERS = tuple(
     + ["<s>", "</s>", "<unk>", "<|endoftext|>", "\r", "\n"]
 )
 MAX_HTTP_RESPONSE_BYTES = 64 * 1024
+FLASH_ATTENTION_VALUES = ("auto", "on", "off")
 
 
 class ReplayError(RuntimeError):
     pass
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("expected a non-negative integer")
+    return parsed
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,8 +152,10 @@ def _clean_generated_text(text: str, max_output_chars: int | None = None) -> str
     return text
 
 
-def _body_for_replay(body: bytes, cache_prompt: str) -> tuple[bytes, list[str]]:
-    if cache_prompt == "preserve":
+def _body_for_replay(
+    body: bytes, cache_prompt: str, n_probs: int | None = None
+) -> tuple[bytes, list[str]]:
+    if cache_prompt == "preserve" and n_probs is None:
         return body, []
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -150,14 +163,20 @@ def _body_for_replay(body: bytes, cache_prompt: str) -> tuple[bytes, list[str]]:
         raise ReplayError("cannot modify a non-JSON captured request") from exc
     if not isinstance(payload, dict):
         raise ReplayError("captured HTTP body is not a JSON object")
-    payload["cache_prompt"] = cache_prompt == "true"
-    # This mode deliberately changes the request.  Exact-byte replay is the
+    modified_fields: list[str] = []
+    if cache_prompt != "preserve":
+        payload["cache_prompt"] = cache_prompt == "true"
+        modified_fields.append("cache_prompt")
+    if n_probs is not None:
+        payload["n_probs"] = n_probs
+        modified_fields.append("n_probs")
+    # These modes deliberately change the request. Exact-byte replay is the
     # default; modified requests are still UTF-8 and deterministic.
     return (
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         ),
-        ["cache_prompt"],
+        modified_fields,
     )
 
 
@@ -239,19 +258,19 @@ def _runtime_metadata(request: CapturedRequest) -> dict[str, Any]:
     return runtime_args if isinstance(runtime_args, dict) else {}
 
 
-@contextlib.contextmanager
-def _started_server(
-    args: argparse.Namespace,
-    requests: Sequence[CapturedRequest],
-) -> Iterator[subprocess.Popen[bytes] | None]:
-    if not args.llama_server:
-        yield None
-        return
-
+def _server_command(
+    args: argparse.Namespace, requests: Sequence[CapturedRequest]
+) -> list[str]:
     first = requests[0].record
     runtime_args = _runtime_metadata(requests[0])
-    model = args.model or first.get("model_path")
-    if not isinstance(model, str) or not model:
+    model_value = args.model or first.get("model_path")
+    if isinstance(model_value, Path):
+        model = str(model_value)
+    elif isinstance(model_value, str):
+        model = model_value
+    else:
+        model = ""
+    if not model:
         raise ReplayError("--model is required when starting llama-server")
     parsed = urlsplit(args.url)
     host = parsed.hostname or "127.0.0.1"
@@ -262,6 +281,17 @@ def _started_server(
     if device is None:
         captured_device = runtime_args.get("device", "")
         device = "" if captured_device in ("", "auto") else str(captured_device)
+
+    flash_attention = getattr(args, "flash_attention", None)
+    if flash_attention is None:
+        captured_flash_attention = runtime_args.get("flash_attention", "auto")
+        if not isinstance(captured_flash_attention, str):
+            raise ReplayError("captured flash_attention is not a string")
+        flash_attention = captured_flash_attention
+    if flash_attention not in FLASH_ATTENTION_VALUES:
+        raise ReplayError(
+            "flash_attention must be one of auto, on, or off"
+        )
 
     command = [
         str(args.llama_server),
@@ -275,11 +305,26 @@ def _started_server(
         host,
         "--port",
         str(port),
+        "--flash-attn",
+        flash_attention,
     ]
     if args.api_key:
         command.extend(["--api-key", args.api_key])
     if device:
         command.extend(["--device", device])
+    return command
+
+
+@contextlib.contextmanager
+def _started_server(
+    args: argparse.Namespace,
+    requests: Sequence[CapturedRequest],
+) -> Iterator[subprocess.Popen[bytes] | None]:
+    if not args.llama_server:
+        yield None
+        return
+
+    command = _server_command(args, requests)
 
     try:
         process = subprocess.Popen(
@@ -332,7 +377,7 @@ def replay(args: argparse.Namespace) -> int:
             )
             for replay_index, request in enumerate(requests):
                 body, modified_fields = _body_for_replay(
-                    request.body, args.cache_prompt
+                    request.body, args.cache_prompt, args.n_probs
                 )
                 status, response_body, error = _post(
                     args.url,
@@ -452,6 +497,11 @@ def _parser() -> argparse.ArgumentParser:
         default="preserve",
         help="preserve or override cache_prompt in the replay body",
     )
+    parser.add_argument(
+        "--n-probs",
+        type=_non_negative_int,
+        help="add or replace n_probs in the replay body (explicit modification)",
+    )
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--startup-timeout", type=float, default=120.0)
     parser.add_argument("--llama-server", type=Path)
@@ -459,6 +509,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctx", type=int)
     parser.add_argument("--threads", type=int)
     parser.add_argument("--device")
+    parser.add_argument(
+        "--flash-attn",
+        dest="flash_attention",
+        choices=FLASH_ATTENTION_VALUES,
+        help="override captured flash attention mode when starting llama-server",
+    )
     parser.add_argument("--output", type=Path)
     return parser
 

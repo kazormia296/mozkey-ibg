@@ -18,7 +18,8 @@ The capture includes:
   `prompt_base64`, prompt code points, protected-span count, and request
   options.
 - `scorer_request`: exact `/completion` JSON as `http_json_base64`, runtime
-  arguments, and the prompt bytes.
+  arguments (including the effective `flash_attention` mode), and the prompt
+  bytes.
 - `scorer_response`: raw HTTP response body, raw model `content`, and the
   text after `CleanGeneratedText`.
 - `session_stage` and `session_decision`: the response after context stripping,
@@ -28,6 +29,13 @@ The scorer computes `runtime_sha256` and `model_sha256` from the files used for
 the request. `MOZC_ZENZ_RUNTIME_SHA256` and `MOZC_ZENZ_MODEL_SHA256` may be set
 to precomputed values when the files are unavailable to the scorer; these
 environment variables do not enable capture.
+
+The scorer always passes `--flash-attn auto|on|off` explicitly to
+`llama-server`. `MOZC_ZENZ_FLASH_ATTENTION` accepts only those three values;
+the effective value is recorded in `runtime_args.flash_attention`. When the
+replay tool starts a fresh server, it restores that captured value by default;
+use `--flash-attn on`, `--flash-attn off`, or `--flash-attn auto` to override
+it.
 
 Replay the exact scorer request sequence against a running local server:
 
@@ -51,6 +59,11 @@ use `--skip-line` or `--skip-sequence`; to test the cache hypothesis use
 `--cache-prompt false`. The output JSONL reports the raw response, cleaned
 text, and whether the cleaned text matched the captured scorer response. Run a
 new server process for each independent fresh-runtime trial.
+
+The default replay does not modify the captured HTTP body. If log
+probabilities are needed for a separate experiment, use `--n-probs 5`; the
+output then records `modified_fields: ["n_probs"]` so that modified replay is
+not confused with byte-preserving replay.
 
 The known malformed strings such as `璋†堯賄賂`, `漉з諷滉紘紘耀`, and
 `瀛槽￥跋扈矜矜` are actual model/output or post-processing observations, not

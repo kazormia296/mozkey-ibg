@@ -1,3 +1,4 @@
+import argparse
 import base64
 import importlib.util
 import json
@@ -25,6 +26,12 @@ class ReplayZenzDiagnosticTest(unittest.TestCase):
         replay_body, modified = MODULE._body_for_replay(body, "preserve")
         self.assertEqual(replay_body, body)
         self.assertEqual(modified, [])
+
+    def test_n_probs_override_is_explicitly_recorded(self) -> None:
+        body = b'{"prompt":"test","cache_prompt":true}'
+        replay_body, modified = MODULE._body_for_replay(body, "preserve", 5)
+        self.assertEqual(json.loads(replay_body)["n_probs"], 5)
+        self.assertEqual(modified, ["n_probs"])
 
     def test_cache_prompt_override_is_json_and_utf8(self) -> None:
         body = json.dumps(
@@ -58,6 +65,36 @@ class ReplayZenzDiagnosticTest(unittest.TestCase):
             limit=None,
         )
         self.assertEqual([item.line_number for item in selected], [2])
+
+    def test_server_command_restores_and_overrides_flash_attention(self) -> None:
+        request = MODULE.CapturedRequest(
+            1,
+            {
+                "model_path": "captured-model.gguf",
+                "runtime_args": {
+                    "ctx": 128,
+                    "threads": 3,
+                    "flash_attention": "off",
+                },
+            },
+            b"{}",
+        )
+        args = argparse.Namespace(
+            api_key="",
+            ctx=None,
+            device=None,
+            flash_attention=None,
+            llama_server=Path("llama-server"),
+            model=None,
+            threads=None,
+            url="http://127.0.0.1:18080/completion",
+        )
+        command = MODULE._server_command(args, [request])
+        self.assertEqual(command[-2:], ["--flash-attn", "off"])
+
+        args.flash_attention = "on"
+        command = MODULE._server_command(args, [request])
+        self.assertEqual(command[-2:], ["--flash-attn", "on"])
 
 
 if __name__ == "__main__":

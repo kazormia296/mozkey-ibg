@@ -306,6 +306,7 @@ constexpr int kApiKeyBytes = 32;
 constexpr int kDefaultCtx = 256;
 constexpr int kDefaultThreads = 4;
 constexpr int kDefaultNPredict = 64;
+constexpr char kDefaultFlashAttention[] = "auto";
 
 constexpr uint32_t kZenzWireMagic = 0x315A4E5A;  // "ZNZ1"
 constexpr uint16_t kZenzWireVersion = 2;
@@ -373,6 +374,7 @@ struct Options {
   int ctx = kDefaultCtx;
   int threads = kDefaultThreads;
   int n_predict = kDefaultNPredict;
+  std::string flash_attention = kDefaultFlashAttention;
   std::string backend_device;
 
   std::wstring llama_server_path;
@@ -389,6 +391,7 @@ struct Options {
   int ctx = kDefaultCtx;
   int threads = kDefaultThreads;
   int n_predict = kDefaultNPredict;
+  std::string flash_attention = kDefaultFlashAttention;
   std::string backend_device;
 
   std::string llama_server_path;
@@ -622,6 +625,11 @@ Options LoadOptions() {
       GetEnvInt(L"MOZC_ZENZ_N_PREDICT", kDefaultNPredict),
       4,
       kMaxNPredict);
+  options.flash_attention = WideToUtf8(
+      GetEnvWide(L"MOZC_ZENZ_FLASH_ATTENTION"));
+  if (options.flash_attention.empty()) {
+    options.flash_attention = kDefaultFlashAttention;
+  }
 
   return options;
 }
@@ -753,10 +761,18 @@ Options LoadOptions() {
   options.ctx = std::clamp(GetEnvInt("MOZC_ZENZ_CTX", kDefaultCtx), 64, kMaxCtx);
   options.threads = std::clamp(GetEnvInt("MOZC_ZENZ_THREADS", kDefaultThreads), 1, kMaxThreads);
   options.n_predict = std::clamp(GetEnvInt("MOZC_ZENZ_N_PREDICT", kDefaultNPredict), 4, kMaxNPredict);
+  options.flash_attention = GetEnvString("MOZC_ZENZ_FLASH_ATTENTION");
+  if (options.flash_attention.empty()) {
+    options.flash_attention = kDefaultFlashAttention;
+  }
 
   return options;
 }
 #endif
+
+bool IsValidFlashAttentionValue(absl::string_view value) {
+  return value == "auto" || value == "on" || value == "off";
+}
 
 bool IsValidBackendDeviceName(const std::string& name) {
   if (name.size() > kMaxBackendDeviceBytes) {
@@ -835,6 +851,7 @@ class ScorerHttpDiagnosticScope final {
                             int n_predict,
                             uint32_t max_output_chars,
                             std::string backend_device,
+                            std::string flash_attention,
                             std::string runtime_path,
                             std::string model_path,
                             std::string endpoint,
@@ -875,10 +892,7 @@ class ScorerHttpDiagnosticScope final {
     runtime_args.AddString("device", backend_device.empty()
                                           ? "auto"
                                           : backend_device);
-    const std::string flash_attention = GetDiagnosticEnvironmentValue(
-        "MOZC_ZENZ_FLASH_ATTENTION");
-    runtime_args.AddString("flash_attention",
-                           flash_attention.empty() ? "auto" : flash_attention);
+    runtime_args.AddString("flash_attention", flash_attention);
     diagnostic.AddObject("runtime_args", runtime_args.Build());
     mozc::session::ZenzDiagnosticCapture::Write(diagnostic);
   }
@@ -1318,6 +1332,8 @@ bool LaunchLlamaServer(const Options& options, std::wstring* error) {
   // --api-key.  Do not treat it as a strong same-user secret.
   cmd += L" --api-key ";
   cmd += Utf8ToWide(options.api_key);
+  cmd += L" --flash-attn ";
+  cmd += Utf8ToWide(options.flash_attention);
   if (!options.backend_device.empty()) {
     cmd += L" --device ";
     cmd += Utf8ToWide(options.backend_device);
@@ -1449,9 +1465,6 @@ bool HttpPostCompletion(
   body += "\"top_p\":1.0,";
   body += "\"stream\":false,";
   body += "\"cache_prompt\":true,";
-  if (mozc::session::ZenzDiagnosticCapture::IsEnabled()) {
-    body += "\"n_probs\":5,";
-  }
   body += "\"stop\":["
           "\"\\uee00\","
           "\"\\uee01\","
@@ -1477,6 +1490,7 @@ bool HttpPostCompletion(
   ScorerHttpDiagnosticScope diagnostic(
       generation, request_kind, prompt, body, options.ctx, options.threads,
       n_predict, max_output_chars, options.backend_device,
+      options.flash_attention,
       WideToUtf8(options.llama_server_path),
       WideToUtf8(options.model_path),
       WideToUtf8(options.host) + ":" + std::to_string(options.port), value,
@@ -1888,9 +1902,15 @@ int RunServer(const Options& options) {
     return 1;
   }
 
+  if (!IsValidFlashAttentionValue(options.flash_attention)) {
+    Debug(L"invalid flash attention option");
+    return 1;
+  }
+
   Debug(L"http_port_mode=random");
   Debug(L"api_key_bytes=" + std::to_wstring(options.api_key.size()));
   Debug(L"n_predict=" + std::to_wstring(options.n_predict));
+  Debug(L"flash_attention=" + Utf8ToWide(options.flash_attention));
 
   while (!g_shutdown_requested.load()) {
     PSECURITY_DESCRIPTOR sd = nullptr;
@@ -2086,6 +2106,8 @@ bool LaunchLlamaServer(const Options& options, std::string* error) {
       std::to_string(options.port),
       "--api-key",
       options.api_key,
+      "--flash-attn",
+      options.flash_attention,
   };
   if (!options.backend_device.empty()) {
     args.push_back("--device");
@@ -2233,9 +2255,6 @@ bool HttpPostCompletion(
   body += "\"top_p\":1.0,";
   body += "\"stream\":false,";
   body += "\"cache_prompt\":true,";
-  if (mozc::session::ZenzDiagnosticCapture::IsEnabled()) {
-    body += "\"n_probs\":5,";
-  }
   body += "\"stop\":["
           "\"\\uee00\","
           "\"\\uee01\","
@@ -2261,6 +2280,7 @@ bool HttpPostCompletion(
   ScorerHttpDiagnosticScope diagnostic(
       generation, request_kind, prompt, body, options.ctx, options.threads,
       n_predict, max_output_chars, options.backend_device,
+      options.flash_attention,
       options.llama_server_path,
       options.model_path, options.host + ":" + std::to_string(options.port),
       value, debug);
@@ -2678,9 +2698,15 @@ int RunServer(const Options& options) {
     return 1;
   }
 
+  if (!IsValidFlashAttentionValue(options.flash_attention)) {
+    Debug("invalid flash attention option");
+    return 1;
+  }
+
   Debug("http_port_mode=random");
   Debug("api_key_bytes=" + std::to_string(options.api_key.size()));
   Debug("n_predict=" + std::to_string(options.n_predict));
+  Debug("flash_attention=" + options.flash_attention);
 
   std::string socket_path = options.pipe_name.empty() ?
       (std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + kDefaultPipeNameSuffix) : options.pipe_name;

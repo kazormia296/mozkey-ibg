@@ -427,6 +427,7 @@ jobs:
           python tools/release/normalize_zenz_gguf.py verify --root .
           python -m unittest \
             tools.check_no_network_checks_test \
+            tools.replay_zenz_diagnostic_test \
             scripts.install_mozkey_linux_bazel_test \
             scripts.install_zenz_runtime_test \
             scripts.package_mozkey_linux_bazel_test \
