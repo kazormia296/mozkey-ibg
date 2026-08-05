@@ -123,6 +123,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("  workflow_call:", preflight)
         preflight_trigger = preflight.split("\npermissions:\n", maxsplit=1)[0]
         self.assertNotRegex(preflight_trigger, r"(?m)^  push:")
+        # Only the full-history portable job needs the extended checkout budget.
         preflight_jobs = self._split_job_blocks(preflight)
         self.assertIn("timeout-minutes: 10", preflight_jobs["portable"])
         self.assertNotIn("timeout-minutes: 5", preflight_jobs["portable"])
