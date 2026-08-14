@@ -1,5 +1,16 @@
 <a id="japanese"></a>
 
+<div align="center">
+  <h2>⚠️ ご利用にあたっての重要な注意</h2>
+  <p><strong>本ソフトウェアは、あくまでGrimodexに付随するものです。</strong></p>
+  <p>
+    通常のIMEとして利用する場合は、ご自身でフォークするか、より純粋な用途を目指した<br>
+    フォークの利用をご検討ください。本プロジェクトはマルチプラットフォーム対応のために<br>
+    大きく手が入っており、今後Grimodex向けの機能が追加されるほど、信頼境界とそれに伴う<br>
+    リスクも大きくなります。
+  </p>
+</div>
+
 <p align="center">
   <img src="src/data/images/icon.svg" width="112" height="112" alt="Mozkey IbG icon">
 </p>
