@@ -31,6 +31,10 @@ LLAMA_SERVER = "/usr/bin/llama-server"
 BUNDLED_LLAMA_SERVER = "/usr/lib/mozkey-ibg/llama-server"
 LLAMA_SERVERS = frozenset({LLAMA_SERVER, BUNDLED_LLAMA_SERVER})
 RUNTIME_ROOTS = frozenset({MOZKEY_SERVER, MOZKEY_SCORER})
+# Linux appends this to /proc/<pid>/exe once the executable file has been
+# unlinked, which is what a package upgrade does to a runtime that is still
+# running.
+_REPLACED_EXECUTABLE_SUFFIX = " (deleted)"
 # Linux TASK_COMM_LEN includes the trailing NUL, so an executable basename is
 # truncated to at most 15 bytes.  These names are never sufficient authority
 # to signal a process; they only prevent an unreadable runtime candidate from
@@ -120,6 +124,21 @@ class _ProcessGone(Exception):
     pass
 
 
+def _canonical_executable(executable: str) -> str:
+    """Map a product executable replaced by an upgrade to its product path.
+
+    Only the exact product paths qualify.  They live in root-owned directories,
+    so a same-UID process can only show one of them if it executed the file
+    root installed there; every other path, deleted or not, stays as reported
+    and is never treated as a Mozkey runtime.
+    """
+    if executable.endswith(_REPLACED_EXECUTABLE_SUFFIX):
+        original = executable[: -len(_REPLACED_EXECUTABLE_SUFFIX)]
+        if original in RUNTIME_ROOTS or original in LLAMA_SERVERS:
+            return original
+    return executable
+
+
 class Procfs:
     def __init__(self, root: Path = Path("/proc")) -> None:
         self.root = root
@@ -206,7 +225,9 @@ class Procfs:
                 self._read_bounded(process_dir / "stat")
             )
             try:
-                executable = os.readlink(process_dir / "exe")
+                executable = _canonical_executable(
+                    os.readlink(process_dir / "exe")
+                )
             except (FileNotFoundError, ProcessLookupError, NotADirectoryError) as error:
                 raise _ProcessGone from error
             except PermissionError as error:

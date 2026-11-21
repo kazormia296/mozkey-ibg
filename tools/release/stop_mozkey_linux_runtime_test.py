@@ -106,6 +106,22 @@ class StopMozkeyLinuxRuntimeTest(unittest.TestCase):
             self.assertEqual([item.pid for item in roots], [10, 20])
             self.assertEqual([item.pid for item in llamas], [21])
 
+    def test_discovers_runtime_whose_executable_an_upgrade_replaced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tree = FakeProcTree(Path(temporary))
+            tree.add(10, stopper.MOZKEY_SERVER + " (deleted)", start_time=101)
+            tree.add(20, stopper.MOZKEY_SCORER + " (deleted)", start_time=102)
+            tree.add(21, stopper.LLAMA_SERVER + " (deleted)", ppid=20,
+                     start_time=103)
+            tree.add(22, "/tmp/mozc_server (deleted)", start_time=104)
+            tree.add(23, stopper.MOZKEY_SERVER + ".backup (deleted)",
+                     start_time=105)
+            identities = stopper.Procfs(tree.root).scan(1000)
+            roots = [item for item in identities if item.exe in stopper.RUNTIME_ROOTS]
+            llamas = stopper._descendant_llamas(identities, {20})
+            self.assertEqual([item.pid for item in roots], [10, 20])
+            self.assertEqual([item.pid for item in llamas], [21])
+
     def test_discovers_bundled_llama_only_as_scorer_descendant(self):
         with tempfile.TemporaryDirectory() as temporary:
             tree = FakeProcTree(Path(temporary))
