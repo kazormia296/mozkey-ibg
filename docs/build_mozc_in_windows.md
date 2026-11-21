@@ -74,7 +74,7 @@ python build_tools/update_deps.py
 
 In this step, additional build dependencies will be downloaded, including:
 
-*   [LLVM 20.1.1](https://github.com/llvm/llvm-project/releases/tag/llvmorg-20.1.1)
+*   [LLVM 22.1.8](https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.8)
 *   [MSYS2 2025-02-21](https://github.com/msys2/msys2-installer/releases/tag/2025-02-21)
 *   [Ninja 1.13.2](https://github.com/ninja-build/ninja/releases/tag/v1.13.2)
 *   [Qt 6.9.1](https://download.qt.io/archive/qt/6.8/6.8.0/submodules/qtbase-everywhere-src-6.9.1.tar.xz)
@@ -159,7 +159,7 @@ bazelisk build package --config release_build --platforms=//:windows-arm64
 ```
 
 The runtime preparation command discovers `vcvarsall.bat`, imports its
-`amd64_arm64` SDK environment, and then uses the checksum-pinned LLVM 20.1.1
+`amd64_arm64` SDK environment, and then uses the checksum-pinned LLVM 22.1.8
 and Ninja 1.13.2 installed by `update_deps.py`. It configures llama.cpp with the
 pinned `cmake/arm64-windows-llvm.cmake` cross-toolchain; no separate Ninja or
 LLVM installation is used.

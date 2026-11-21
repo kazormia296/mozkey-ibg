@@ -121,7 +121,7 @@ class PrepareWindowsZenzRuntimeTest(unittest.TestCase):
                 {
                     "compiler_id": "Clang",
                     "compiler_target": "arm64-pc-windows-msvc",
-                    "compiler_version": "20.1.1",
+                    "compiler_version": "22.1.8",
                 },
                 {
                     "processor": "arm64",
@@ -178,7 +178,7 @@ class PrepareWindowsZenzRuntimeTest(unittest.TestCase):
             compiler_file.parent.mkdir(parents=True)
             compiler_file.write_text(
                 'set(CMAKE_CXX_COMPILER_ID "Clang")\n'
-                'set(CMAKE_CXX_COMPILER_VERSION "20.1.1")\n',
+                'set(CMAKE_CXX_COMPILER_VERSION "22.1.8")\n',
                 encoding="utf-8",
             )
             (Path(name) / "compile_commands.json").write_text(
@@ -190,7 +190,7 @@ class PrepareWindowsZenzRuntimeTest(unittest.TestCase):
                 {
                     "compiler_id": "Clang",
                     "compiler_target": "arm64-pc-windows-msvc",
-                    "compiler_version": "20.1.1",
+                    "compiler_version": "22.1.8",
                 },
             )
 
