@@ -32,7 +32,10 @@ using ::mozc::zenz::kZenzWireKindResponse;
 using ::mozc::zenz::kZenzWireMagic;
 using ::mozc::zenz::kZenzWireStatusOk;
 using ::mozc::zenz::kZenzWireStatusTimeout;
+using ::mozc::zenz::IsValidZenzWireBackendDevice;
 using ::mozc::zenz::kZenzWireVersion;
+using ::mozc::zenz::kZenzWireVersionWithDevice;
+using ::mozc::zenz::ZenzWireDeviceTrailer;
 using ::mozc::zenz::ZenzWireRequestHeader;
 using ::mozc::zenz::ZenzWireResponseHeader;
 
@@ -423,9 +426,22 @@ ZenzLiveResponse ZenzUnixSocketClient::Convert(
   ScopedFd socket_fd(connection.fd);
   bool timed_out = false;
 
+  // Mozkey IbG: an explicit inference device rides on a version 2 request.
+  // Automatic selection keeps the version 1 request, which every scorer
+  // understands.
+  const bool send_backend_device = !request.backend_device.empty();
+  if (send_backend_device &&
+      !IsValidZenzWireBackendDevice(
+          request.backend_device.data(),
+          static_cast<uint32_t>(request.backend_device.size()))) {
+    response.debug = "invalid_backend_device";
+    return response;
+  }
+
   ZenzWireRequestHeader request_header = {};
   request_header.magic = kZenzWireMagic;
-  request_header.version = kZenzWireVersion;
+  request_header.version =
+      send_backend_device ? kZenzWireVersionWithDevice : kZenzWireVersion;
   request_header.kind = kZenzWireKindRequest;
   request_header.generation = request.generation;
   request_header.timeout_msec = request.timeout_msec;
@@ -438,6 +454,18 @@ ZenzLiveResponse ZenzUnixSocketClient::Convert(
     ok = WriteAll(socket_fd.get(), request.prompt.data(),
                   static_cast<uint32_t>(request.prompt.size()),
                   request_deadline, &timed_out, cancellation_read.get());
+  }
+  if (ok && send_backend_device) {
+    ZenzWireDeviceTrailer trailer = {};
+    trailer.backend_device_size =
+        static_cast<uint32_t>(request.backend_device.size());
+    ok = WriteAll(socket_fd.get(), &trailer, sizeof(trailer),
+                  request_deadline, &timed_out, cancellation_read.get());
+    if (ok) {
+      ok = WriteAll(socket_fd.get(), request.backend_device.data(),
+                    trailer.backend_device_size, request_deadline, &timed_out,
+                    cancellation_read.get());
+    }
   }
   if (!ok) {
     response.timeout = timed_out;

@@ -32,6 +32,8 @@ using ::mozc::zenz::kZenzWireKindResponse;
 using ::mozc::zenz::kZenzWireMagic;
 using ::mozc::zenz::kZenzWireStatusOk;
 using ::mozc::zenz::kZenzWireVersion;
+using ::mozc::zenz::kZenzWireVersionWithDevice;
+using ::mozc::zenz::ZenzWireDeviceTrailer;
 using ::mozc::zenz::ZenzWireRequestHeader;
 using ::mozc::zenz::ZenzWireResponseHeader;
 
@@ -143,9 +145,25 @@ bool ServeOneRequest(int server_fd, const ZenzLiveRequest& expected_request,
   } else {
     ok = false;
   }
+  std::string received_device;
+  if (ok && request_header.version == kZenzWireVersionWithDevice) {
+    ZenzWireDeviceTrailer trailer = {};
+    ok = ReadAll(client_fd, &trailer, sizeof(trailer)) &&
+         trailer.backend_device_size > 0 &&
+         trailer.backend_device_size <= 128;
+    if (ok) {
+      received_device.assign(trailer.backend_device_size, '\0');
+      ok = ReadAll(client_fd, received_device.data(),
+                   trailer.backend_device_size);
+    }
+  }
 
+  const uint16_t expected_version = expected_request.backend_device.empty()
+                                        ? kZenzWireVersion
+                                        : kZenzWireVersionWithDevice;
   ok = ok && request_header.magic == kZenzWireMagic &&
-       request_header.version == kZenzWireVersion &&
+       request_header.version == expected_version &&
+       received_device == expected_request.backend_device &&
        request_header.kind == kZenzWireKindRequest &&
        request_header.generation == expected_request.generation &&
        request_header.timeout_msec == expected_request.timeout_msec &&
@@ -223,6 +241,50 @@ TEST(ZenzUnixSocketClientTest, ExchangesSharedWireProtocolWithoutLaunching) {
   EXPECT_EQ(response.key, request.key);
   EXPECT_EQ(response.value, expected_value);
   EXPECT_EQ(response.debug, expected_debug);
+}
+
+TEST(ZenzUnixSocketClientTest, SendsSelectedBackendDeviceAsVersionTwo) {
+  ScopedSocketDirectory socket_directory;
+  ASSERT_FALSE(socket_directory.directory().empty());
+  const int server_fd =
+      CreateListeningSocket(socket_directory.socket_path());
+  ASSERT_GE(server_fd, 0);
+
+  ZenzLiveRequest request = MakeRequest(38, "zenz prompt payload", 1000);
+  request.backend_device = "MTL0";
+  std::atomic<bool> server_ok = false;
+  std::thread server([&] {
+    server_ok.store(ServeOneRequest(server_fd, request, "value", "debug"));
+  });
+
+  ZenzUnixSocketClient client(socket_directory.socket_path(),
+                              [] { return true; });
+  const ZenzLiveResponse response = client.Convert(request);
+  server.join();
+  ::close(server_fd);
+
+  EXPECT_TRUE(server_ok.load());
+  EXPECT_TRUE(response.ok);
+  EXPECT_EQ(response.value, "value");
+}
+
+TEST(ZenzUnixSocketClientTest, RejectsOptionLikeBackendDevice) {
+  ScopedSocketDirectory socket_directory;
+  ASSERT_FALSE(socket_directory.directory().empty());
+  const int server_fd =
+      CreateListeningSocket(socket_directory.socket_path());
+  ASSERT_GE(server_fd, 0);
+
+  ZenzLiveRequest request = MakeRequest(39, "zenz prompt payload", 1000);
+  request.backend_device = "--host=0.0.0.0";
+  ZenzUnixSocketClient client(socket_directory.socket_path(),
+                              [] { return true; });
+  const ZenzLiveResponse response = client.Convert(request);
+  ::close(server_fd);
+
+  EXPECT_FALSE(response.ok);
+  EXPECT_FALSE(response.timeout);
+  EXPECT_EQ(response.debug, "invalid_backend_device");
 }
 
 TEST(ZenzUnixSocketClientTest, LaunchesScorerAndUsesFreshRequestDeadline) {

@@ -35,7 +35,11 @@ using ::mozc::zenz::kZenzWireMagic;
 using ::mozc::zenz::kZenzWireStatusError;
 using ::mozc::zenz::kZenzWireStatusOk;
 using ::mozc::zenz::kZenzWireStatusTimeout;
+using ::mozc::zenz::IsValidZenzWireBackendDevice;
+using ::mozc::zenz::kZenzWireMaxBackendDeviceBytes;
 using ::mozc::zenz::kZenzWireVersion;
+using ::mozc::zenz::kZenzWireVersionWithDevice;
+using ::mozc::zenz::ZenzWireDeviceTrailer;
 using ::mozc::zenz::ZenzWireRequestHeader;
 using ::mozc::zenz::ZenzWireResponseHeader;
 
@@ -448,7 +452,8 @@ bool PosixZenzScorerServer::HandleClient(int client_fd,
   }
 
   if (header.magic != kZenzWireMagic ||
-      header.version != kZenzWireVersion ||
+      (header.version != kZenzWireVersion &&
+       header.version != kZenzWireVersionWithDevice) ||
       header.kind != kZenzWireKindRequest) {
     SendResponse(client_fd, header.generation,
                  ErrorResponse("bad_request_header"));
@@ -482,6 +487,37 @@ bool PosixZenzScorerServer::HandleClient(int client_fd,
                  ErrorResponse(timed_out ? "prompt_read_timeout"
                                          : "prompt_read_failed"));
     return true;
+  }
+
+  if (header.version == kZenzWireVersionWithDevice) {
+    ZenzWireDeviceTrailer trailer = {};
+    if (!ReadAll(client_fd, &trailer, sizeof(trailer), request_deadline,
+                 &timed_out)) {
+      SendResponse(client_fd, request.generation,
+                   ErrorResponse(timed_out ? "device_read_timeout"
+                                           : "device_read_failed"));
+      return true;
+    }
+    if (trailer.backend_device_size == 0 ||
+        trailer.backend_device_size > kZenzWireMaxBackendDeviceBytes) {
+      SendResponse(client_fd, request.generation,
+                   ErrorResponse("invalid_backend_device"));
+      return true;
+    }
+    request.backend_device.resize(trailer.backend_device_size);
+    if (!ReadAll(client_fd, request.backend_device.data(),
+                 trailer.backend_device_size, request_deadline, &timed_out)) {
+      SendResponse(client_fd, request.generation,
+                   ErrorResponse(timed_out ? "device_read_timeout"
+                                           : "device_read_failed"));
+      return true;
+    }
+    if (!IsValidZenzWireBackendDevice(request.backend_device.data(),
+                                      trailer.backend_device_size)) {
+      SendResponse(client_fd, request.generation,
+                   ErrorResponse("invalid_backend_device"));
+      return true;
+    }
   }
 
   PosixZenzResponse response =
