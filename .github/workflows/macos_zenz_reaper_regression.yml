@@ -1,0 +1,86 @@
+name: macOS Zenz scorer reaper regression
+
+on:
+  push:
+    paths:
+      - '.github/workflows/macos_zenz_reaper_regression.yml'
+      - 'src/session/BUILD.bazel'
+      - 'src/session/zenz_client_factory.cc'
+      - 'src/session/zenz_client_factory.h'
+      - 'src/session/zenz_client_factory_test.cc'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/macos_zenz_reaper_regression.yml'
+      - 'src/session/BUILD.bazel'
+      - 'src/session/zenz_client_factory.cc'
+      - 'src/session/zenz_client_factory.h'
+      - 'src/session/zenz_client_factory_test.cc'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scorer_reaper_macos:
+    name: Execute scorer child-reaping tests on Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out Mozkey
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Confirm native macOS host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          bazelisk version
+          echo "SOURCE_COMMIT=$GITHUB_SHA"
+
+      - name: Prepare daily dictionary
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Mozkey IbG CI builds only the pinned release-approved profile.
+          ./tools/dictionary/prepare_daily_dictionary.ps1 -ReleaseApprovedOnly
+
+      - name: Restore dependency cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
+        with:
+          path: src/third_party_cache
+          key: zenz-reaper-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/build_tools/update_deps.py') }}
+
+      - name: Install Mozkey dependencies
+        working-directory: ./src
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 build_tools/update_deps.py
+
+      - name: Execute macOS scorer reaper regression tests
+        working-directory: ./src
+        shell: bash
+        run: |
+          set -euo pipefail
+          bazelisk test \
+            --config=oss_macos \
+            -c dbg \
+            --nocache_test_results \
+            --test_output=all \
+            --test_summary=detailed \
+            --define=mozkey_dictionary_profile=release-approved-only \
+            //session:zenz_client_factory_test
