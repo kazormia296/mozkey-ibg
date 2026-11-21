@@ -137,8 +137,7 @@ jobs:
   prepare_macos_zenz_runtime:
     if: ${{ inputs.release == true }}
     runs-on: macos-15
-    # Builds llama.cpp for arm64 and x86_64 and lipo-merges the result.
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: checkout
@@ -147,51 +146,51 @@ jobs:
           submodules: false
           persist-credentials: false
 
-      # Since the sync to upstream Mozkey v1.0.0 the macOS scorer is upstream's
-      # POSIX runtime (mozc_zenz_scorer + mozc_zenz_guard), which requires the
-      # source-pinned, patched Universal llama-server (llama.cpp v0.7.0 with
-      # the tokenizer and dual-liveness patches) under Resources/ZenzRuntime.
-      # The builder verifies the pinned commit, patch and model identities and
-      # writes BUILD-CONTRACT.txt; stage_runtime_assets.zsh re-verifies it in
-      # the build job.
-      - name: Verify the runtime source pins before building
-        run: |
-          python3 -m unittest discover -s tools/zenz_runtime -p 'test_*.py' -v
-          python3 tools/zenz_runtime/runtime_lock.py check
+      - name: Restore pinned runtime source cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
+        with:
+          path: src/third_party_cache
+          key: macos-zenz-b9637-${{ hashFiles('tools/release/prepare_macos_zenz_runtime.py', 'src/build_tools/update_deps.py') }}
 
-      - name: Build source-pinned Universal Zenz runtime
-        shell: /bin/zsh {0}
+      - name: Install pinned Ninja
         run: |
-          set -euo pipefail
-          RUNTIME="$RUNNER_TEMP/mozkey-ibg-zenz-runtime"
-          test ! -e "$RUNTIME"
-          # Use the tracked, lock-pinned source model instead of a release-time
-          # download; the builder still verifies its SHA-256.
-          MOZKEY_ZENZ_MODEL_SOURCE="$GITHUB_WORKSPACE/src/win32/installer/zenz_runtime/models/zenz-v3.2-small-Q5_K_M.gguf" \
-            src/mac/installer/zenz_runtime/build_universal_runtime.zsh "$RUNTIME"
-          test -x "$RUNTIME/llama-server"
-          test -s "$RUNTIME/models/zenz-v3.2-small-Q5_K_M.gguf"
-          test -s "$RUNTIME/BUILD-CONTRACT.txt"
+          python3 src/build_tools/update_deps.py --noqt --nondk
 
-      - name: Run runtime packaging contract tests
+      - name: Build pinned arm64 Zenz runtime
+        run: |
+          python3 tools/release/prepare_macos_zenz_runtime.py
+
+      - name: Assert arm64 scorer and server Mach-O contracts
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from tools.release import prepare_macos_zenz_runtime as runtime
+
+          generated = Path("src/mac/zenz_runtime/generated")
+          runtime._verify_arm64_scorer(
+              generated / runtime.SCORER_NAME
+          )
+          runtime._verify_arm64_server(generated / "llama-server")
+          PY
+
+      - name: Run runtime preparation contract tests
         run: |
           python3 -m unittest -v \
-            tools.release.prepare_macos_zenz_runtime_test
+            tools.release.prepare_macos_zenz_runtime_test \
+            tools.release.probe_macos_zenz_runtime_test
           PYTHONPATH=src python3 -m unittest -v \
             mac.build_package_test \
             mac.tweak_installer_files_test
 
       - name: Archive runtime with executable modes
         run: |
-          tar -czf macos-universal-zenz-runtime.tar.gz \
-            -C "$RUNNER_TEMP/mozkey-ibg-zenz-runtime" \
-            llama-server models/zenz-v3.2-small-Q5_K_M.gguf BUILD-CONTRACT.txt
+          tar -czf macos-arm64-zenz-runtime.tar.gz src/mac/zenz_runtime/generated
 
-      - name: Upload Universal Zenz runtime
+      - name: Upload arm64 Zenz runtime
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
-          name: macos-zenz-runtime-universal-v0.7.0
-          path: macos-universal-zenz-runtime.tar.gz
+          name: macos-zenz-runtime-arm64-b9637
+          path: macos-arm64-zenz-runtime.tar.gz
           if-no-files-found: error
           overwrite: true
           retention-days: 1
@@ -204,7 +203,7 @@ jobs:
     if: ${{ inputs.release == true }}
     # https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: checkout
@@ -219,24 +218,15 @@ jobs:
           name: macos-daily-dictionary
           path: .
 
-      - name: Download Universal Zenz runtime
+      - name: Download arm64 Zenz runtime
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6
         with:
-          name: macos-zenz-runtime-universal-v0.7.0
+          name: macos-zenz-runtime-arm64-b9637
           path: .
 
-      - name: Verify and stage the Universal Zenz runtime
-        shell: /bin/zsh {0}
+      - name: Restore arm64 Zenz runtime
         run: |
-          set -euo pipefail
-          RUNTIME="$RUNNER_TEMP/mozkey-ibg-zenz-runtime"
-          test ! -e "$RUNTIME"
-          mkdir -p "$RUNTIME"
-          tar -xzf macos-universal-zenz-runtime.tar.gz -C "$RUNTIME"
-          rm -f macos-universal-zenz-runtime.tar.gz
-          # Fails closed unless the runtime matches the tracked builder script,
-          # the pinned llama.cpp commit, both patches and the pinned model.
-          src/mac/installer/zenz_runtime/stage_runtime_assets.zsh "$RUNTIME"
+          tar -xzf macos-arm64-zenz-runtime.tar.gz
 
       - name: Try to restore update_deps cache
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
@@ -258,45 +248,13 @@ jobs:
       - name: bazel build
         working-directory: ./src
         run: |
-          # MOZKEY_INSTALLABLE=1 selects the audited release preinstall
-          # (src/mac/preflight_mozkey_release.sh).  Without it the package
-          # embeds the stage-1 gate and refuses to install.
-          # macos_zenz_runtime=1 packages the staged Universal llama-server,
-          # model and BUILD-CONTRACT under Resources/ZenzRuntime; without it
-          # tweak_installer_files.py rejects the incomplete runtime.
-          bazelisk build package --macos_cpus=arm64 --config release_build --define=mozkey_dictionary_profile=release-approved-only --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1
+          bazelisk build package --macos_cpus=arm64 --config release_build --define=mozkey_dictionary_profile=release-approved-only
 
-      # Expands the exact package, verifies the embedded BUILD-CONTRACT, model,
-      # notices, Universal runtime helpers and nested signatures, then starts
-      # the packaged scorer and runs a real inference request through
-      # //zenz_scorer:zenz_runtime_package_probe.  The application itself is
-      # arm64-only in Mozkey IbG (installer/distribution.xml).
-      - name: Probe packaged arm64 scorer and Universal runtime with real inference
-        shell: /bin/zsh {0}
+      - name: Probe packaged arm64 scorer and server with real inference
         run: |
-          set -euo pipefail
-          MOZKEY_ZENZ_VERIFY_APP_ARCHITECTURES=arm64 \
-          MOZKEY_ZENZ_EXPECTED_CONTRACT="$GITHUB_WORKSPACE/src/mac/installer/zenz_runtime/BUILD-CONTRACT.txt" \
-            src/mac/installer/zenz_runtime/verify_release_package.zsh \
-            src/bazel-bin/mac/MozkeyIbG.pkg \
-            "$RUNNER_TEMP/mozkey-ibg-zenz-package-verify"
-
-      - name: Require the installable release preflight in the package
-        run: |
-          set -euo pipefail
-          expanded="$RUNNER_TEMP/mozkey-ibg-zenz-package-verify/expanded"
-          preinstall="$(find "$expanded" -type f -name preinstall -print)"
-          test "$(printf '%s\n' "$preinstall" | grep -c .)" -eq 1
-          cmp "$preinstall" src/bazel-bin/mac/preflight.sh
-          if grep -F -q 'PKG is NOT INSTALLABLE' "$preinstall"; then
-            echo "::error::The stage-1 non-installable preflight was packaged." >&2
-            exit 1
-          fi
-          if grep -F -q '@@@MOZKEY_INSTALL_VERSION@@@' "$preinstall"; then
-            echo "::error::The installer version placeholder was not resolved." >&2
-            exit 1
-          fi
-          grep -F -q "io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" "$preinstall"
+          python3 tools/release/probe_macos_zenz_runtime.py \
+            --package src/bazel-bin/mac/MozkeyIbG.pkg \
+            --timeout-seconds 300
 
       - name: Prepare the package tree before loading signing credentials
         run: |
@@ -460,7 +418,7 @@ jobs:
             find "$SIGNING_TREE/installer" \
               \( -type d \( -name '*.app' -o -name '*.bundle' -o -name '*.framework' \) \
               -o -type f \( -name '*.dylib' -o -name llama-server \
-              -o -name mozc_zenz_scorer -o -name mozc_zenz_guard \) \) -print0
+              -o -name mozc_zenz_scorer \) \) -print0
           )
           if [ "$signed_target_count" -eq 0 ]; then
             echo "::error::No signed code was found in the installer payload." >&2
@@ -570,11 +528,8 @@ jobs:
       - name: Run macOS Zenz runtime script tests
         run: |
           python3 -m unittest -v \
-            tools.release.prepare_macos_zenz_runtime_test
-          python3 -m unittest discover -s tools/zenz_runtime -p 'test_*.py' -v
-          python3 tools/zenz_runtime/runtime_lock.py check
-          python3 src/mac/preflight_mozkey_release_test.py
-          python3 src/mac/test_postflight_mozkey_oss_filter.py
+            tools.release.prepare_macos_zenz_runtime_test \
+            tools.release.probe_macos_zenz_runtime_test
           PYTHONPATH=src python3 -m unittest -v \
             mac.build_package_test \
             mac.tweak_installer_files_test

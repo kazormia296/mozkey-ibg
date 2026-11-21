@@ -27,7 +27,7 @@ jobs:
     steps:
       # Checkout without submodules to exclude third_party code from lint check
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
         with:
           submodules: false
           persist-credentials: false
@@ -51,11 +51,6 @@ jobs:
           cd ..
           python tools/typing_correction/validate_typing_correction_metrics.py \
             /tmp/typing-correction-metrics.json
-
-      - name: Setup Go
-        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7.1.0
-        with:
-          go-version: 'stable'
 
       - name: Run
         working-directory: ./src
