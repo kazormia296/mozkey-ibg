@@ -142,6 +142,13 @@ reject_path /usr/share/fcitx5/addon/mozc.conf
 reject_path /usr/share/fcitx5/inputmethod/mozc.conf
 reject_path /usr/share/metainfo/org.fcitx.Fcitx5.Addon.Mozc.metainfo.xml
 reject_path /usr/share/icons/hicolor/32x32/apps/fcitx_mozc.png
+# Upstream Mozkey 1.1.0 owns these Linux paths; Mozkey IbG must not.
+reject_path /usr/lib/mozkey
+reject_path /usr/share/icons/mozkey
+reject_path /usr/lib/ibus-mozkey
+reject_path /usr/share/ibus-mozkey
+reject_path /usr/share/ibus/component/mozkey.xml
+reject_path /usr/share/ibus/component/mozc.xml
 
 # Model a distro multiarch-path migration. The prior product record must be
 # consumed before it is replaced, and only the prior Mozkey addon may be

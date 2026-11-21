@@ -42,7 +42,10 @@ import sys
 # A dictionary from --branding to a product name which is embedded into the
 # properties above.
 PRODUCT_NAMES = {
-    'Mozc': 'Mozkey IbG',
+    'Mozc': 'Mozc',
+    # The Linux build of this fork passes --branding=Mozkey (the upstream
+    # Mozkey build flag) and is identified as Mozkey IbG everywhere.
+    'Mozkey': 'Mozkey IbG',
     'GoogleJapaneseInput': 'Google Japanese Input',
 }
 
@@ -67,7 +70,7 @@ def GetXmlElement(key, value):
   return '  <%s>%s</%s>' % (key, value, key)
 
 
-def OutputXml(component, ibus_mozc_path):
+def OutputXml(component, ibus_mozc_path, branding):
   """Outputs a XML data for ibus-daemon.
 
   Args:
@@ -81,14 +84,15 @@ def OutputXml(component, ibus_mozc_path):
   print('  <engines exec="%s --xml" />' % ibus_mozc_path)
   print('</component>')
 
-  print("""
-<!-- Settings of <engines> and <layout> are stored in ibus_config.textproto -->
-<!-- under the user configuration directory, which is either of: -->
-<!-- * $XDG_CONFIG_HOME/mozc/ibus_config.textproto -->
-<!-- * $HOME/.config/mozc/ibus_config.textproto -->
-<!-- * $HOME/.mozc/ibus_config.textproto -->
-<!-- `ibus write-cache; ibus restart` might be necessary to apply changes. -->
-""")
+  profile = 'mozkey-ibg' if branding == 'Mozkey' else 'mozc'
+  print('<!-- Settings of <engines> and <layout> are stored in ibus_config.textproto -->')
+  print('<!-- under the user configuration directory, which is either of: -->')
+  print(f'<!-- * $XDG_CONFIG_HOME/{profile}/ibus_config.textproto -->')
+  print(f'<!-- * $HOME/.config/{profile}/ibus_config.textproto -->')
+  # Mozkey IbG never reads ~/.mozc or upstream Mozkey's directories.  Its own
+  # legacy directory is honored when it already exists.
+  print(f'<!-- * $HOME/.{profile}/ibus_config.textproto -->')
+  print('<!-- `ibus write-cache; ibus restart` might be necessary to apply changes. -->')
 
 
 def OutputCppVariable(prefix, key, value):
@@ -127,7 +131,7 @@ def main():
       '--branding',
       dest='branding',
       default=None,
-      help='GoogleJapaneseInput for the official build. Otherwise, Mozkey IbG.',
+      help='GoogleJapaneseInput, Mozc, or Mozkey (Linux Mozkey IbG).',
   )
   parser.add_option(
       '--ibus_mozc_path',
@@ -154,17 +158,22 @@ def main():
   ibus_mozc_icon_path = options.ibus_mozc_icon_path
   setup_path = os.path.join(options.server_dir, 'mozc_tool')
 
-  # Information to generate <component> part of mozc.xml.
+  # Linux Mozkey IbG must have an IBus component identity distinct from both
+  # stock Mozc and upstream Mozkey (org.mozkey.IBus.Mozkey).  Retain the
+  # existing values for the upstream branding options.
+  is_mozkey = options.branding == 'Mozkey'
   component = {
-      'name': 'com.google.IBus.Mozc',
+      'name': ('io.github.kazormia296.IBus.MozkeyIbG' if is_mozkey
+               else 'com.google.IBus.Mozc'),
       'description': product_name + ' Component',
       'exec': ibus_mozc_path + ' --ibus',
       # TODO(mazda): Generate the version number.
       'version': '0.0.0.0',
-      'author': 'Google LLC',
+      'author': 'Mozkey IbG contributors' if is_mozkey else 'Google LLC',
       'license': 'New BSD',
-      'homepage': 'https://github.com/google/mozc',
-      'textdomain': 'ibus-mozc',
+      'homepage': ('https://github.com/kazormia296/mozkey-ibg' if is_mozkey
+                   else 'https://github.com/google/mozc'),
+      'textdomain': 'ibus-mozkey-ibg' if is_mozkey else 'ibus-mozc',
   }
 
   engine_common = {
@@ -180,7 +189,7 @@ def main():
   if options.output_cpp:
     OutputCpp(component, engine_common)
   else:
-    OutputXml(component, ibus_mozc_path)
+    OutputXml(component, ibus_mozc_path, options.branding)
   return 0
 
 

@@ -91,6 +91,75 @@ class ProductIdentityContractTest(unittest.TestCase):
             (ROOT / "scripts/fixtures/fcitx5-mozkey-e2e/profile").exists()
         )
 
+    def test_linux_runtime_and_ibus_identities_differ_from_upstream_mozkey(
+        self,
+    ) -> None:
+        # Upstream Mozkey v1.1.0 isolates its own Linux build under "mozkey"
+        # names.  The fork adopts the same mechanism with IbG identifiers so
+        # that Mozkey IbG, upstream Mozkey and stock Mozc can be co-installed.
+        constants = read("src/base/const.h")
+        system_util = read("src/base/system_util.cc")
+        ipc = read("src/ipc/ipc_path_manager.cc")
+        config = read("src/config.bzl")
+        ibus_xml = read("src/unix/ibus/gen_mozc_xml.py")
+        ibus_config = read("src/unix/ibus/ibus_config.textproto")
+        ibus_path_util = read("src/unix/ibus/path_util.cc")
+        package = read("src/unix/build_package.py")
+        namespace_test = read("src/ipc/linux_mozkey_namespace_test.cc")
+        probe = read("src/ipc/linux_mozkey_ipcclient_probe.cc")
+
+        self.assertIn('kEventPathPrefix[] = "mozkey-ibg.event."', constants)
+        self.assertNotIn('kEventPathPrefix[] = "mozkey.event."', constants)
+        self.assertIn('kIPCPrefix[] = "/tmp/.mozkey-ibg."', ipc)
+        self.assertNotIn('kIPCPrefix[] = "/tmp/.mozkey."', ipc)
+        self.assertIn('kLegacyProfileName = ".mozkey-ibg"', system_util)
+        self.assertIn('kXdgProfileName = "mozkey-ibg"', system_util)
+        for upstream_profile in ('".mozkey"', '"mozkey"', '".config/mozkey"'):
+            self.assertNotIn(upstream_profile, system_util)
+
+        for required in (
+            'LINUX_MOZC_ICONS_DIR = "/usr/share/icons/mozkey-ibg"',
+            'LINUX_MOZC_SERVER_DIR = "/usr/lib/mozkey-ibg"',
+            'IBUS_MOZC_INSTALL_DIR = "/usr/share/ibus-mozkey-ibg"',
+            'IBUS_MOZC_PATH = "/usr/lib/ibus-mozkey-ibg/ibus-engine-mozkey-ibg"',
+        ):
+            self.assertIn(required, config)
+        for upstream_path in (
+            '"/usr/lib/mozkey"',
+            '"/usr/share/icons/mozkey"',
+            '"/usr/share/ibus-mozkey"',
+            '"/usr/lib/ibus-mozkey/ibus-engine-mozkey"',
+            '"/usr/lib/mozc"',
+            '"/usr/share/ibus-mozc"',
+        ):
+            self.assertNotIn(upstream_path, config)
+
+        self.assertIn("'io.github.kazormia296.IBus.MozkeyIbG'", ibus_xml)
+        self.assertIn("'ibus-mozkey-ibg'", ibus_xml)
+        self.assertIn("'Mozkey': 'Mozkey IbG'", ibus_xml)
+        self.assertNotIn("'org.mozkey.IBus.Mozkey'", ibus_xml)
+        self.assertNotIn("'ibus-mozkey'", ibus_xml)
+        for engine in ("mozkey-ibg-jp", "mozkey-ibg-on", "mozkey-ibg-off"):
+            self.assertIn(f'name : "{engine}"', ibus_config)
+        for foreign_engine in ('"mozkey-jp"', '"mozc-jp"', '"mozkey-on"',
+                               '"mozc-on"', '"mozkey-off"', '"mozc-off"'):
+            self.assertNotIn(foreign_engine, ibus_config)
+        self.assertIn('"/usr/share/ibus-mozkey-ibg"', ibus_path_util)
+
+        self.assertIn("'mozkey-ibg.xml'", package)
+        for default in (
+            "default='/usr/lib/mozkey-ibg'",
+            "default='/usr/share/icons/mozkey-ibg'",
+            "default='/usr/share/ibus-mozkey-ibg'",
+            "default='/usr/lib/ibus-mozkey-ibg/ibus-engine-mozkey-ibg'",
+        ):
+            self.assertIn(default, package)
+
+        self.assertIn('EXPECT_STREQ(kEventPathPrefix, "mozkey-ibg.event.")',
+                      namespace_test)
+        self.assertIn(r'"\0tmp/.mozkey-ibg."', namespace_test)
+        self.assertIn('"/usr/lib/mozkey-ibg/mozc_server"', probe)
+
     def test_windows_registration_is_independent_from_upstream_mozkey(self) -> None:
         profile = read("src/win32/base/tsf_profile.cc")
         installer_builder = read("src/win32/installer/build_installer.py")

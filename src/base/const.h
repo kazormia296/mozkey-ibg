@@ -163,7 +163,14 @@ inline constexpr char kEventPathPrefix[] = "MozkeyIbG.event.";
 #else   // __linux__ including __ANDROID__
 inline constexpr char kMozcServerName[] = "mozc_server";
 inline constexpr char kMozcRenderer[] = "mozc_renderer";
+// Mozkey IbG uses its own Linux event namespace so that it shares named
+// events with neither stock Mozc ("mozc.event.") nor upstream Mozkey
+// ("mozkey.event.").  Keep Android/ChromeOS event names unchanged.
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(OS_CHROMEOS)
 inline constexpr char kEventPathPrefix[] = "mozkey-ibg.event.";
+#else
+inline constexpr char kEventPathPrefix[] = "mozc.event.";
+#endif  // Linux Mozkey IbG
 inline constexpr char kMozcTool[] = "mozc_tool";
 #endif  // _WIN32, __APPLE__, or else
 

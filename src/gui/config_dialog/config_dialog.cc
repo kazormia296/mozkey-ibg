@@ -45,6 +45,7 @@
 #include <QFont>
 #include <QCheckBox>
 #include <QFrame>
+#include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -450,14 +451,8 @@ ConfigDialog::ConfigDialog()
   inputAppearanceContentLayout->insertWidget(0, preeditDisplayColorGroupBox);
   preeditDisplayColorGroupBox->show();
 
-#if !defined(_WIN32) && !defined(__APPLE__)
-  // On Linux neither the detailed renderer appearance nor TSF preedit
-  // attributes are supported. Keep the tab out of the navigation entirely.
-  const int appearance_index = configDialogTabWidget->indexOf(inputAppearanceTab);
-  if (appearance_index >= 0) {
-    configDialogTabWidget->removeTab(appearance_index);
-  }
-#endif  // !defined(_WIN32) && !defined(__APPLE__)
+  // Linux uses a reduced, functional renderer appearance editor below. TSF-only
+  // preedit controls remain hidden, but the tab itself is available.
 
   Qt::WindowFlags flags = windowFlags();
   flags &= ~Qt::WindowContextHelpButtonHint;
@@ -1675,19 +1670,45 @@ std::wstring BuildSetDefaultImeScript(const std::wstring& mozkey_input_tip) {
              L"};"
 
              L"$alreadyMozkey=($currentTip -eq $mozkeyInputTip);"
-
+             L"$list=Get-WinUserLanguageList;"
+             L"$ja=@($list | Where-Object { $_.LanguageTag -eq 'ja' });"
+             L"if ($ja.Count -ne 1) { throw 'Expected one Japanese language'; };"
+             L"$currentTips=@($ja[0].InputMethodTips);"
+             L"$alreadyFirst=($currentTips.Count -gt 0 -and "
+             L"  $currentTips[0] -ieq $mozkeyInputTip);"
+             L"$needsBackup=(-not $alreadyMozkey -or -not $alreadyFirst);"
+             // Reject a missing or duplicated target before creating a
+             // historical restore point.
+             L"$matchingTips=@($currentTips | Where-Object { $_ -ieq $mozkeyInputTip });"
+             L"if ($matchingTips.Count -ne 1) {"
+             L"  throw 'Mozkey InputTip missing/duplicate';"
+             L"};"
+             // Reject malformed active backups before any persistent change.
              L"if ($backupActive -eq 1) {"
-             L"  if (-not $alreadyMozkey) {"
-             L"    Set-WinDefaultInputMethodOverride -InputTip $mozkeyInputTip;"
-             L"  }"
-             L"  exit 0;"
+             L"  if ($null -eq $backup.WasEmpty -or"
+             L"      [string]::IsNullOrWhiteSpace($backup.JapaneseInputMethodTips)) {"
+             L"    throw 'Incomplete active default IME restore point';"
+             L"  };"
+             L"  $wasEmpty=[int]$backup.WasEmpty;"
+             L"  if (($wasEmpty -ne 0 -and $wasEmpty -ne 1) -or"
+             L"      ($wasEmpty -eq 0 -and"
+             L"       [string]::IsNullOrWhiteSpace($backup.InputTip)) -or"
+             L"      ($wasEmpty -eq 1 -and"
+             L"       -not [string]::IsNullOrWhiteSpace($backup.InputTip))) {"
+             L"    throw 'Invalid active default IME restore point';"
+             L"  };"
+             L"};"
+             // An inactive key may contain an interrupted older backup.
+             // Never overwrite it without explicit user inspection.
+             L"if ((Test-Path -LiteralPath $path) -and $backupActive -ne 1) {"
+             L"  throw 'Incomplete default IME restore point exists';"
              L"};"
 
-             // If Mozkey is already the override and there is no active
-             // backup, do not create a pointless restore point whose restore
-             // target is Mozkey itself.
-             L"if ($alreadyMozkey) { exit 0 };"
-
+             // Keep the first restore point, but never skip repairing an
+             // already-selected override: it may not match the active TSF.
+             // Back up even if override=Mozkey when this operation
+             // will change Japanese IME ordering.
+             L"if ($backupActive -ne 1 -and $needsBackup) {"
              L"if (!(Test-Path $path)) {"
              L"  New-Item -Path $path -Force | Out-Null;"
              L"};"
@@ -1718,50 +1739,267 @@ std::wstring BuildSetDefaultImeScript(const std::wstring& mozkey_input_tip) {
 
              L"New-ItemProperty -Path $path -Name BackupActive "
              L"  -PropertyType DWord -Value 1 -Force | Out-Null;"
+             // This phase only stores the historical restore point.
+             // Persistent changes happen in BuildFinalizeDefaultImeScript,
+             // which can roll back its own in-memory pre-attempt snapshot.
+             L"};");
+}
 
-             // Set Mozkey as the Windows default input method override.
-             L"Set-WinDefaultInputMethodOverride -InputTip $mozkeyInputTip;");
+// A single PowerShell process owns the persistent changes and can restore
+// its pre-attempt state if any write or verification fails. In particular,
+// the historical Restore-button snapshot is never used as a transaction.
+std::wstring BuildFinalizeDefaultImeScript(
+    const std::wstring& mozkey_input_tip) {
+  return std::wstring(
+             L"$ErrorActionPreference='Stop';"
+             L"$target='") + mozkey_input_tip +
+         std::wstring(
+             L"';"
+             L"$originalOverride=Get-WinDefaultInputMethodOverride;"
+             L"$originalTip='';"
+             L"if ($null -ne $originalOverride) {"
+             L"  $originalTip=[string]$originalOverride.InputMethodTip;"
+             L"};"
+             L"$list=Get-WinUserLanguageList;"
+             L"$ja=@($list | Where-Object { $_.LanguageTag -eq 'ja' });"
+             L"if ($ja.Count -ne 1) { throw 'Expected one Japanese language'; };"
+             L"$tips=@($ja[0].InputMethodTips);"
+             L"$matchingTips=@($tips | Where-Object { $_ -ieq $target });"
+             L"if ($matchingTips.Count -ne 1) {"
+             L"  throw 'Mozkey InputTip missing/duplicate';"
+             L"};"
+             L"$expected=@($target) + @($tips | Where-Object { $_ -ine $target });"
+             // Include other-language flags, not just their TIP sequences.
+             L"function OtherState($langs) {"
+             L"  return (@($langs | Where-Object { $_.LanguageTag -ne 'ja' } | "
+             L"    ForEach-Object {"
+             L"      $_.LanguageTag + ':' + [string]$_.Autocorrect + ':' + "
+             L"      [string]$_.Handwriting + ':' + "
+             L"      [string]$_.Spellchecking + ':' + "
+             L"      (@($_.InputMethodTips) -join '|')"
+             L"    }) -join ';;');"
+             L"};"
+             L"$otherBefore=OtherState $list;"
+             L"$languageOrderBefore=@($list | ForEach-Object { $_.LanguageTag }) -join '|';"
+             L"$jaFlagsBefore=([string]$ja[0].Autocorrect + ':' + "
+             L"[string]$ja[0].Handwriting + ':' + "
+             L"[string]$ja[0].Spellchecking);"
+             L"try {"
+             L"  if (($tips -join '|') -ine ($expected -join '|')) {"
+             L"    $ja[0].InputMethodTips.Clear();"
+             L"    foreach ($tip in $expected) {"
+             L"      $ja[0].InputMethodTips.Add($tip) | Out-Null;"
+             L"    };"
+             L"    $defaultImeWriteStarted=$true;"
+             L"    Set-WinUserLanguageList -LanguageList $list -Force;"
+             L"  };"
+             L"  $defaultImeWriteStarted=$true;"
+             L"  Set-WinDefaultInputMethodOverride -InputTip $target;"
+             L"  $verify=Get-WinDefaultInputMethodOverride;"
+             L"  if ($null -eq $verify -or $verify.InputMethodTip -ine $target) {"
+             L"    throw 'Override verification failed';"
+             L"  };"
+             L"  $after=Get-WinUserLanguageList;"
+             L"  $afterJa=@($after | Where-Object { $_.LanguageTag -eq 'ja' });"
+             L"  if ($afterJa.Count -ne 1 -or"
+             L"      (@($afterJa[0].InputMethodTips) -join '|') -ine "
+             L"      ($expected -join '|')) {"
+             L"    throw 'Japanese IME order verification failed';"
+             L"  };"
+             L"  if ((OtherState $after) -cne $otherBefore -or"
+             L"      (@($after | ForEach-Object { $_.LanguageTag }) -join '|')"
+             L"      -cne $languageOrderBefore) {"
+             L"    throw 'Other user languages changed';"
+             L"  };"
+             L"  $jaFlagsAfter=([string]$afterJa[0].Autocorrect + ':' + "
+             L"    [string]$afterJa[0].Handwriting + ':' + "
+             L"    [string]$afterJa[0].Spellchecking);"
+             L"  if ($jaFlagsAfter -cne $jaFlagsBefore) {"
+             L"    throw 'Japanese language flags changed';"
+             L"  };"
+             L"} catch {"
+             L"  $failure=[string]$_.Exception.Message;"
+             L"  try {"
+             L"    $restore=Get-WinUserLanguageList;"
+             L"    $restoreJa=@($restore | Where-Object { $_.LanguageTag -eq 'ja' });"
+             L"    if ($restoreJa.Count -ne 1) {"
+             L"      throw 'Cannot locate Japanese language for rollback';"
+             L"    };"
+             L"    $restoreFlags=([string]$restoreJa[0].Autocorrect + ':' + "
+             L"      [string]$restoreJa[0].Handwriting + ':' + "
+             L"      [string]$restoreJa[0].Spellchecking);"
+             L"    if ((@($restoreJa[0].InputMethodTips) -join '|') -ine "
+             L"        ($tips -join '|') -or"
+             L"        (OtherState $restore) -cne $otherBefore -or"
+             L"        (@($restore | ForEach-Object { $_.LanguageTag })"
+             L"          -join '|') -cne $languageOrderBefore -or"
+             L"        $restoreFlags -cne $jaFlagsBefore) {"
+             // Use the pre-attempt language objects, not the mutated OS state.
+             L"      $ja[0].InputMethodTips.Clear();"
+             L"      foreach ($tip in $tips) {"
+             L"        $ja[0].InputMethodTips.Add($tip) | Out-Null;"
+             L"      };"
+             L"      Set-WinUserLanguageList -LanguageList $list -Force;"
+             L"    };"
+             L"    if ([string]::IsNullOrWhiteSpace($originalTip)) {"
+             L"      Set-WinDefaultInputMethodOverride;"
+             L"    } else {"
+             L"      Set-WinDefaultInputMethodOverride -InputTip $originalTip;"
+             L"    };"
+             L"    $backOverride=Get-WinDefaultInputMethodOverride;"
+             L"    $backTip='';"
+             L"    if ($null -ne $backOverride) {"
+             L"      $backTip=[string]$backOverride.InputMethodTip;"
+             L"    };"
+             L"    if ($backTip -ine $originalTip) {"
+             L"      throw 'Override rollback verification failed';"
+             L"    };"
+             L"    $back=Get-WinUserLanguageList;"
+             L"    $backJa=@($back | Where-Object { $_.LanguageTag -eq 'ja' });"
+             L"    if ($backJa.Count -ne 1 -or"
+             L"        (@($backJa[0].InputMethodTips) -join '|') -ine"
+             L"        ($tips -join '|') -or"
+             L"        (OtherState $back) -cne $otherBefore -or"
+             L"        (@($back | ForEach-Object { $_.LanguageTag }) -join '|')"
+             L"          -cne $languageOrderBefore) {"
+             L"      throw 'Language rollback verification failed';"
+             L"    };"
+             L"    $backFlags=([string]$backJa[0].Autocorrect + ':' + "
+             L"      [string]$backJa[0].Handwriting + ':' + "
+             L"      [string]$backJa[0].Spellchecking);"
+             L"    if ($backFlags -cne $jaFlagsBefore) {"
+             L"      throw 'Japanese flags rollback verification failed';"
+             L"    };"
+             L"  } catch {"
+             L"    throw ('SET_FAILED_ROLLBACK_FAILED: ' + $failure +"
+             L"           '; rollback: ' + $_.Exception.Message);"
+             L"  };"
+             L"  $defaultImeRollbackVerified=$true;"
+             L"  throw ('SET_FAILED_ROLLBACK_VERIFIED: ' + $failure);"
+             L"};");
+}
+
+// Keep backup creation and persistent settings in the same PowerShell
+// invocation. A new restore point is discarded only if no persistent write
+// occurred or a write failure's rollback was verified. Pre-existing points
+// are never discarded here.
+std::wstring BuildSafeSetDefaultImeScript(
+    const std::wstring& mozkey_input_tip) {
+  return std::wstring(
+             L"$ErrorActionPreference='Stop';"
+             L"$backupPath='HKCU:\\Software\\Grimodex\\MozkeyIbG\\"
+             L"DefaultImeOverrideBackup';"
+             L"$backupExisted=Test-Path -LiteralPath $backupPath;"
+             L"$defaultImeWriteStarted=$false;"
+             L"$defaultImeRollbackVerified=$false;"
+             L"try {") +
+         BuildSetDefaultImeScript(mozkey_input_tip) +
+         BuildFinalizeDefaultImeScript(mozkey_input_tip) +
+         std::wstring(
+             L"} catch {"
+             L"  $failure=[string]$_.Exception.Message;"
+             L"  if (-not $backupExisted -and"
+             L"      (-not $defaultImeWriteStarted -or"
+             L"       $defaultImeRollbackVerified) -and"
+             L"      (Test-Path -LiteralPath $backupPath)) {"
+             L"    try {"
+             L"      Remove-Item -LiteralPath $backupPath -Recurse -Force"
+             L"        -ErrorAction Stop;"
+             L"    } catch {"
+             L"      throw ('SET_BACKUP_CLEANUP_FAILED: ' + $failure +"
+             L"        '; cleanup: ' + $_.Exception.Message);"
+             L"    };"
+             L"  };"
+             L"  throw;"
+             L"};");
 }
 
 std::wstring BuildRestoreDefaultImeScript() {
+  // Preflight rejects malformed/stale restore points before any write.
+  // The restore-point key is consumed only after all settings are verified.
+  // If a write fails, restore the pre-attempt state instead of assuming the
+  // historical backup is an appropriate transaction rollback target.
   return
       L"$ErrorActionPreference='Stop';"
       L"$path='HKCU:\\Software\\Grimodex\\MozkeyIbG\\"
       L"DefaultImeOverrideBackup';"
-      L"if (!(Test-Path $path)) { exit 2 };"
-      L"$backup=Get-ItemProperty -Path $path;"
-      L"if ($backup.BackupActive -ne 1) { exit 2 };"
-
-      // Restore the previous Windows default input method override.
-      L"if ($backup.WasEmpty -eq 1 -or "
-      L"    [string]::IsNullOrWhiteSpace($backup.InputTip)) {"
-      L"  Set-WinDefaultInputMethodOverride;"
-      L"} else {"
-      L"  $savedInputTip=[string]$backup.InputTip;"
-      L"  Set-WinDefaultInputMethodOverride -InputTip $savedInputTip;"
+      L"if (!(Test-Path -LiteralPath $path)) { exit 2; };"
+      L"$backup=Get-ItemProperty -LiteralPath $path;"
+      L"if ($backup.BackupActive -ne 1) { exit 2; };"
+      L"if ($null -eq $backup.WasEmpty) { throw 'Invalid restore point: WasEmpty missing'; };"
+      L"$wasEmpty=[int]$backup.WasEmpty;"
+      L"if ($wasEmpty -ne 0 -and $wasEmpty -ne 1) { throw 'Invalid restore point: WasEmpty'; };"
+      L"$savedOverride=[string]$backup.InputTip;"
+      L"if ($wasEmpty -eq 0 -and [string]::IsNullOrWhiteSpace($savedOverride)) { throw 'Invalid restore point: missing override'; };"
+      L"if ($wasEmpty -eq 1 -and -not [string]::IsNullOrWhiteSpace($savedOverride)) { throw 'Invalid restore point: unexpected override'; };"
+      L"$savedString=[string]$backup.JapaneseInputMethodTips;"
+      L"if ([string]::IsNullOrWhiteSpace($savedString)) { throw 'Invalid restore point: Japanese IME order missing'; };"
+      L"$saved=@($savedString -split '\\|');"
+      L"if (@($saved | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -ne 0) { throw 'Invalid restore point: empty input tip'; };"
+      L"if (@($saved | Sort-Object -Unique).Count -ne $saved.Count) { throw 'Invalid restore point: duplicate input tip'; };"
+      L"$beforeOverride=Get-WinDefaultInputMethodOverride;"
+      L"$beforeTip='';"
+      L"if ($null -ne $beforeOverride) { $beforeTip=[string]$beforeOverride.InputMethodTip; };"
+      L"$list=Get-WinUserLanguageList;"
+      L"$ja=@($list | Where-Object { $_.LanguageTag -eq 'ja' });"
+      L"if ($ja.Count -ne 1) { throw 'Restore requires exactly one Japanese language'; };"
+      L"$beforeTips=@();"
+      L"foreach ($tip in $ja[0].InputMethodTips) { $beforeTips += [string]$tip; };"
+      L"if ($beforeTips.Count -ne $saved.Count -or (@($beforeTips | Sort-Object) -join '|') -ine (@($saved | Sort-Object) -join '|')) { throw 'Japanese IME set changed since backup; restore refused'; };"
+      L"function LanguageState($languages) {"
+      L"$records=@();"
+      L"foreach ($language in $languages) {"
+      L"$tips=@();"
+      L"foreach ($tip in $language.InputMethodTips) { $tips += [string]$tip; };"
+      L"$records += ([string]$language.LanguageTag + ':' + [string]$language.Autocorrect + ':' + [string]$language.Handwriting + ':' + [string]$language.Spellchecking + ':' + ($tips -join '|'));"
       L"};"
-
-      // Restore the previous ja InputMethodTips order if it was saved.
-      L"if (-not [string]::IsNullOrWhiteSpace("
-      L"    $backup.JapaneseInputMethodTips)) {"
-      L"  $tips=$backup.JapaneseInputMethodTips -split '\\|';"
-      L"  $list=Get-WinUserLanguageList;"
-      L"  $ja=$list | Where-Object { $_.LanguageTag -eq 'ja' } | "
-      L"    Select-Object -First 1;"
-      L"  if ($null -ne $ja) {"
-      L"    $ja.InputMethodTips.Clear();"
-      L"    foreach ($tip in $tips) {"
-      L"      if (-not [string]::IsNullOrWhiteSpace($tip)) {"
-      L"        $ja.InputMethodTips.Add($tip) | Out-Null;"
-      L"      }"
-      L"    }"
-      L"    Set-WinUserLanguageList $list -Force;"
-      L"  }"
+      L"return ($records -join ';;');"
       L"};"
-
-      // The restore point has been consumed.  Remove it so the next
-      // Set action captures the then-current state as a new restore point.
-      L"Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue;";
+      L"function ReadOverrideTip() {"
+      L"$current=Get-WinDefaultInputMethodOverride;"
+      L"if ($null -eq $current) { return ''; };"
+      L"return [string]$current.InputMethodTip;"
+      L"};"
+      L"function BackupSignature($point) {"
+      L"return ([string]$point.BackupActive + ':' + [string]$point.WasEmpty + ':' + [string]$point.InputTip + ':' + [string]$point.JapaneseInputMethodTips);"
+      L"};"
+      L"$backupSignature=BackupSignature $backup;"
+      L"$beforeSignature=LanguageState $list;"
+      L"$writeStarted=$false;"
+      L"try {"
+      L"if (($beforeTips -join '|') -ine ($saved -join '|')) {"
+      L"$ja[0].InputMethodTips.Clear();"
+      L"foreach ($tip in $saved) { $ja[0].InputMethodTips.Add($tip) | Out-Null; };"
+      L"$writeStarted=$true;"
+      L"Set-WinUserLanguageList -LanguageList $list -Force;"
+      L"};"
+      L"$expectedSignature=LanguageState $list;"
+      L"$writeStarted=$true;"
+      L"if ($wasEmpty -eq 1) { Set-WinDefaultInputMethodOverride; }"
+      L"else { Set-WinDefaultInputMethodOverride -InputTip $savedOverride; };"
+      L"$targetTip='';"
+      L"if ($wasEmpty -eq 0) { $targetTip=$savedOverride; };"
+      L"if ((ReadOverrideTip) -ine $targetTip) { throw 'Restore override verification failed'; };"
+      L"if ((LanguageState (Get-WinUserLanguageList)) -cne $expectedSignature) { throw 'Restore language settings verification failed'; };"
+      L"if (!(Test-Path -LiteralPath $path)) { throw 'Restore point disappeared'; };"
+      L"if ((BackupSignature (Get-ItemProperty -LiteralPath $path)) -cne $backupSignature) { throw 'Restore point changed concurrently'; };"
+      L"} catch {"
+      L"$failure=[string]$_.Exception.Message;"
+      L"if (-not $writeStarted) { throw ('RESTORE_PREFLIGHT_FAILED: ' + $failure); };"
+      L"try {"
+      L"$ja[0].InputMethodTips.Clear();"
+      L"foreach ($tip in $beforeTips) { $ja[0].InputMethodTips.Add($tip) | Out-Null; };"
+      L"if ((LanguageState (Get-WinUserLanguageList)) -cne $beforeSignature) { Set-WinUserLanguageList -LanguageList $list -Force; };"
+      L"if ($beforeTip -eq '') { Set-WinDefaultInputMethodOverride; }"
+      L"else { Set-WinDefaultInputMethodOverride -InputTip $beforeTip; };"
+      L"if ((ReadOverrideTip) -ine $beforeTip -or (LanguageState (Get-WinUserLanguageList)) -cne $beforeSignature) { throw 'Rollback verification failed'; };"
+      L"} catch {"
+      L"throw ('RESTORE_FAILED_ROLLBACK_FAILED: ' + $failure + '; rollback: ' + $_.Exception.Message);"
+      L"};"
+      L"throw ('RESTORE_FAILED_ROLLBACK_VERIFIED: ' + $failure);"
+      L"};"
+      L"try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop; }"
+      L"catch { exit 3; };";
 }
 #endif  // _WIN32
 
@@ -2233,11 +2471,16 @@ void ShowZenzFeedbackManagementDialog(QWidget* parent,
                        return;
                      }
 
-                     store.RecordRejected(
-                         key.toUtf8().constData(),
-                         context_class.toUtf8().constData(),
-                         value.toUtf8().constData(),
-                         "hard_reject");
+                     if (!store.RecordManualBlock(
+                             key.toUtf8().constData(),
+                             context_class.toUtf8().constData(),
+                             value.toUtf8().constData())) {
+                       ShowJapaneseCritical(
+                           &dialog, dialog.windowTitle(),
+                           QString::fromUtf8(
+                               "Zenz 補正のブロックを保存できませんでした。"));
+                       return;
+                     }
 
                      reload_table();
 
@@ -3556,6 +3799,122 @@ void ConfigDialog::UpdateConversionStatusPreview() {
 
 void ConfigDialog::InitializeRendererAppearanceControls() {
 #if !defined(_WIN32) && !defined(__APPLE__)
+  // Initial Linux support exposes only settings actually implemented by the
+  // Qt renderer. Never display TSF, ruby or window-effects controls as working.
+  auto* linux_group = new QGroupBox(
+      StatusUiText("Candidate and suggestion windows",
+                   "候補・サジェストウィンドウ"),
+      inputAppearanceScrollAreaWidgetContents);
+  linux_group->setObjectName(QStringLiteral("linuxRendererAppearanceGroupBox"));
+  auto* layout = new QFormLayout(linux_group);
+  const auto add_theme = [&](const char* object_name, bool follow_candidate) {
+    auto* combo = new QComboBox(linux_group);
+    combo->setObjectName(QString::fromLatin1(object_name));
+    const auto add_item = [combo](const QString& label, int value) {
+      combo->addItem(label, value);
+    };
+    add_item(StatusUiText("System theme", "システムに合わせる"),
+             config::Config::RENDERER_WINDOW_COLOR_AUTO);
+    add_item(StatusUiText("Light", "ライト"),
+             config::Config::RENDERER_WINDOW_COLOR_LIGHT);
+    add_item(StatusUiText("Dark", "ダーク"),
+             config::Config::RENDERER_WINDOW_COLOR_DARK);
+    if (follow_candidate) {
+      add_item(StatusUiText("Follow candidate", "候補に合わせる"),
+               config::Config::RENDERER_WINDOW_COLOR_FOLLOW_CANDIDATE);
+    }
+    // Preserve palettes previously saved on other platforms. Palette editing
+    // is not exposed until the Qt renderer supports the complete editor.
+    add_item(StatusUiText("Custom (existing palette)",
+                           "カスタム（既存の配色）"),
+             config::Config::RENDERER_WINDOW_COLOR_CUSTOM);
+    QObject::connect(combo, SIGNAL(currentIndexChanged(int)), this,
+                     SLOT(EnableApplyButton()));
+    return combo;
+  };
+  layout->addRow(StatusUiText("Candidate window", "候補ウィンドウ"),
+                 add_theme("candidateWindowColorThemeComboBox", false));
+  layout->addRow(StatusUiText("Suggestion window", "サジェストウィンドウ"),
+                 add_theme("suggestWindowColorThemeComboBox", true));
+
+  // RendererStyle already carries independent text settings. Expose them only
+  // after the Qt renderer uses the selected font and scaled metrics.
+  const auto add_size = [&](const char* object_name) {
+    auto* spin = new QSpinBox(linux_group);
+    spin->setObjectName(QString::fromLatin1(object_name));
+    spin->setRange(80, 200);  // Matches renderer_style_config.cc clamps.
+    spin->setSingleStep(10);
+    spin->setSuffix(QStringLiteral(" %"));
+    QObject::connect(spin, QOverload<int>::of(&QSpinBox::valueChanged),
+                     this, [this](int) { EnableApplyButton(); });
+    return spin;
+  };
+  layout->addRow(StatusUiText("Candidate size", "候補の大きさ"),
+                 add_size("candidateWindowSizePercentSpinBox"));
+  layout->addRow(StatusUiText("Suggestion size", "サジェストの大きさ"),
+                 add_size("suggestWindowSizePercentSpinBox"));
+
+  const auto add_font = [&](const char* object_name) {
+    auto* combo = new QComboBox(linux_group);
+    combo->setObjectName(QString::fromLatin1(object_name));
+    InitializeCandidateRubyFontComboBox(combo);
+    QObject::connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     this, [this](int) { EnableApplyButton(); });
+    return combo;
+  };
+  layout->addRow(StatusUiText("Candidate font", "候補のフォント"),
+                 add_font("linuxCandidateWindowFontComboBox"));
+  layout->addRow(StatusUiText("Suggestion font", "サジェストのフォント"),
+                 add_font("linuxSuggestWindowFontComboBox"));
+
+  const auto add_weight = [&](const char* object_name) {
+    auto* combo = new QComboBox(linux_group);
+    combo->setObjectName(QString::fromLatin1(object_name));
+    InitializeRendererFontWeightComboBox(combo);
+    QObject::connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     this, [this](int) { EnableApplyButton(); });
+    return combo;
+  };
+  layout->addRow(StatusUiText("Candidate font weight", "候補文字の太さ"),
+                 add_weight("linuxCandidateWindowFontWeightComboBox"));
+  layout->addRow(StatusUiText("Suggestion font weight", "サジェスト文字の太さ"),
+                 add_weight("linuxSuggestWindowFontWeightComboBox"));
+
+  // Only expose effects that the Qt top-level window actually implements.
+  // Custom shadow controls remain hidden until the translucent shell and its
+  // screen-edge geometry are implemented.
+  const auto add_effect_spin = [&](const char* name, int low, int high,
+                                   int value, const QString& suffix) {
+    auto* spin = new QSpinBox(linux_group);
+    spin->setObjectName(QString::fromLatin1(name));
+    spin->setRange(low, high);
+    spin->setValue(value);
+    spin->setSuffix(suffix);
+    QObject::connect(spin, QOverload<int>::of(&QSpinBox::valueChanged),
+                     this, [this](int) { EnableApplyButton(); });
+    return spin;
+  };
+  layout->addRow(StatusUiText("Candidate corner radius", "候補の角丸"),
+                 add_effect_spin("candidateWindowCornerRadiusSpinBox", 0, 24,
+                                 6, QStringLiteral(" px")));
+  layout->addRow(StatusUiText("Suggestion corner radius", "サジェストの角丸"),
+                 add_effect_spin("suggestWindowCornerRadiusSpinBox", 0, 24,
+                                 6, QStringLiteral(" px")));
+  layout->addRow(StatusUiText("Candidate opacity", "候補の不透明度"),
+                 add_effect_spin("candidateWindowOpacityPercentSpinBox", 20,
+                                 100, 100, QStringLiteral(" %")));
+  layout->addRow(StatusUiText("Suggestion opacity", "サジェストの不透明度"),
+                 add_effect_spin("suggestWindowOpacityPercentSpinBox", 20,
+                                 100, 100, QStringLiteral(" %")));
+
+  auto* description = new QLabel(
+      StatusUiText("Themes, fonts, sizing, rounding and opacity are supported. "
+                   "Custom shadows and detailed palettes remain unavailable.",
+                   "テーマ・フォント・倍率・角丸・不透明度に対応。影と詳細な配色編集は未対応です。"),
+      linux_group);
+  description->setWordWrap(true);
+  layout->addRow(description);
+  inputAppearanceContentLayout->insertWidget(0, linux_group);
   return;
 #endif  // !defined(_WIN32) && !defined(__APPLE__)
 
@@ -3601,8 +3960,8 @@ void ConfigDialog::InitializeRendererAppearanceControls() {
   enabled_layout->addWidget(enabled);
   status_root->addWidget(enabled_row);
 
-  // The preview is deliberately above the controls and never hidden when the
-  // production overlay is disabled: users can design the indicator offline.
+  // The preview remains visible when the production overlay is disabled,
+  // while the related appearance controls become unavailable for editing.
   auto* preview_section = new QFrame(status_group);
   auto* preview_layout = new QVBoxLayout(preview_section);
   preview_layout->setContentsMargins(16, 0, 16, 0);
@@ -3621,6 +3980,11 @@ void ConfigDialog::InitializeRendererAppearanceControls() {
   QPushButton* preset_button = nullptr;
   auto make_section = [&](const QString& title, bool is_basic = false) -> QGridLayout* {
     auto* section = new QFrame(status_group);
+    // The preview and visibility toggle stay usable; style edits do not.
+    // The checked state is restored from config after this UI is constructed.
+    section->setEnabled(enabled->isChecked());
+    QObject::connect(enabled, &QCheckBox::toggled,
+                     section, &QWidget::setEnabled);
     auto* layout = new QVBoxLayout(section);
     // Match the small gaps above the preedit color subsections.
     // Basic follows the preview directly; subsequent subsections get 8 px
@@ -4998,6 +5362,9 @@ void ConfigDialog::ConvertFromProto(const config::Config &config) {
   SET_CHECKBOX(zenzLiveCorrectionCheckBox, use_zenz_live_correction);
   SET_CHECKBOX(zenzStrictReadingPreservationCheckBox,
                use_zenz_strict_reading_preservation);
+  // Invert only the UI: the persisted field remains an opt-in for emoji changes.
+  zenzSuppressEmojiChangesCheckBox->setChecked(
+      !config.allow_zenz_emoji_changes());
   SET_CHECKBOX(zenzDeferLiveConversionDisplayCheckBox,
                defer_live_conversion_display_until_zenz_result);
 
@@ -5392,6 +5759,8 @@ void ConfigDialog::ConvertToProto(config::Config *config) const {
   GET_CHECKBOX(zenzLiveCorrectionCheckBox, use_zenz_live_correction);
   GET_CHECKBOX(zenzStrictReadingPreservationCheckBox,
                use_zenz_strict_reading_preservation);
+  config->set_allow_zenz_emoji_changes(
+      !zenzSuppressEmojiChangesCheckBox->isChecked());
   GET_CHECKBOX(zenzDeferLiveConversionDisplayCheckBox,
                defer_live_conversion_display_until_zenz_result);
   config->set_zenz_live_correction_delay_msec(
@@ -5565,6 +5934,10 @@ void ConfigDialog::ConvertToProto(config::Config *config) const {
 
   ConvertRendererAppearanceToProto(config);
 
+#if defined(_WIN32) || defined(__APPLE__)
+  // Linux uses the dedicated candidate/suggestion font selectors in
+  // ConvertRendererAppearanceToProto().  The hidden legacy widgets are not
+  // initialized there and would overwrite the selected fonts with "Default".
   const auto selected_font = [](const QComboBox* combo) -> std::string {
     return combo == nullptr ? std::string()
                             : combo->currentData().toString().trimmed()
@@ -5586,6 +5959,7 @@ void ConfigDialog::ConvertToProto(config::Config *config) const {
   config->set_candidate_window_font_name(candidate_font);
   config->set_suggest_window_font_name(suggest_font);
   config->set_ruby_window_font_name(ruby_font);
+#endif  // _WIN32 || __APPLE__
 
   GET_CHECKBOX(dimPendingRomanInputCheckBox, dim_pending_roman_input);
   config->set_pending_roman_dimness_percent(
@@ -5730,9 +6104,51 @@ void ConfigDialog::ConvertToProto(config::Config *config) const {
 void ConfigDialog::ConvertRendererAppearanceFromProto(
     const config::Config &config) {
 #if !defined(_WIN32) && !defined(__APPLE__)
-  if (useDarkModeCandidateWindow != nullptr) {
-    useDarkModeCandidateWindow->setChecked(
-        config.use_dark_mode_candidate_window());
+  const int candidate_theme = config.has_candidate_window_color_theme()
+      ? static_cast<int>(config.candidate_window_color_theme())
+      : config.has_use_dark_mode_candidate_window()
+            ? static_cast<int>(config.use_dark_mode_candidate_window()
+                                   ? config::Config::RENDERER_WINDOW_COLOR_DARK
+                                   : config::Config::RENDERER_WINDOW_COLOR_LIGHT)
+            : static_cast<int>(config::Config::RENDERER_WINDOW_COLOR_AUTO);
+  SetComboCurrentData(FindComboBox(this, "candidateWindowColorThemeComboBox"),
+                      candidate_theme);
+  SetComboCurrentData(FindComboBox(this, "suggestWindowColorThemeComboBox"),
+                      static_cast<int>(config.suggest_window_color_theme()));
+  if (QSpinBox* spin = FindSpinBox(this, "candidateWindowSizePercentSpinBox")) {
+    spin->setValue(static_cast<int>(config.candidate_window_size_percent()));
+  }
+  if (QSpinBox* spin = FindSpinBox(this, "suggestWindowSizePercentSpinBox")) {
+    spin->setValue(static_cast<int>(config.suggest_window_size_percent()));
+  }
+  const std::string& legacy_font = config.candidate_ruby_font_name();
+  SetComboBoxCurrentFontNameOrAdd(
+      FindComboBox(this, "linuxCandidateWindowFontComboBox"),
+      QString::fromStdString(config.has_candidate_window_font_name()
+                               ? config.candidate_window_font_name()
+                               : legacy_font));
+  SetComboBoxCurrentFontNameOrAdd(
+      FindComboBox(this, "linuxSuggestWindowFontComboBox"),
+      QString::fromStdString(config.has_suggest_window_font_name()
+                               ? config.suggest_window_font_name()
+                               : legacy_font));
+  SetComboCurrentData(
+      FindComboBox(this, "linuxCandidateWindowFontWeightComboBox"),
+      NormalizeRendererFontWeight(config.candidate_window_font_weight()));
+  SetComboCurrentData(
+      FindComboBox(this, "linuxSuggestWindowFontWeightComboBox"),
+      NormalizeRendererFontWeight(config.suggest_window_font_weight()));
+  if (QSpinBox* spin = FindSpinBox(this, "candidateWindowCornerRadiusSpinBox")) {
+    spin->setValue(static_cast<int>(config.candidate_window_custom_corner_radius()));
+  }
+  if (QSpinBox* spin = FindSpinBox(this, "suggestWindowCornerRadiusSpinBox")) {
+    spin->setValue(static_cast<int>(config.suggest_window_custom_corner_radius()));
+  }
+  if (QSpinBox* spin = FindSpinBox(this, "candidateWindowOpacityPercentSpinBox")) {
+    spin->setValue(static_cast<int>(config.candidate_window_opacity_percent()));
+  }
+  if (QSpinBox* spin = FindSpinBox(this, "suggestWindowOpacityPercentSpinBox")) {
+    spin->setValue(static_cast<int>(config.suggest_window_opacity_percent()));
   }
   return;
 #endif  // !defined(_WIN32) && !defined(__APPLE__)
@@ -5921,9 +6337,55 @@ void ConfigDialog::ConvertRendererAppearanceFromProto(
 void ConfigDialog::ConvertRendererAppearanceToProto(
     config::Config *config) const {
 #if !defined(_WIN32) && !defined(__APPLE__)
-  if (useDarkModeCandidateWindow != nullptr) {
-    config->set_use_dark_mode_candidate_window(
-        useDarkModeCandidateWindow->isChecked());
+  const int candidate_theme = GetComboCurrentData(
+      FindComboBox(this, "candidateWindowColorThemeComboBox"),
+      config::Config::RENDERER_WINDOW_COLOR_AUTO);
+  config->set_candidate_window_color_theme(
+      static_cast<config::Config::RendererWindowColorTheme>(candidate_theme));
+  config->set_use_dark_mode_candidate_window(
+      candidate_theme == config::Config::RENDERER_WINDOW_COLOR_DARK);
+  config->set_suggest_window_color_theme(
+      static_cast<config::Config::RendererWindowColorTheme>(
+          GetComboCurrentData(
+              FindComboBox(this, "suggestWindowColorThemeComboBox"),
+              config::Config::RENDERER_WINDOW_COLOR_AUTO)));
+  if (const QSpinBox* spin = FindSpinBox(this, "candidateWindowSizePercentSpinBox")) {
+    config->set_candidate_window_size_percent(static_cast<uint32_t>(spin->value()));
+  }
+  if (const QSpinBox* spin = FindSpinBox(this, "suggestWindowSizePercentSpinBox")) {
+    config->set_suggest_window_size_percent(static_cast<uint32_t>(spin->value()));
+  }
+  if (const QComboBox* font =
+          FindComboBox(this, "linuxCandidateWindowFontComboBox")) {
+    config->set_candidate_window_font_name(
+        font->currentData().toString().toStdString());
+  }
+  if (const QComboBox* font =
+          FindComboBox(this, "linuxSuggestWindowFontComboBox")) {
+    config->set_suggest_window_font_name(
+        font->currentData().toString().toStdString());
+  }
+  config->set_candidate_window_font_weight(static_cast<uint32_t>(
+      GetComboCurrentData(
+          FindComboBox(this, "linuxCandidateWindowFontWeightComboBox"), 400)));
+  config->set_suggest_window_font_weight(static_cast<uint32_t>(
+      GetComboCurrentData(
+          FindComboBox(this, "linuxSuggestWindowFontWeightComboBox"), 400)));
+  if (const QSpinBox* spin = FindSpinBox(this, "candidateWindowCornerRadiusSpinBox")) {
+    config->set_candidate_window_custom_corner_radius(
+        static_cast<uint32_t>(spin->value()));
+  }
+  if (const QSpinBox* spin = FindSpinBox(this, "suggestWindowCornerRadiusSpinBox")) {
+    config->set_suggest_window_custom_corner_radius(
+        static_cast<uint32_t>(spin->value()));
+  }
+  if (const QSpinBox* spin = FindSpinBox(this, "candidateWindowOpacityPercentSpinBox")) {
+    config->set_candidate_window_opacity_percent(
+        static_cast<uint32_t>(spin->value()));
+  }
+  if (const QSpinBox* spin = FindSpinBox(this, "suggestWindowOpacityPercentSpinBox")) {
+    config->set_suggest_window_opacity_percent(
+        static_cast<uint32_t>(spin->value()));
   }
   return;
 #endif  // !defined(_WIN32) && !defined(__APPLE__)
@@ -6579,21 +7041,12 @@ void ConfigDialog::SelectZenzLiveCorrectionSetting(int state) {
               : 0);
   zenzLiveCorrectionMinKeyLengthLabel->setEnabled(enabled);
   zenzLiveCorrectionMinKeyLengthSpinBox->setEnabled(enabled);
-  zenzLiveCorrectionDeviceLabel->setEnabled(enabled);
-  zenzLiveCorrectionDeviceComboBox->setEnabled(enabled);
-  zenzLiveCorrectionProfileLabel->setEnabled(enabled);
-  zenzLiveCorrectionProfileLineEdit->setEnabled(enabled);
-  zenzLiveCorrectionTopicLabel->setEnabled(enabled);
-  zenzLiveCorrectionTopicLineEdit->setEnabled(enabled);
-  zenzLiveCorrectionStyleLabel->setEnabled(enabled);
-  zenzLiveCorrectionStyleLineEdit->setEnabled(enabled);
-  zenzLiveCorrectionSettingsLabel->setEnabled(enabled);
-  zenzLiveCorrectionSettingsLineEdit->setEnabled(enabled);
-  zenzLiveCorrectionRightContextCheckBox->setEnabled(enabled);
+  // Condition fields and right context are shared by automatic and explicit
+  // manual Zenz correction.  Keep them editable with live conversion off.
+  // Mozkey IbG: the inference device is a property of the same shared Zenz
+  // request, so it follows the same rule and stays editable as well.
   SelectZenzRightContextSetting(
-      enabled ? static_cast<int>(
-                    zenzLiveCorrectionRightContextCheckBox->isChecked())
-              : 0);
+      static_cast<int>(zenzLiveCorrectionRightContextCheckBox->isChecked()));
   // Recording, automatic reuse, and external Mozc history learning are
   // independent preferences. Keep their controls available even when live
   // correction is disabled: the feedback candidate rewriter also operates
@@ -6638,9 +7091,7 @@ void ConfigDialog::SelectZenzFeedbackAutoBlockSetting(int state) {
 }
 
 void ConfigDialog::SelectZenzRightContextSetting(int state) {
-  const bool enabled = liveConversionCheckBox->isChecked() &&
-                       zenzLiveCorrectionCheckBox->isChecked() &&
-                       static_cast<bool>(state);
+  const bool enabled = static_cast<bool>(state);
 
   zenzLiveCorrectionRightContextLengthLabel->setEnabled(enabled);
   zenzLiveCorrectionRightContextLengthSpinBox->setEnabled(enabled);
@@ -6740,20 +7191,49 @@ void ConfigDialog::SetMozkeyAsDefaultIme() {
     return;
   }
 
-  const int exit_code =
-      RunPowerShellScript(BuildSetDefaultImeScript(mozkey_input_tip));
-
-  if (exit_code == 0) {
-    QMessageBox::information(
-        this, windowTitle(),
-        tr("%1 has been set as the Windows default IME.")
-            .arg(GuiUtil::ProductName()));
-  } else {
+  // Validate current-session activation before writing any restore point.
+  // This may change the active TSF profile, but not the persistent override.
+  if (!mozc::win32::ImeUtil::Activate()) {
     QMessageBox::critical(
         this, windowTitle(),
-        tr("Failed to set %1 as the Windows default IME.")
+        tr("Failed to activate %1 in the current session. "
+           "No Windows default-input settings were changed.")
             .arg(GuiUtil::ProductName()));
+    return;
   }
+
+  // Save the historical restore point and apply/verify the persistent
+  // settings in one PowerShell process. Do not call ImeUtil::SetDefault:
+  // its native default changes are not covered by our restore point.
+  const int persist_exit_code =
+      RunPowerShellScript(BuildSafeSetDefaultImeScript(mozkey_input_tip));
+  if (persist_exit_code != 0) {
+    QMessageBox::critical(
+        this, windowTitle(),
+        tr("Failed to set %1 as the Windows default IME. "
+           "Persistent changes were rolled back where possible. "
+           "A restore point may remain; inspect your input settings "
+           "before trying again.")
+            .arg(GuiUtil::ProductName()));
+    return;
+  }
+
+  // The default override and language order are already verified. A TSF
+  // activation failure now is a session warning, not a persistent failure.
+  if (!mozc::win32::ImeUtil::Activate()) {
+    QMessageBox::warning(
+        this, windowTitle(),
+        tr("%1 was saved as the Windows default IME, but the current "
+           "session could not be activated. Sign out or restart Windows "
+           "for the change to take effect.")
+            .arg(GuiUtil::ProductName()));
+    return;
+  }
+
+  QMessageBox::information(
+      this, windowTitle(),
+      tr("%1 has been set as the Windows default IME.")
+          .arg(GuiUtil::ProductName()));
 #endif  // _WIN32
 }
 
@@ -6773,15 +7253,23 @@ void ConfigDialog::RestorePreviousDefaultImeSetting() {
   if (exit_code == 0) {
     QMessageBox::information(
         this, windowTitle(),
-        tr("The previous Windows default IME setting has been restored."));
+        tr("The previous Windows default IME setting has been restored."
+           "\nThe active input method may require a sign-out or restart to update."));
   } else if (exit_code == 2) {
     QMessageBox::warning(
         this, windowTitle(),
         tr("No previous Windows default IME setting has been saved."));
+  } else if (exit_code == 3) {
+    QMessageBox::warning(
+        this, windowTitle(),
+        tr("The previous Windows default IME settings were restored and verified,"
+           " but the saved restore point could not be cleared."));
   } else {
     QMessageBox::critical(
         this, windowTitle(),
-        tr("Failed to restore the previous Windows default IME setting."));
+        tr("Failed to restore the previous Windows default IME setting."
+           " The saved restore point has not been intentionally consumed."
+           " Some settings may have changed."));
   }
 #endif  // _WIN32
 }

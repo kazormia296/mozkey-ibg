@@ -5,6 +5,16 @@
     <name>ConfigDialog</name>
     <message>
         <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz による絵文字変換を抑制する</source>
+        <translation>Zenz による絵文字変換を抑制する</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz は入力した読みや文脈に応じて絵文字を生成することがあります。有効にすると、絵文字の追加・変更・削除を伴う Zenz の変換結果を採用せず、通常の Mozc 変換結果を使用します。通常の Mozc の絵文字候補の表示や手動選択には影響しません。初期値はオンです。</source>
+        <translation>Zenz は入力した読みや文脈に応じて絵文字を生成することがあります。有効にすると、絵文字の追加・変更・削除を伴う Zenz の変換結果を採用せず、通常の Mozc 変換結果を使用します。通常の Mozc の絵文字候補の表示や手動選択には影響しません。初期値はオンです。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
         <source>Input Appearance</source>
         <translation>入力外観</translation>
     </message>
@@ -557,8 +567,8 @@
     </message>
     <message>
         <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz 補正結果が返るまで通常のライブ変換結果を表示しない</source>
-        <translation>Zenz 補正結果が返るまで通常のライブ変換結果を表示しない</translation>
+        <source>Zenz 補正結果が返るまでライブ変換結果（Mozc）を表示しない</source>
+        <translation>Zenz 補正結果が返るまでライブ変換結果（Mozc）を表示しない</translation>
     </message>
     <message>
         <location filename="config_dialog.ui" line="0"/>
@@ -574,6 +584,11 @@
         <location filename="config_dialog.ui" line="0"/>
         <source>「通常のライブ変換結果を表示しない」が有効な場合、Zenz 補正要求の送信後、この時間以内に結果が返らなければ、その回の Zenz 補正を中止して通常の Mozkey IbG ライブ変換結果を表示します。</source>
         <translation>「通常のライブ変換結果を表示しない」が有効な場合、Zenz 補正要求の送信後、この時間以内に結果が返らなければ、その回の Zenz 補正を中止して通常の Mozkey IbG ライブ変換結果を表示します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正結果の採用条件</source>
+        <translation>Zenz 補正結果の採用条件</translation>
     </message>
     <message>
         <location filename="config_dialog.ui" line="0"/>
@@ -1668,6 +1683,38 @@ The current Windows default IME override will be saved so it can be restored lat
         <location filename="config_dialog.cc" line="0"/>
         <source>Zenz correction maximum wait must be at least 50 ms.</source>
         <translation>Zenz 補正開始後の最大待機時間は 50 ms 以上にしてください。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Failed to activate %1 in the current session. No Windows default-input settings were changed.</source>
+        <translation>現在のセッションで%1を有効化できませんでした。Windowsの既定の入力方式の設定は変更されていません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Failed to set %1 as the Windows default IME. Persistent changes were rolled back where possible. A restore point may remain; inspect your input settings before trying again.</source>
+        <translation>%1をWindowsの既定IMEに設定できませんでした。可能な範囲で設定を元に戻しましたが、復元用の設定情報が残っている場合があります。再試行する前に、Windowsの入力設定を確認してください。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>%1 was saved as the Windows default IME, but the current session could not be activated. Sign out or restart Windows for the change to take effect.</source>
+        <translation>%1をWindowsの既定IMEに設定しましたが、現在のセッションでは有効化できませんでした。変更を反映するには、Windowsからサインアウトするか、再起動してください。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>The previous Windows default IME setting has been restored.
+The active input method may require a sign-out or restart to update.</source>
+        <translation>以前のWindowsの既定IME設定を復元しました。
+現在使用中の入力方式に反映されるまで、サインアウトまたは再起動が必要な場合があります。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>The previous Windows default IME settings were restored and verified, but the saved restore point could not be cleared.</source>
+        <translation>以前のWindowsの既定IME設定を復元し、結果を確認しました。ただし、保存されていた復元用の設定情報を削除できませんでした。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Failed to restore the previous Windows default IME setting. The saved restore point has not been intentionally consumed. Some settings may have changed.</source>
+        <translation>以前のWindowsの既定IME設定を復元できませんでした。復元用の設定情報は意図的に削除していませんが、一部の設定が変更された可能性があります。</translation>
     </message>
 </context>
 <context>

@@ -61,10 +61,13 @@ Mozkeyの由来やフォーク元のcreditを置き換えるものではあり�
 Mozkey自体はgoogle/mozcを基盤としているため、Mozcとそのコントリビューターへの
 著作権表示、ライセンス、attributionも引き続き保持します。
 
-現在のMozkey IbGは、フォーク元の**Mozkey v1.0.0**に追従しています。Mozkey v1.0.0までの
+現在のMozkey IbGは、フォーク元の**Mozkey v1.1.0**に追従しています。Mozkey v1.1.0までの
 変換・学習・UIの機能、修正、既定値を取り込んだうえで、Mozkey IbG固有の製品識別子、
-Grimodex連携、Linux / Fcitx5対応、セキュリティ強化を重ねています。Mozkey IbG自体の
-release versionはフォーク元とは独立しており、`src/version.bzl`で管理します。
+Grimodex連携、Linux / Fcitx5対応、セキュリティ強化を重ねています。フォーク元がv1.1.0で
+導入したLinuxのprofile分離とinstall path分離は、仕組みだけを取り込み、識別子は
+すべて`mozkey-ibg`名前空間のままです。フォーク元MozkeyやMozcのprofileからの移行は
+行いません。Mozkey IbG自体のrelease versionはフォーク元とは独立しており、
+`src/version.bzl`で管理します。
 
 ## 名称と識別子
 
@@ -144,6 +147,10 @@ installerをDeveloper ID署名してApple notarizationとGatekeeper検証を行�
 署名・notarizationに必要なsecretがないreleaseはfail closedします。詳細は
 [macOS build guide](docs/build_mozc_in_osx.md)を参照してください。
 
+インストール完了時にinstallerからログアウトを求められます。作業内容を保存してから
+案内に従い、再ログイン後に入力ソースを有効にしてください。案内が表示されなかった
+場合も、入力ソースを有効にする前に手動で一度ログアウト・再ログインしてください。
+
 ### Linux / Fcitx5
 
 Linux releaseはDebian / Ubuntu向けamd64 `.deb`、Fedora / RPM系向けx86_64 `.rpm`、
@@ -197,6 +204,13 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
 - 確定済みの左文脈と限定的な右文脈を使った候補順位の補正
 - 助詞、複合機能語、名詞述語、条件表現、地名・施設名構成の誤分割抑制
 - ユーザー辞書由来表記、ASCII、mixed-script、記号styleの保護
+- システム辞書由来の人名・地名・組織名について、Mozcが実際に選択した候補の品詞・読み・
+  表記・位置を検証し、Zenzによる不用意な書き換えを抑制。一般表現と競合する監査済みの
+  地名60組（`あきたし / 秋田市`など）は強制保護から除外し、文脈補正の余地を残す
+- 検証済みの姓名に限り、Zenzへの入力中だけ自然な代理語へ置き換えて応答後に復元。
+  安全に復元できない場合は通常のMozc結果を維持（地名・組織名は代理語化しない）
+- ASCII数字リテラルは、変換セグメントの読み側にも対応する数値tokenがある場合に保護。
+  `いつかきっと` → `5日キット`のように読みから生成された数字はZenzの補正を妨げない
 - secure inputではsurrounding textを読まない境界設計
 
 ### ローカルZenz補正
@@ -208,10 +222,18 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
   表示する方式も選択可能
 - Zenz候補が通常Mozc結果の明白な先頭・末尾の欠落になっている場合は拒否してMozc結果へ
   戻す保護と、採用前にMozcで逆変換して読みを照合する「厳密な読み保持（実験的）」
+- 「Zenzによる絵文字変換を抑制する」（既定ON）。Zenzが絵文字を追加・削除・置換した
+  補正結果は採用せず通常Mozcの結果を維持。保存済みfeedback由来の補正にも適用し、
+  通常Mozcの絵文字候補や手動選択は妨げない
+- 設定画面で「Zenzライブ補正」と「Zenz補正結果の採用条件」を分離。厳密な読み保持と
+  絵文字抑制は、ライブ補正のON / OFFにかかわらず設定でき、手動Zenz補正にも適用
 - 「Zenz学習（Mozc変換履歴）」と「Zenz学習（補正フィードバック）」を独立して設定
 - 短い読みではZenz feedbackを自動適用しない制限（既定ON、最小読み文字数7文字）。
   記録は継続し、明示的な手動blockは読みの長さにかかわらず有効
 - accepted / rejected feedback、明示block、検索、import / export、削除UI
+- 表示中のZenz補正を`Ctrl+Delete`で手動block（`BlockVisibleZenzCorrection`）。
+  読み全体・文脈class・補正文字列の組を`hard_reject`として保存し、通常Mozc変換へ戻す。
+  Secret mode、TSF `IS_PRIVATE`、password欄などでは新しい永続blockを保存しない
 - 通常Mozc候補を削除せず、local feedbackを保守的に順位へ反映
 
 ### 入力・学習・keymap
@@ -226,7 +248,8 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
   `ForceZenzLiveCorrectionWithoutFeedback`）
 - 「ライブ変換中」（`LiveConversion`）と「Zenz補正中」（`ZenzConversion`）専用のkeymap状態
 - 選択中の候補を履歴から削除、または候補一覧から非表示にする`DeleteSelectedCandidate`
-  （標準keymapではPrediction / Conversionの`Ctrl+Delete`）
+  （標準keymapではPrediction / Conversionの`Ctrl+Delete`。Zenz補正の表示中は
+  `Ctrl+Delete`が上記の手動blockになる）
 - 顔文字・絵文字候補が選択履歴によって第1候補へ上がらないようにする抑制
   （候補自体は第2候補以下に残る）
 - Windowsで選択文字列をSpace再変換するMS-IME風設定
@@ -260,9 +283,10 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
   新規書き込みを停止。入力mode iconとindicatorに盾を重ねて表示
 
 各機能の詳細な仕様は、フォーク元
-[Mozkey v1.0.0のREADME](https://github.com/koyasi777/mozkey/blob/v1.0.0/README.md)
-にまとまっています。ただし、そこに書かれたdownload・install手順と製品識別子は
-フォーク元Mozkeyのものであり、Mozkey IbGには適用されません。
+[Mozkey v1.1.0のREADME](https://github.com/koyasi777/mozkey/blob/v1.1.0/README.md)
+にまとまっています。ただし、そこに書かれたdownload・install手順、release asset名
+（`Mozkey_v…`）、製品識別子はフォーク元Mozkeyのものであり、Mozkey IbGには
+適用されません。
 
 ### Grimodex連携
 
@@ -287,6 +311,9 @@ Mozkey IbGは、通常のIME利用時に入力内容を外部Internet serviceへ
 - feedbackにはraw left contextを保存せず、full sequenceと非可逆なcontext classだけを保存
 - Windows向けにnetwork DLL import / string markerの検査toolと、Firewall ruleを確認する
   release checklistを提供
+- macOS向けにsource監査と、pkgから展開したZenzの実推論中に`ps` / `lsof`で通信先を
+  samplingする検証を提供。samplingで外部通信が観測されないことは、全processの
+  通信禁止やOS levelの外向き通信遮断を証明するものではない
 - secure inputではsurrounding textを送らない
 - Secret / Incognito modeではZenz feedbackの参照と記録を停止し、WindowsのTSF
   `IS_PRIVATE`では既存の学習を読み取り専用として新規の永続的な学習書き込みを停止
@@ -294,7 +321,8 @@ Mozkey IbGは、通常のIME利用時に入力内容を外部Internet serviceへ
 localhost内部通信は、外部Internet通信とは別のローカルprocess境界として使用します。
 また、dependency、dictionary source、toolchainの取得を伴うbuild・test・release処理では
 network accessが必要になる場合があります。正確な保証範囲と検証項目は
-[Secure Offline Guarantee](docs/security/offline_guarantee.md)および
+[Secure Offline Guarantee](docs/security/offline_guarantee.md)、
+[macOS offline audit contract](docs/security/macos_offline_audit.md)、および
 [Release Checklist](docs/security/release_checklist.md)を参照してください。
 
 ## 辞書profile
@@ -349,6 +377,7 @@ platform別のbuild資料:
 - [Linux dictionary quality gate](docs/linux_daily_dictionary_quality_gate.md)
 - [Grimodex desktop integration](docs/grimodex_desktop_integration.md)
 - [Secure Offline Guarantee](docs/security/offline_guarantee.md)
+- [macOS offline audit contract](docs/security/macos_offline_audit.md)
 - [Secure Offline Release Checklist](docs/security/release_checklist.md)
 - [Release procedure](docs/releasing.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
@@ -408,11 +437,14 @@ as part of the full lineage.
 `Integrated by Grimodex` credits the integration and maintenance performed in
 this downstream fork; it does not replace Mozkey's origin or upstream credit.
 
-Mozkey IbG currently tracks upstream **Mozkey v1.0.0**. It adopts the
+Mozkey IbG currently tracks upstream **Mozkey v1.1.0**. It adopts the
 conversion, learning, and UI features, fixes, and defaults up to that release,
 and layers the Mozkey IbG product identity, Grimodex integration, Linux / Fcitx5
-support, and security hardening on top. Mozkey IbG keeps its own release version,
-independent of upstream, in `src/version.bzl`.
+support, and security hardening on top. Upstream's v1.1.0 Linux profile and
+install-path isolation is adopted as a mechanism only: every identifier stays in
+the `mozkey-ibg` namespace, and nothing is migrated from an upstream Mozkey or
+Mozc profile. Mozkey IbG keeps its own release version, independent of upstream,
+in `src/version.bzl`.
 
 ### Project identity
 
@@ -470,7 +502,9 @@ package is the normal choice; `universal` keeps the server and local Zenz
 runtime on x64 emulation while adding ARM64 / ARM64EC TIP bridges. The macOS
 package targets Apple Silicon on macOS 12 or later. Release packaging fails
 closed unless it is signed with Developer ID identities, notarized, stapled,
-and assessed by Gatekeeper.
+and assessed by Gatekeeper. The installer asks you to log out when it finishes;
+save your work, follow the prompt, and enable the input source after logging
+back in (log out manually once if no prompt appears).
 
 Linux releases provide an amd64 Debian/Ubuntu package, an x86_64 Fedora/RPM
 package, and the Arch `mozkey-ibg-bin` AUR package backed by the verified Arch
@@ -489,6 +523,19 @@ for exact dependencies, attestation, rollback, and uninstall behavior.
 - Obvious-omission guards that fall back to the Mozc result, plus an
   experimental strict reading-preservation check before a Zenz result is adopted
 - Context-aware ranking while preserving user-dictionary and mixed-script forms
+- Protection of system-dictionary proper nouns (personal, place, and
+  organization names) verified from the candidate Mozc actually selected, with
+  60 reviewed ambiguous place-name pairs exempted so Zenz can still correct
+  ordinary expressions, and temporary proxy substitution for verified full
+  personal names
+- Numeric-literal protection only when the reading itself contains the number,
+  so digits generated by conversion do not block a Zenz correction
+- Zenz correction acceptance criteria shared by live and manual correction:
+  strict reading preservation and default-on suppression of emoji that Zenz
+  adds, removes, or replaces, in a settings group separate from live correction
+- Manually blocking a visible Zenz correction with `Ctrl+Delete`
+  (`BlockVisibleZenzCorrection`), which stores a `hard_reject` and restores the
+  Mozc result; no new persistent block is written in private or secure input
 - Conservative local feedback learning and explicit feedback management, with
   independent switches for Mozc-history learning and Zenz feedback, and no
   automatic feedback reuse for short readings (on by default, minimum 7
@@ -499,8 +546,9 @@ for exact dependencies, attestation, rollback, and uninstall behavior.
   Zenz correction commands, dedicated `LiveConversion` / `ZenzConversion` keymap
   states, and correction-aware history
 - Deleting a selected candidate from history or hiding it
-  (`DeleteSelectedCandidate`, `Ctrl+Delete` in the default keymaps), and keeping
-  emoticon and emoji candidates out of the top position
+  (`DeleteSelectedCandidate`, `Ctrl+Delete` in the default keymaps outside a
+  visible Zenz correction), and keeping emoticon and emoji candidates out of the
+  top position
 - Hyphenless seven-digit postal-code conversion, custom romaji-table outputs up
   to 1023 UTF-8 bytes per rule, and extended date and weekday candidates
 - Configurable candidate, suggestion, and ruby appearance on Windows and macOS
@@ -521,14 +569,19 @@ for exact dependencies, attestation, rollback, and uninstall behavior.
 - Pinned public dictionary profile separated from local-evaluation data
 
 The detailed behavior of the inherited features is documented in the upstream
-[Mozkey v1.0.0 README](https://github.com/koyasi777/mozkey/blob/v1.0.0/README.md).
-Its download and installation instructions and product identifiers describe
-upstream Mozkey and do not apply to Mozkey IbG.
+[Mozkey v1.1.0 README](https://github.com/koyasi777/mozkey/blob/v1.1.0/README.md).
+Its download and installation instructions, release asset names (`Mozkey_v…`),
+and product identifiers describe upstream Mozkey and do not apply to Mozkey IbG.
 
 Mozkey IbG aims to keep normal IME input off external Internet services. Local
 Zenz uses a loopback endpoint as an internal process boundary; build and release
-tasks may still access the network to fetch pinned dependencies. See the
-[offline guarantee](docs/security/offline_guarantee.md) for the exact boundary.
+tasks may still access the network to fetch pinned dependencies. On macOS, a
+source gate and a sampled `ps` / `lsof` socket audit during real packaged
+inference are provided; a passing sampled audit is not proof that every IME
+process is unable to reach the Internet, nor an OS-enforced egress block. See
+the [offline guarantee](docs/security/offline_guarantee.md) and the
+[macOS offline audit contract](docs/security/macos_offline_audit.md) for the
+exact boundary.
 
 ### Documentation
 
@@ -540,6 +593,7 @@ tasks may still access the network to fetch pinned dependencies. See the
 - [Grimodex integration](docs/grimodex_desktop_integration.md)
 - [Dictionary policy](src/data/dictionary_koyasi/README.md)
 - [Security and privacy](docs/security/offline_guarantee.md)
+- [macOS offline audit contract](docs/security/macos_offline_audit.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 - [Fork source: koyasi777/mozkey](https://github.com/koyasi777/mozkey)
 

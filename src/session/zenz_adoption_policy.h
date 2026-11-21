@@ -66,6 +66,11 @@ struct ProtectedConversionSpan {
     // eligible for reading-derived kana replacement, but boundary/attachment
     // repair may be applied when it is locally safe.
     kUserPreferred,
+
+    // A unique proper noun selected from a dictionary node path. Unlike
+    // user-preferred entries, it may be adjacent to Japanese characters
+    // without a detectable character-class boundary (e.g. 髙橋さん).
+    kSystemProperNoun,
   };
 
   std::string key;
@@ -81,6 +86,20 @@ struct ProtectedConversionSpan {
   // repair the missing occurrence when it is safe.
   size_t required_occurrences = 1;
 
+  // True only for a numeric span first observed in the selected preedit,
+  // rather than from a user-dictionary candidate.  An individually verified
+  // edge segment may relax the baseline-wide occurrence count when other
+  // numerals with the same spelling were generated from kana readings.
+  bool numeric_preedit_only = false;
+
+  // Verified UTF-8 byte offset of the selected system proper name in the
+  // original Mozc value. Unset for preexisting user dictionary spans.
+  size_t source_value_offset = std::string::npos;
+
+  // Selected full-name reading offset, verified against the same conversion.
+  size_t source_key_offset = std::string::npos;
+  bool verified_personal_full_name = false;
+
   // Placeholder used only in the Zenz prompt.  When non-empty, the prompt key
   // contains this token instead of key, and the Zenz output is restored to
   // value before validation and adoption.
@@ -92,6 +111,22 @@ struct ProtectedConversionSpan {
 // technical spellings remain identity-critical.
 ProtectedConversionSpan::Tier ClassifyProtectedAsciiSurface(
     absl::string_view surface);
+
+// Whole-expression exception: skip protection only when every lexical
+// reading in the selected proper-noun expression is listed.  A single
+// ambiguous proper-noun token does not disable protection of an expression
+// that also contains a non-exception proper-noun token.
+bool ShouldProtectSystemProperNounReadings(
+    const std::vector<std::string>& token_readings);
+
+// Context-dependent geographical homophones must not be hard-locked only
+// because a selected Mozc dictionary path is tagged as a place name.
+// Match the complete reading + surface, independently of token boundaries.
+// This affects only system-proper-name guards, not user-dictionary protection.
+bool ShouldProtectSelectedSystemProperNoun(
+    absl::string_view reading, absl::string_view surface,
+    const std::vector<std::string>& token_readings,
+    bool verified_personal_full_name);
 
 struct ZenzProtectedPromptInput {
   absl::string_view key;

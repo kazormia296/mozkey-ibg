@@ -71,10 +71,10 @@ DEFAULT_BUILD_LABEL_MACOS = "%d.%d.%d.%d" % (MAJOR, MINOR, BUILD, REVISION + 1)
 #  * POS matcher definition and/or conversion models were changed,
 #  * New data are added to the data set file, and/or
 #  * Any changes that loose data compatibility are made.
-ENGINE_VERSION = 24
+ENGINE_VERSION = 25
 
 # This version is used to manage the data version and is included only in the
 # data set file.  DATA_VERSION can be incremented without updating
 # ENGINE_VERSION as long as it's compatible with the engine.
 # This version should be reset to 0 when ENGINE_VERSION is incremented.
-DATA_VERSION = 11
+DATA_VERSION = 0

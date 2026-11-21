@@ -61,6 +61,14 @@ using ::mozc::converter::Attribute;
 using ::mozc::converter::Candidate;
 using ::mozc::converter::RankingConstraint;
 
+class NBestGeneratorTestPeer
+    : public testing::TestPeer<NBestGenerator<CachingConnector<true>>> {
+ public:
+  explicit NBestGeneratorTestPeer(NBestGenerator<CachingConnector<true>>& g)
+      : testing::TestPeer<NBestGenerator<CachingConnector<true>>>(g) {}
+  PEER_METHOD(MakeCandidate);
+};
+
 class ImmutableConverterTestPeer : testing::TestPeer<ImmutableConverter> {
  public:
   explicit ImmutableConverterTestPeer(ImmutableConverter& converter)
@@ -387,6 +395,29 @@ TEST_F(NBestGeneratorTest, InnerSegmentBoundary) {
   EXPECT_EQ(values[2], "行きたい");
   EXPECT_EQ(content_keys[2], "いきたい");
   EXPECT_EQ(content_values[2], "行きたい");
+
+  // The selected dictionary node path must expose the proper nouns embedded
+  // in a longer, single-candidate conversion, not only the first/last POS.
+  // Verify UTF-8 byte offsets against the actual candidate strings.
+  bool saw_tokyo = false;
+  bool saw_nagoya = false;
+  for (const converter::ProperNounSpan& span : top_cand.proper_noun_spans) {
+    ASSERT_LE(span.key_offset, top_cand.key.size());
+    ASSERT_LE(span.value_offset, top_cand.value.size());
+    EXPECT_EQ(top_cand.key.substr(span.key_offset, span.key.size()), span.key);
+    EXPECT_EQ(top_cand.value.substr(span.value_offset, span.value.size()),
+              span.value);
+    if (span.key == "とうきょう" && span.value == "東京") {
+      EXPECT_EQ(span.key_offset, 0);
+      EXPECT_EQ(span.value_offset, 0);
+      saw_tokyo = true;
+    }
+    if (span.key == "なごや" && span.value == "名古屋") {
+      saw_nagoya = true;
+    }
+  }
+  EXPECT_TRUE(saw_tokyo);
+  EXPECT_TRUE(saw_nagoya);
 }
 
 TEST_F(NBestGeneratorTest, NoPartialCandidateBetweenAlphabets) {
@@ -691,6 +722,672 @@ TEST_F(NBestGeneratorTest, ParticleOmissionBonusTest) {
 
     // Cost should be reduced by 1 for bonus 2001 compared to 2000.
     EXPECT_EQ(cost_bonus_2000 - cost_bonus_2001, 1);
+  }
+}
+
+
+// These tests use synthetic lattice nodes.  They neither require daily-profile
+// data nor rely on whichever candidate happened to rank first.
+TEST_F(NBestGeneratorTest, GeneralNounFullNameRecoveredFromLattice) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();  // general noun
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();  // surname
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();  // given name
+  lattice.Insert(std::string("みかみ").size(), given);
+
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  const auto& span = candidate.proper_noun_spans[0];
+  EXPECT_EQ(span.key, "みかみあい");
+  EXPECT_EQ(span.value, "見上愛");
+  EXPECT_EQ(span.key_offset, 0);
+  EXPECT_EQ(span.value_offset, 0);
+  ASSERT_EQ(span.token_readings.size(), 2);
+  EXPECT_EQ(span.token_readings[0], "みかみ");
+  EXPECT_EQ(span.token_readings[1], "あい");
+  EXPECT_TRUE(span.verified_personal_full_name);
+}
+
+TEST_F(NBestGeneratorTest, GeneralNounNotProtectedWithoutExactNamePair) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, surname);
+  // The given-name reading matches, but its surface does NOT.
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "アイ";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), given);
+
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+TEST_F(NBestGeneratorTest, UserDictionaryDecompositionCannotProveFullName) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();
+  surname->attributes |= Node::USER_DICTIONARY;
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), given);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+TEST_F(NBestGeneratorTest, FullNameDictionaryNodeCarriesStrongEvidence) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("さとうあい");
+  auto* full = lattice.NewNode();
+  full->key = "さとうあい";
+  full->value = "佐藤愛";
+  full->lid = fixture->GetPosMatcher().GetLastNameId();
+  full->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(0, full);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {full};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+TEST_F(NBestGeneratorTest, TwoSelectedNameNodesFormOneStrongFullName) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), given);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {surname, given};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+TEST_F(NBestGeneratorTest, AmbiguousSurnameGivenSplitsAreNotPromoted) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* family1 = lattice.NewNode();
+  family1->key = "みかみ";
+  family1->value = "見上";
+  family1->lid = family1->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, family1);
+  auto* name1 = lattice.NewNode();
+  name1->key = "あい";
+  name1->value = "愛";
+  name1->lid = name1->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), name1);
+  auto* family2 = lattice.NewNode();
+  family2->key = "み";
+  family2->value = "見";
+  family2->lid = family2->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, family2);
+  auto* name2 = lattice.NewNode();
+  name2->key = "かみあい";
+  name2->value = "上愛";
+  name2->lid = name2->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("み").size(), name2);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+TEST_F(NBestGeneratorTest, SingleAmbiguousGivenNameIsNotStrongFullName) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("あい");
+  auto* single = lattice.NewNode();
+  single->key = "あい";
+  single->value = "愛";
+  single->lid = single->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(0, single);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {single};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_FALSE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+
+// v8.2: Evidence must survive a following particle, without protecting it.
+TEST_F(NBestGeneratorTest, GeneralNounFullNameBeforeParticle) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいが");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto* particle = lattice.NewNode();
+  particle->key = "が";
+  particle->value = "が";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(whole->key.size(), particle);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  const auto& span = candidate.proper_noun_spans[0];
+  EXPECT_EQ(span.key, "みかみあい");
+  EXPECT_EQ(span.value, "見上愛");
+  EXPECT_EQ(span.key_offset, 0);
+  EXPECT_EQ(span.value_offset, 0);
+  EXPECT_TRUE(span.verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "見上愛が");
+}
+
+TEST_F(NBestGeneratorTest, EmbeddedNameAtSelectedNodeBoundaryHasOffsets) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("きょうはみかみあいが");
+  auto* prefix = lattice.NewNode();
+  prefix->key = "きょうは";
+  prefix->value = "今日は";
+  prefix->lid = prefix->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, prefix);
+  const auto name_offset = prefix->key.size();
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(name_offset, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(name_offset, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(name_offset + surname->key.size(), given);
+  auto* particle = lattice.NewNode();
+  particle->key = "が";
+  particle->value = "が";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(name_offset + whole->key.size(), particle);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {prefix, whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_EQ(candidate.proper_noun_spans[0].key_offset, prefix->key.size());
+  EXPECT_EQ(candidate.proper_noun_spans[0].value_offset, prefix->value.size());
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+// Even if a whole candidate is one general-noun node, a validated external
+// functional suffix boundary permits guarding only the name prefix.
+TEST_F(NBestGeneratorTest, WholeNodeWithFunctionalSuffixCanGuardNamePrefix) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいが");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあいが";
+  whole->value = "見上愛が";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto* functional = lattice.NewNode();
+  functional->key = "が";
+  functional->value = "が";
+  // Functional suffix should be a grammatical particle in real data.  The
+  // mock table offers a stable functional POS through the rule getter.
+  functional->lid = functional->rid = pos.GetFunctionalId();
+  lattice.Insert(surname->key.size() + given->key.size(), functional);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].key, "みかみあい");
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+}
+
+TEST_F(NBestGeneratorTest, WholeNodeWithoutFunctionalSuffixRemainsUnguarded) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいが");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあいが";
+  whole->value = "見上愛が";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+
+// v8.3: A large number of unrelated nodes at the surname's start position
+// must not suppress exact surname+given-name evidence. v8.2's raw 192-node
+// traversal budget rejected this case before reaching the surname node.
+TEST_F(NBestGeneratorTest, UnrelatedPrefixNodesCannotExhaustNameEvidence) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいの");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  for (int i = 0; i < 210; ++i) {
+    auto* unrelated = lattice.NewNode();
+    unrelated->key = "み";
+    unrelated->value = "み";
+    unrelated->lid = unrelated->rid = pos.GetGeneralNounId();
+    lattice.Insert(0, unrelated);
+  }
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto* particle = lattice.NewNode();
+  particle->key = "の";
+  particle->value = "の";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(whole->key.size(), particle);
+
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].key, "みかみあい");
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "見上愛の");
+}
+
+// v8.3: v8.2 found the exact given name but discarded it because unrelated
+// candidates at its position pushed the total examined count above 192.
+TEST_F(NBestGeneratorTest, UnrelatedGivenPositionNodesCannotDiscardNameEvidence) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいから");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  for (int i = 0; i < 210; ++i) {
+    auto* unrelated = lattice.NewNode();
+    unrelated->key = "あ";
+    unrelated->value = "あ";
+    unrelated->lid = unrelated->rid = pos.GetGeneralNounId();
+    lattice.Insert(surname->key.size(), unrelated);
+  }
+  auto* particle = lattice.NewNode();
+  particle->key = "から";
+  particle->value = "から";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(whole->key.size(), particle);
+
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].key, "みかみあい");
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "見上愛から");
+}
+
+// A geographic proper noun can contain its regional suffix in one node.
+// Never promote an ordinary noun or a mismatched suffix to proper-name proof.
+TEST_F(NBestGeneratorTest, GeographicCompoundRequiresMatchingPOSAndEnding) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  const uint16_t geographic_lid = pos.GetGeographicProperNounId();
+  const uint16_t city_rid = pos.GetGeographicCitySuffixId();
+  const uint16_t town_rid = pos.GetGeographicTownSuffixId();
+  ASSERT_TRUE(pos.IsGeographicProperNoun(geographic_lid));
+  ASSERT_TRUE(pos.IsGeographicSuffix(city_rid));
+  ASSERT_TRUE(pos.IsGeographicCitySuffix(city_rid));
+  ASSERT_TRUE(pos.IsGeographicTownSuffix(town_rid));
+  ASSERT_FALSE(pos.IsGeographicTownSuffix(city_rid));
+
+  const auto verify = [&](absl::string_view key, absl::string_view value,
+                          uint16_t lid, uint16_t rid, bool expected,
+                          bool user_dictionary = false) {
+    Lattice lattice;
+    lattice.SetKey(std::string(key));
+    auto* node = lattice.NewNode();
+    node->key = std::string(key);
+    node->value = std::string(value);
+    node->lid = lid;
+    node->rid = rid;
+    if (user_dictionary) {
+      node->attributes |= Node::USER_DICTIONARY;
+    }
+    lattice.Insert(0, node);
+
+    auto generator = fixture->CreateNBestGenerator(
+        lattice, ConvReq(ConversionRequest::CONVERSION));
+    NBestGeneratorTestPeer peer(*generator);
+    const std::vector<const Node*> selected = {node};
+    Candidate candidate;
+    peer.MakeCandidate(candidate, 0, 0, 0,
+                       absl::Span<const Node* const>(selected.data(),
+                                                     selected.size()));
+    ASSERT_EQ(candidate.proper_noun_spans.size(), expected ? 1u : 0u)
+        << std::string(key) << " / " << std::string(value);
+    if (expected) {
+      ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+      EXPECT_EQ(candidate.proper_noun_spans[0].key, std::string(key));
+      EXPECT_EQ(candidate.proper_noun_spans[0].value, std::string(value));
+      EXPECT_EQ(candidate.proper_noun_spans[0].key_offset, 0u);
+      EXPECT_EQ(candidate.proper_noun_spans[0].value_offset, 0u);
+      EXPECT_FALSE(candidate.proper_noun_spans[0].verified_personal_full_name);
+    }
+  };
+
+  verify("あいおいし", "相生市", geographic_lid, city_rid, true);
+  verify("あいおいちょう", "相生町", geographic_lid, town_rid, true);
+  verify("あいおいまち", "相生町", geographic_lid, town_rid, true);
+  verify("しぶやく", "渋谷区", geographic_lid,
+         pos.GetGeographicWardSuffixId(), true);
+  verify("あおがしまむら", "青ヶ島村", geographic_lid,
+         pos.GetGeographicVillageSuffixId(), true);
+  verify("やまぐちけん", "山口県", geographic_lid,
+         pos.GetGeographicPrefectureKenSuffixId(), true);
+  verify("おおさかふ", "大阪府", geographic_lid,
+         pos.GetGeographicPrefectureFuSuffixId(), true);
+  verify("えちぜんぐん", "越前郡", geographic_lid,
+         pos.GetGeographicCountySuffixId(), true);
+  verify("はかたえき", "博多駅", geographic_lid,
+         pos.GetGeographicStationSuffixId(), true);
+
+  // The ending must agree with the exact regional-suffix subtype, not merely
+  // with some ending in the region family. Generic region suffix is unsafe.
+  verify("あいおいまち", "相生町", geographic_lid, city_rid, false);
+  verify("あいおいし", "相生市", geographic_lid, town_rid, false);
+  verify("あいおいし", "相生市", geographic_lid,
+         pos.GetGeographicSuffixId(), false);
+  verify("あいおいし", "相生市", pos.GetGeneralNounId(), city_rid, false);
+  verify("あいおいし", "相生市", geographic_lid,
+         pos.GetGeneralNounId(), false);
+  verify("あいおいし", "相生市", pos.GetLastNameId(), city_rid, false);
+  verify("あいおいか", "相生市", geographic_lid, city_rid, false);
+  verify("あいおいし", "相生山", geographic_lid, city_rid, false);
+  verify("あいおいし", "相生市", geographic_lid, city_rid, false, true);
+}
+
+TEST_F(NBestGeneratorTest, GeographicCompoundSpanDoesNotIncludeSurroundingText) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("きょうはあいおいしにいく");
+  auto* prefix = lattice.NewNode();
+  prefix->key = "きょうは";
+  prefix->value = "今日は";
+  prefix->lid = prefix->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, prefix);
+  auto* place = lattice.NewNode();
+  place->key = "あいおいし";
+  place->value = "相生市";
+  place->lid = pos.GetGeographicProperNounId();
+  place->rid = pos.GetGeographicCitySuffixId();
+  lattice.Insert(prefix->key.size(), place);
+  auto* particle = lattice.NewNode();
+  particle->key = "に";
+  particle->value = "に";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(prefix->key.size() + place->key.size(), particle);
+  auto* verb = lattice.NewNode();
+  verb->key = "いく";
+  verb->value = "行く";
+  verb->lid = verb->rid = pos.GetGeneralNounId();
+  lattice.Insert(prefix->key.size() + place->key.size() + particle->key.size(),
+                 verb);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {prefix, place, particle, verb};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+  const auto& span = candidate.proper_noun_spans[0];
+  EXPECT_EQ(span.key, "あいおいし");
+  EXPECT_EQ(span.value, "相生市");
+  EXPECT_EQ(span.key_offset, prefix->key.size());
+  EXPECT_EQ(span.value_offset, prefix->value.size());
+  EXPECT_FALSE(span.verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "今日は相生市に行く");
+}
+
+TEST_F(NBestGeneratorTest, AmbiguousCityHasSameFullSpanForOneOrTwoNodes) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+
+  // One selected dictionary node with a regional city suffix RID.
+  {
+    Lattice lattice;
+    lattice.SetKey("あきたし");
+    auto* place = lattice.NewNode();
+    place->key = "あきたし";
+    place->value = "秋田市";
+    place->lid = pos.GetGeographicProperNounId();
+    place->rid = pos.GetGeographicCitySuffixId();
+    lattice.Insert(0, place);
+    auto generator = fixture->CreateNBestGenerator(
+        lattice, ConvReq(ConversionRequest::CONVERSION));
+    NBestGeneratorTestPeer peer(*generator);
+    const std::vector<const Node*> selected = {place};
+    Candidate candidate;
+    peer.MakeCandidate(candidate, 0, 0, 0,
+                       absl::Span<const Node* const>(selected.data(),
+                                                     selected.size()));
+    ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+    EXPECT_EQ(candidate.proper_noun_spans[0].key, "あきたし");
+    EXPECT_EQ(candidate.proper_noun_spans[0].value, "秋田市");
+    EXPECT_EQ(candidate.proper_noun_spans[0].token_readings,
+              (std::vector<std::string>{"あきたし"}));
+  }
+
+  // Alternative selected path: ordinary geographical noun + city ending.
+  {
+    Lattice lattice;
+    lattice.SetKey("あきたし");
+    auto* place = lattice.NewNode();
+    place->key = "あきた";
+    place->value = "秋田";
+    place->lid = place->rid = pos.GetGeographicProperNounId();
+    lattice.Insert(0, place);
+    auto* suffix = lattice.NewNode();
+    suffix->key = "し";
+    suffix->value = "市";
+    suffix->lid = suffix->rid = pos.GetGeneralNounId();
+    lattice.Insert(place->key.size(), suffix);
+    auto generator = fixture->CreateNBestGenerator(
+        lattice, ConvReq(ConversionRequest::CONVERSION));
+    NBestGeneratorTestPeer peer(*generator);
+    const std::vector<const Node*> selected = {place, suffix};
+    Candidate candidate;
+    peer.MakeCandidate(candidate, 0, 0, 0,
+                       absl::Span<const Node* const>(selected.data(),
+                                                     selected.size()));
+    ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+    EXPECT_EQ(candidate.proper_noun_spans[0].key, "あきたし");
+    EXPECT_EQ(candidate.proper_noun_spans[0].value, "秋田市");
+    EXPECT_EQ(candidate.proper_noun_spans[0].token_readings,
+              (std::vector<std::string>{"あきた", "し"}));
   }
 }
 

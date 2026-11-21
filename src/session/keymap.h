@@ -208,6 +208,7 @@ struct ConversionState {
     COMPOSITION_MODE_HALF_ALPHANUMERIC,
     DELETE_SELECTED_CANDIDATE,
     REPORT_BUG,
+    BLOCK_VISIBLE_ZENZ_CORRECTION,  // Manual full-sequence hard block.
   };
 };
 

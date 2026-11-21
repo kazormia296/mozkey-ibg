@@ -164,6 +164,8 @@ void FillSyntheticCandidate(const converter::Candidate& base_candidate,
   candidate->content_value = std::string(value);
 
   candidate->inner_segment_boundary = converter::InnerSegmentBoundary();
+  // A synthetic Zenz-feedback surface is not a system-dictionary node path.
+  candidate->proper_noun_spans.clear();
 
   candidate->attributes &= ~converter::Attribute::BEST_CANDIDATE;
   candidate->attributes |=
@@ -275,6 +277,15 @@ bool ZenzFeedbackCandidateRewriter::Rewrite(
             full_key, original_top_value, feedback_candidate.value);
 
     if (!IsSafeCandidateText(full_key, zenz_value)) {
+      continue;
+    }
+
+    // Persisted Zenz feedback cannot bypass the user's current emoji policy.
+    // The ordinary EmojiRewriter and explicit dictionary selections are not
+    // affected by this check.
+    if (!request.config().allow_zenz_emoji_changes() &&
+        !session::ZenzOutputValidator::PreservesEmojiSequences(
+            original_top_value, zenz_value)) {
       continue;
     }
 

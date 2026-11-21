@@ -181,7 +181,13 @@ try {
 
   New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
   New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
-  $dest = Join-Path $OutputDirectory "MozkeyIbG_v${ReleaseVersion}_${Architecture}.msi"
+  $nameTool = Join-Path $Repo 'tools\release\artifact_name.py'
+  Assert-Condition (Test-Path -LiteralPath $nameTool -PathType Leaf) 'Missing canonical artifact namer'
+  $releaseName = @(& python $nameTool --version $ReleaseVersion --os windows --arch $Architecture --format msi)
+  Assert-Condition ($LASTEXITCODE -eq 0 -and $releaseName.Count -eq 1) 'Canonical artifact filename resolution failed'
+  # Mozkey IbG: fail closed if the namer ever emits an upstream (Mozkey_v*) name.
+  Assert-Condition ([string]$releaseName[0] -clike "MozkeyIbG_v*_windows_$Architecture.msi") 'Canonical artifact namer returned a non-Mozkey IbG filename'
+  $dest = Join-Path $OutputDirectory $releaseName[0]
   Assert-Condition (-not (Test-Path -LiteralPath $dest)) "Release candidate already exists: $dest"
   Copy-Item -LiteralPath $SourceMsi -Destination $dest -ErrorAction Stop
   $originalHash = (Get-FileHash -LiteralPath $SourceMsi -Algorithm SHA256).Hash
@@ -192,6 +198,9 @@ try {
     signing_provider = $null
     source_inputs_reproducible = $false
     target_architecture = $Architecture
+    operating_system = 'windows'
+    package_format = 'msi'
+    release_filename = [IO.Path]::GetFileName($dest)
     expected_pe_machine = $archContract.machine
     release_version = $ReleaseVersion
     msi_product_version = $props.ProductVersion

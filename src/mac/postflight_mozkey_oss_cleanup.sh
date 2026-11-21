@@ -103,4 +103,19 @@ if ! /usr/bin/codesign --verify --deep --strict "$_mozkey_app"; then
   echo 'Mozkey postinstall: installed MozkeyIbG.app failed codesign verification' >&2
   exit 1
 fi
+
+# Enable the newly installed input source only after the app signature passes.
+# Do not prompt or switch input sources during CLI installs or upgrades where
+# Mozkey IbG is already enabled (the executable checks this via TIS; it only
+# matches its own bundle identifier, so an upstream Mozkey or Mozc input source
+# installed side by side is never enabled, selected or modified).
+# An unavailable desktop session must not fail the package installation.
+if [ "${COMMAND_LINE_INSTALL:-}" != '1' ]; then
+  _mozkey_console_user=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null) || _mozkey_console_user=''
+  if [ -n "$_mozkey_console_user" ] && [ "$_mozkey_console_user" != 'root' ] && \
+     [ "$_mozkey_console_user" != 'loginwindow' ]; then
+    /usr/bin/sudo -u "$_mozkey_console_user" \
+      "$_mozkey_app/Contents/MacOS/MozkeyIbG" --register_input_source >/dev/null 2>&1 || true
+  fi
+fi
 exit 0

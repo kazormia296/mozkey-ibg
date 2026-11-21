@@ -98,6 +98,32 @@ process is outside this desktop user's threat boundary; the scorer's private
 IPC endpoint, loopback-only listener, port reservation, and child-image check
 remain mandatory controls.
 
+## macOS offline verification
+
+For macOS Zenz-bundled builds, Mozc communicates with its scorer through a
+private, per-user Unix-domain socket. The scorer-to-`llama-server` connection
+is authenticated and bound to randomized localhost (`127.0.0.1`) transport.
+
+The macOS-specific checks include:
+
+- `python3 tools/check_macos_offline_source.py` for selected macOS/shared
+  runtime source contracts;
+- `python3 -m unittest discover -s tools/tests -p 'test_macos_offline_audit.py' -v`
+  for the guard's regression cases;
+- `src/mac/installer/zenz_runtime/verify_release_package.zsh` for the final
+  unpacked PKG, including a native scorer inference probe and sampled `ps` /
+  `lsof` socket audit of the scorer and descendants.
+
+The sampled socket audit records no prompts or model outputs and rejects
+observed non-loopback IP endpoints. It is **not an OS-enforced egress block**,
+may miss short-lived connections, and does not cover every installed Mozkey IbG
+process. Native Intel verification and installed full-IME audits are separate
+release requirements. Build-time dependency/model downloads are not treated
+as installed-IME runtime communications.
+
+See [macOS offline audit contract](macos_offline_audit.md) for the detailed
+scope and limitations.
+
 ## Usage statistics and crash reports
 
 The usage-statistics and crash-report option inherited from upstream is removed

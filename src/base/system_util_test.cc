@@ -85,11 +85,22 @@ TEST_F(SystemUtilTest, GetUserProfileDirectory) {
   // Resets again.
   SystemUtil::SetUserProfileDirectory("");
 
-  // A system Mozc profile must never redirect Mozkey's profile.
+  // A pre-existing Mozc or upstream Mozkey directory must never redirect
+  // Mozkey IbG's profile.
   EXPECT_OK(FileUtil::CreateDirectory("/home/mozcuser/.mozc"));
+  EXPECT_OK(FileUtil::DirectoryExists("/home/mozcuser/.mozc"));
+  EXPECT_OK(FileUtil::CreateDirectory("/home/mozcuser/.mozkey"));
+  EXPECT_OK(FileUtil::DirectoryExists("/home/mozcuser/.mozkey"));
   EXPECT_EQ("/tmp/config/mozkey-ibg", SystemUtil::GetUserProfileDirectory());
 
-  // Mozkey's own legacy directory is still honored.
+  // The same holds for the XDG default when $XDG_CONFIG_HOME is unset.
+  SystemUtil::SetUserProfileDirectory("");
+  environ_mock.SetEnv("XDG_CONFIG_HOME", "");
+  EXPECT_EQ("/home/mozcuser/.config/mozkey-ibg",
+            SystemUtil::GetUserProfileDirectory());
+  EXPECT_OK(FileUtil::DirectoryExists("/home/mozcuser/.config/mozkey-ibg"));
+
+  // Mozkey IbG's own legacy directory is still honored.
   EXPECT_OK(FileUtil::CreateDirectory("/home/mozcuser/.mozkey-ibg"));
   EXPECT_OK(FileUtil::DirectoryExists("/home/mozcuser/.mozkey-ibg"));
   SystemUtil::SetUserProfileDirectory("");
@@ -104,6 +115,20 @@ TEST_F(SystemUtilTest, GetUserProfileDirectory) {
 
 #endif  // Platforms
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(SystemUtilTest, LinuxInstallationPathsAreMozkeySpecific) {
+  // Mozkey IbG shares its install directory with neither stock Mozc
+  // (/usr/lib/mozc) nor upstream Mozkey (/usr/lib/mozkey).
+  EXPECT_EQ(SystemUtil::GetServerDirectory(), "/usr/lib/mozkey-ibg");
+  EXPECT_EQ(SystemUtil::GetServerPath(), "/usr/lib/mozkey-ibg/mozc_server");
+  EXPECT_EQ(SystemUtil::GetRendererPath(),
+            "/usr/lib/mozkey-ibg/mozc_renderer");
+  EXPECT_EQ(SystemUtil::GetToolPath(), "/usr/lib/mozkey-ibg/mozc_tool");
+  EXPECT_EQ(SystemUtil::GetDocumentDirectory(),
+            "/usr/lib/mozkey-ibg/documents");
+}
+#endif  // __linux__ && !__ANDROID__
 
 TEST_F(SystemUtilTest, GetTotalPhysicalMemoryTest) {
   EXPECT_GT(SystemUtil::GetTotalPhysicalMemory(), 0);

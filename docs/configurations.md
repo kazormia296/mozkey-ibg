@@ -120,8 +120,8 @@ Here is the default configuration as of version 2.29.5205.
 ```
 # `ibus write-cache; ibus restart` might be necessary to apply changes.
 engines {
-  name : "mozc-jp"
-  longname : "Mozc"
+  name : "mozkey-ibg-jp"
+  longname : "Mozkey IbG"
   layout : "default"
   layout_variant : ""
   layout_option : ""
@@ -129,8 +129,8 @@ engines {
   symbol : "あ"
 }
 engines {
-  name : "mozc-on"
-  longname : "Mozc:あ"
+  name : "mozkey-ibg-on"
+  longname : "Mozkey IbG:あ"
   layout : "default"
   layout_variant : ""
   layout_option : ""
@@ -139,8 +139,8 @@ engines {
   composition_mode : HIRAGANA
 }
 engines {
-  name : "mozc-off"
-  longname : "Mozc:A_"
+  name : "mozkey-ibg-off"
+  longname : "Mozkey IbG:A_"
   layout : "default"
   layout_variant : ""
   layout_option : ""
@@ -176,8 +176,8 @@ Sample configuration:
 
 ```
 engines {
-  name : "mozc-jp"
-  longname : "Mozc"
+  name : "mozkey-ibg-jp"
+  longname : "Mozkey IbG"
   layout : "jp"  # or "us"
   layout_variant : ""
   layout_option : ""
@@ -195,8 +195,8 @@ Sample configuration:
 
 ```
 engines {
-  name : "mozc-jp"
-  longname : "Mozc"
+  name : "mozkey-ibg-jp"
+  longname : "Mozkey IbG"
   layout :"default"
   layout_variant : ""
   layout_option : ""
@@ -211,16 +211,16 @@ active_on_launch: True  # default is False.
 
 ```
 engines {
-  name : "mozc-jp"
-  longname : "Mozc"
+  name : "mozkey-ibg-jp"
+  longname : "Mozkey IbG"
   layout : "jp"
   layout_variant : ""
   layout_option : ""
   rank : 80
 }
 engines {
-  name : "mozc-us"
-  longname : "Mozc US"
+  name : "mozkey-ibg-us"
+  longname : "Mozkey IbG US"
   layout : "us"
   layout_variant : ""
   layout_option : ""
@@ -243,8 +243,8 @@ The available values are `DIRECT`, `HIRAGANA`, `FULL_KATAKANA`, `HALF_ASCII`, `F
 
 ```
 engines {
-  name : "mozc-on"
-  longname : "Mozc:あ"
+  name : "mozkey-ibg-on"
+  longname : "Mozkey IbG:あ"
   layout : "default"
   layout_variant : ""
   layout_option : ""
@@ -253,8 +253,8 @@ engines {
   composition_mode: HIRAGANA
 }
 engines {
-  name : "mozc-off"
-  longname : "Mozc:A_"
+  name : "mozkey-ibg-off"
+  longname : "Mozkey IbG:A_"
   layout : "default"
   layout_variant : ""
   layout_option : ""

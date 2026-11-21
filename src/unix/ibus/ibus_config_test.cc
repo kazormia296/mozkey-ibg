@@ -40,7 +40,7 @@ namespace ibus {
 TEST(IbusConfigTest, LoadConfig) {
   IbusConfig config;
   const std::string config_data = R"(engines {
-  name : "mozc-jp"
+  name : "mozkey-ibg-jp"
   longname : "Mozkey IbG"
   layout : "default"
   layout_variant : ""
@@ -55,12 +55,12 @@ active_on_launch: False
 <engine>
   <description>Mozkey IbG (Japanese Input Method)</description>
   <language>ja</language>
-  <icon>/usr/share/ibus-mozc/product_icon.png</icon>
+  <icon>/usr/share/ibus-mozkey-ibg/product_icon.png</icon>
   <rank>80</rank>
   <icon_prop_key>InputMode</icon_prop_key>
   <symbol>あ</symbol>
   <setup>/usr/lib/mozkey-ibg/mozc_tool --mode=config_dialog</setup>
-  <name>mozc-jp</name>
+  <name>mozkey-ibg-jp</name>
   <longname>Mozkey IbG</longname>
   <layout>default</layout>
   <layout_variant></layout_variant>
@@ -74,7 +74,7 @@ active_on_launch: False
 TEST(IbusConfigTest, NormalizeLayout) {
   IbusConfig config;
   const std::string config_data = R"(engines {
-  name : "mozc-jp"
+  name : "mozkey-ibg-jp"
   longname : "Mozkey IbG"
   layout : "nec_vndr/jp"
   layout_variant : "Hello World!"

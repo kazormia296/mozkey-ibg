@@ -47,5 +47,5 @@
     <choice id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" visible="false">
         <pkg-ref id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput"/>
     </choice>
-    <pkg-ref id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" onConclusion="none">MozkeyIbG.pkg</pkg-ref>
+    <pkg-ref id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" onConclusion="RequireLogout">MozkeyIbG.pkg</pkg-ref>
 </installer-gui-script>
