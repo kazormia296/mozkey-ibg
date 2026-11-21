@@ -61,6 +61,8 @@ class ResultFilter {
     kFilterByValue = 1,
     // Applied against the concatenation of history value and result's value
     kFilterByHistoryAndValue = 2,
+    // Applied against "<NWP>" + result's value.
+    kFilterByNwp = 4,
   };
 
   // Select how to apply the suggestion filter against `result`. Returns a

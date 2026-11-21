@@ -40,6 +40,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "base/win32/com.h"
 #include "base/win32/wide_char.h"
@@ -58,7 +59,7 @@ namespace win32 {
 namespace tsf {
 namespace {
 
-constexpr int kMaxSurroundingLength = 20;
+constexpr int kDefaultMaxSurroundingLength = 20;
 constexpr int kMaxCharacterLength = 1024 * 1024;
 
 struct SurroundingTextFocusSnapshot final {
@@ -151,11 +152,15 @@ class SurroudingTextUpdater final : public TipComImplements<ITfEditSession> {
       wil::com_ptr_nothrow<TipTextService> text_service,
       wil::com_ptr_nothrow<ITfContext> source_context,
       wil::com_ptr_nothrow<ITfContext> full_context, bool move_anchor,
-      SurroundingTextFocusSnapshot domain)
+      bool retrieve_selected_text, int max_preceding_length,
+      int max_following_length, SurroundingTextFocusSnapshot domain)
       : text_service_(std::move(text_service)),
         source_context_(std::move(source_context)),
         context_(std::move(full_context)),
         move_anchor_(move_anchor),
+        retrieve_selected_text_(retrieve_selected_text),
+        max_preceding_length_(max_preceding_length),
+        max_following_length_(max_following_length),
         domain_(domain) {}
 
   const TipSurroundingTextInfo& result() const { return result_; }
@@ -182,13 +187,46 @@ class SurroudingTextUpdater final : public TipComImplements<ITfEditSession> {
         return result;
       }
 
-      result = TipRangeUtil::GetText(selected_range.get(), edit_cookie,
-                                     &result_.selected_text);
-      result_.has_selected_text = SUCCEEDED(result);
+      // Inspect the current selection's InputScope in this same synchronous
+      // read edit session, before retrieving any selected/preceding/following
+      // text. This avoids relying on the asynchronous focus-scope cache.
+      std::vector<InputScope> input_scopes;
+      if (SUCCEEDED(TipRangeUtil::GetInputScopes(
+              selected_range.get(), edit_cookie, &input_scopes))) {
+        result_.is_private_input_scope =
+            TipSurroundingTextUtil::ContainsPrivateInputScope(input_scopes);
+
+        if (TipSurroundingTextUtil::ContainsPasswordInputScope(input_scopes)) {
+          // Report the password scope only while the focus domain captured by
+          // the caller is still current; otherwise the caller sees a failure.
+          domain_current_ = IsFullContextMappingCurrent(
+              text_service_.get(), source_context_.get(), context_.get(),
+              domain_);
+          if (domain_current_) {
+            result_.is_password_input_scope = true;
+          } else {
+            result_ = TipSurroundingTextInfo();
+          }
+          return S_OK;
+        }
+      }
+
+      if (retrieve_selected_text_) {
+        result = TipRangeUtil::GetText(selected_range.get(), edit_cookie,
+                                       &result_.selected_text);
+        result_.has_selected_text = SUCCEEDED(result);
+      }
 
       // For reconversion, the active selection end should be moved to the
-      // front character.
-      if (move_anchor_) {
+      // front character.  Do not call SetSelection for an empty selection.
+      // Some TSF hosts (notably Gecko) treat even a no-op SetSelection during
+      // key handling as evidence that the IME processed the physical key.
+      // Avoid a no-op selection update: some hosts treat it as handling the
+      // physical key even when there is no selection to reconvert.
+      const bool should_move_anchor =
+          TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+              move_anchor_, retrieve_selected_text_, result_);
+      if (should_move_anchor) {
         if (!IsFullContextMappingCurrent(
                 text_service_.get(), source_context_.get(), context_.get(),
                 domain_)) {
@@ -209,13 +247,13 @@ class SurroudingTextUpdater final : public TipComImplements<ITfEditSession> {
 
     const TF_HALTCOND halt_cond = {nullptr, TF_ANCHOR_START, TF_HF_OBJECT};
 
-    {
+    if (max_preceding_length_ > 0) {
       wil::com_ptr_nothrow<ITfRange> preceding_range;
       LONG preceding_range_shifted = 0;
       if (SUCCEEDED(selected_range->Clone(&preceding_range)) &&
           SUCCEEDED(preceding_range->Collapse(edit_cookie, TF_ANCHOR_START)) &&
           SUCCEEDED(preceding_range->ShiftStart(
-              edit_cookie, -kMaxSurroundingLength, &preceding_range_shifted,
+              edit_cookie, -max_preceding_length_, &preceding_range_shifted,
               &halt_cond))) {
         HRESULT result = TipRangeUtil::GetText(
             preceding_range.get(), edit_cookie, &result_.preceding_text);
@@ -223,13 +261,13 @@ class SurroudingTextUpdater final : public TipComImplements<ITfEditSession> {
       }
     }
 
-    {
+    if (max_following_length_ > 0) {
       wil::com_ptr_nothrow<ITfRange> following_range;
       LONG following_range_shifted = 0;
       if (SUCCEEDED(selected_range->Clone(&following_range)) &&
           SUCCEEDED(following_range->Collapse(edit_cookie, TF_ANCHOR_END)) &&
           SUCCEEDED(following_range->ShiftEnd(
-              edit_cookie, kMaxSurroundingLength, &following_range_shifted,
+              edit_cookie, max_following_length_, &following_range_shifted,
               &halt_cond))) {
         HRESULT result = TipRangeUtil::GetText(
             following_range.get(), edit_cookie, &result_.following_text);
@@ -250,6 +288,9 @@ class SurroudingTextUpdater final : public TipComImplements<ITfEditSession> {
   wil::com_ptr_nothrow<ITfContext> context_;
   TipSurroundingTextInfo result_;
   bool move_anchor_;
+  bool retrieve_selected_text_;
+  int max_preceding_length_;
+  int max_following_length_;
   SurroundingTextFocusSnapshot domain_;
   bool domain_current_ = false;
 };
@@ -406,6 +447,7 @@ bool GetSurroundingTextImm32(ITfContext* context,
     return false;
   }
   info->in_composition = false;
+  info->used_legacy_imm32_fallback = true;
   info->has_preceding_text = true;
   info->preceding_text.assign(ss->preceding_text.begin(),
                               ss->preceding_text.end());
@@ -453,25 +495,69 @@ bool TipSurroundingText::Get(TipTextService* text_service, ITfContext* context,
     return true;
   }
 
-  // When RequestEditSession fails, it does not maintain the reference count.
-  // So we need to ensure that AddRef/Release should be called at least once
-  // per object.
   auto updater = MakeComPtr<SurroudingTextUpdater>(
-      text_service, context, full_context, /*move_anchor=*/false, domain);
+      text_service, context, full_context, /*move_anchor=*/false,
+      /*retrieve_selected_text=*/true, kDefaultMaxSurroundingLength,
+      kDefaultMaxSurroundingLength, domain);
 
   HRESULT edit_session_result = S_OK;
   const HRESULT hr = full_context->RequestEditSession(
       text_service->GetClientID(), updater.get(), TF_ES_SYNC | TF_ES_READ,
       &edit_session_result);
-  if (FAILED(hr)) {
-    return false;
-  }
-  if (FAILED(edit_session_result) || !updater->domain_current()) {
+  if (FAILED(hr) || FAILED(edit_session_result) ||
+      !updater->domain_current()) {
     return false;
   }
 
   *info = updater->result();
+  return true;
+}
 
+bool TipSurroundingText::GetForZenzContext(
+    TipTextService* text_service, ITfContext* context,
+    size_t max_preceding_length, size_t max_following_length,
+    TipSurroundingTextInfo* info) {
+  if (text_service == nullptr || context == nullptr || info == nullptr) {
+    return false;
+  }
+  *info = TipSurroundingTextInfo();
+  const SurroundingTextFocusSnapshot domain =
+      CaptureSurroundingTextFocusSnapshot(text_service);
+  if (!IsSurroundingTextContextCurrent(text_service, context, domain)) {
+    return false;
+  }
+
+  wil::com_ptr_nothrow<ITfContext> full_context(
+      TipTransitoryExtension::AsFullContext(context));
+  if (full_context == nullptr ||
+      !IsSurroundingTextContextCurrent(text_service, context, domain)) {
+    // Zenz deliberately does not use the legacy IMM32 document-feed path.
+    return false;
+  }
+
+  const int preceding_limit =
+      max_preceding_length > static_cast<size_t>(kMaxCharacterLength)
+          ? kMaxCharacterLength
+          : static_cast<int>(max_preceding_length);
+  const int following_limit =
+      max_following_length > static_cast<size_t>(kMaxCharacterLength)
+          ? kMaxCharacterLength
+          : static_cast<int>(max_following_length);
+  auto updater = MakeComPtr<SurroudingTextUpdater>(
+      text_service, context, full_context, /*move_anchor=*/false,
+      /*retrieve_selected_text=*/false, preceding_limit, following_limit,
+      domain);
+
+  HRESULT edit_session_result = S_OK;
+  const HRESULT hr = full_context->RequestEditSession(
+      text_service->GetClientID(), updater.get(), TF_ES_SYNC | TF_ES_READ,
+      &edit_session_result);
+  if (FAILED(hr) || FAILED(edit_session_result) ||
+      !updater->domain_current()) {
+    return false;
+  }
+
+  *info = updater->result();
   return true;
 }
 
@@ -495,7 +581,9 @@ bool PrepareForReconversionTSF(TipTextService* text_service,
   // So we need to ensure that AddRef/Release should be called at least once
   // per object.
   auto updater = MakeComPtr<SurroudingTextUpdater>(
-      text_service, context, full_context, /*move_anchor=*/true, domain);
+      text_service, context, full_context, /*move_anchor=*/true,
+      /*retrieve_selected_text=*/true, kDefaultMaxSurroundingLength,
+      kDefaultMaxSurroundingLength, domain);
 
   HRESULT edit_session_result = S_OK;
   const HRESULT hr = full_context->RequestEditSession(
@@ -509,6 +597,27 @@ bool PrepareForReconversionTSF(TipTextService* text_service,
   }
 
   *info = updater->result();
+  return true;
+}
+
+bool TipSurroundingText::PrepareForExplicitSelectionReconversionFromIme(
+    TipTextService* text_service, ITfContext* context,
+    TipSurroundingTextInfo* info, uint64_t focus_epoch,
+    int32_t focus_revision) {
+  if (text_service == nullptr || context == nullptr || info == nullptr) {
+    return false;
+  }
+  *info = TipSurroundingTextInfo();
+  const SurroundingTextFocusSnapshot domain = {
+      .focus_epoch = focus_epoch,
+      .focus_revision = focus_revision,
+  };
+  // IMR_RECONVERTSTRING can return text near the caret without a selection.
+  // Only a successful full-TSF range read can authorize Space reconversion.
+  if (!PrepareForReconversionTSF(text_service, context, info, domain)) {
+    *info = TipSurroundingTextInfo();
+    return false;
+  }
   return true;
 }
 
@@ -611,6 +720,51 @@ bool TipSurroundingText::DeletePrecedingText(
     return false;
   }
   return true;
+}
+
+bool TipSurroundingTextUtil::ContainsEmbeddedObject(
+    const std::wstring_view text) {
+  return text.find(static_cast<wchar_t>(TS_CHAR_EMBEDDED)) !=
+         std::wstring_view::npos;
+}
+
+bool TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(
+    const TipSurroundingTextInfo& info) {
+  return info.has_selected_text && !info.selected_text.empty() &&
+         !info.used_legacy_imm32_fallback;
+}
+
+bool TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+    const bool move_anchor, const bool retrieve_selected_text,
+    const TipSurroundingTextInfo& info) {
+  if (!move_anchor) {
+    return false;
+  }
+  if (!retrieve_selected_text) {
+    return true;
+  }
+  return info.has_selected_text && !info.selected_text.empty() &&
+         !ContainsEmbeddedObject(info.selected_text);
+}
+
+bool TipSurroundingTextUtil::ContainsPasswordInputScope(
+    const std::vector<InputScope>& input_scopes) {
+  for (const InputScope input_scope : input_scopes) {
+    if (input_scope == IS_PASSWORD) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool TipSurroundingTextUtil::ContainsPrivateInputScope(
+    const std::vector<InputScope>& input_scopes) {
+  for (const InputScope input_scope : input_scopes) {
+    if (input_scope == IS_PRIVATE) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool TipSurroundingTextUtil::MeasureCharactersBackward(

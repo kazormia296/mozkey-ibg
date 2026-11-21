@@ -49,6 +49,19 @@ TEST(LiveConversionReadingTest, RequiresPreedit) {
   output.set_live_conversion(true);
 
   EXPECT_TRUE(BuildLiveConversionReading(output).empty());
+
+  commands::Output pre_live_output;
+  pre_live_output.set_pre_live_conversion_reading(true);
+
+  EXPECT_TRUE(BuildLiveConversionReading(pre_live_output).empty());
+}
+
+TEST(LiveConversionReadingTest, BuildsReadingBeforeLiveConversionStarts) {
+  commands::Output output;
+  output.set_pre_live_conversion_reading(true);
+  AddSegment(&output, "にゅ", "にゅ");
+
+  EXPECT_EQ(BuildLiveConversionReading(output), "にゅ");
 }
 
 TEST(LiveConversionReadingTest, PrefersKeysAndFallsBackToValues) {

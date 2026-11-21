@@ -70,6 +70,8 @@
 namespace mozc::prediction {
 namespace {
 
+using ::mozc::converter::Attribute;
+
 bool IsDebug(const ConversionRequest& request) {
 #ifndef NDEBUG
   return true;
@@ -105,13 +107,13 @@ void MaybeFixRealtimeTopCost(const ConversionRequest& request,
   int realtime_cost_min = Result::kInvalidCost;
   Result* realtime_top_result = nullptr;
   for (Result& result : results) {
-    if (result.types & PredictionType::REALTIME_TOP) {
+    if (result.attributes & PredictionType::REALTIME_TOP) {
       realtime_top_result = &result;
     }
 
     // Update the minimum cost for REALTIME candidates that have the same key
     // length as request_key.
-    if (result.types & PredictionType::REALTIME &&
+    if (result.attributes & PredictionType::REALTIME &&
         result.cost < realtime_cost_min &&
         result.key.size() == request.key().size()) {
       realtime_cost_min = result.cost;
@@ -194,10 +196,7 @@ void DictionaryPredictor::RewriteResultsForPrediction(
   }
 
   MaybeFixRealtimeTopCost(request, results);
-
-  if (!is_mixed_conversion) {
-    RemoveMissSpelledCandidates(request, results);
-  }
+  RemoveMissSpelledCandidates(request, results);
 }
 
 std::vector<Result>
@@ -233,16 +232,15 @@ std::vector<Result> DictionaryPredictor::RerankAndFilterResults(
   filter::ResultFilter filter(request, pos_matcher_, connector_,
                               suggestion_filter_);
 
-  absl::flat_hash_map<std::string, int32_t> merged_types;
+  absl::flat_hash_map<std::string, uint32_t> merged_attributes;
   if (IsDebug(request)) {
     for (const auto& result : results) {
       if (!result.removed) {
-        merged_types[result.value] |= result.types;
+        merged_attributes[result.value] |= result.attributes;
       }
     }
   }
 
-  std::shared_ptr<Result> prev_top_result;
   std::vector<Result> final_results;
 
   for (size_t i = 0; i < results.size(); ++i) {
@@ -256,33 +254,28 @@ std::vector<Result> DictionaryPredictor::RerankAndFilterResults(
       break;
     }
 
-    if (i == 0 && (prev_top_result =
-                       MaybeGetPreviousTopResult(result, request)) != nullptr) {
-      final_results.emplace_back(*prev_top_result);
-    }
-
     if (filter.ShouldRemove(result, final_results.size())) {
       continue;
     }
 
-    if ((result.candidate_attributes &
-         converter::Attribute::PARTIALLY_KEY_CONSUMED) &&
+    if (final_results.empty()) {
+      const std::shared_ptr<Result> prev_top =
+          MaybeGetPreviousTopResult(result, request);
+      if (prev_top && !filter.ShouldRemove(*prev_top, final_results.size())) {
+        final_results.emplace_back(*prev_top);
+      }
+    }
+
+    if ((result.attributes & Attribute::PARTIALLY_KEY_CONSUMED) &&
         cursor_at_tail) {
-      result.candidate_attributes |=
-          converter::Attribute::AUTO_PARTIAL_SUGGESTION;
+      result.attributes |= Attribute::AUTO_PARTIAL_SUGGESTION;
     }
 
-    if ((!(result.candidate_attributes &
-           converter::Attribute::SPELLING_CORRECTION) &&
+    if ((!(result.attributes & Attribute::SPELLING_CORRECTION) &&
          IsLatinInputMode(request)) ||
-        (result.types & PredictionType::SUFFIX)) {
-      result.candidate_attributes |=
-          converter::Attribute::NO_VARIANTS_EXPANSION;
-      result.candidate_attributes |= converter::Attribute::NO_EXTRA_DESCRIPTION;
-    }
-
-    if (result.types & PredictionType::TYPING_CORRECTION) {
-      result.candidate_attributes |= converter::Attribute::TYPING_CORRECTION;
+        (result.attributes & Attribute::SUFFIX_DICTIONARY)) {
+      result.attributes |= Attribute::NO_VARIANTS_EXPANSION;
+      result.attributes |= Attribute::NO_EXTRA_DESCRIPTION;
     }
 
     final_results.emplace_back(std::move(result));
@@ -292,8 +285,8 @@ std::vector<Result> DictionaryPredictor::RerankAndFilterResults(
 
   if (IsDebug(request)) {
     for (auto& result : final_results) {
-      const auto it = merged_types.find(result.value);
-      const int32_t types = it == merged_types.end() ? 0 : it->second;
+      const auto it = merged_attributes.find(result.value);
+      const uint32_t types = it == merged_attributes.end() ? 0 : it->second;
       AppendDescription(result, GetPredictionTypeDebugString(types));
     }
   }
@@ -329,8 +322,8 @@ int DictionaryPredictor::CalculateSingleKanjiCostOffset(
     if (result.removed) {
       continue;
     }
-    if (!(result.types & (prediction::REALTIME | prediction::UNIGRAM |
-                          prediction::PREFIX | prediction::NUMBER))) {
+    if (!(result.attributes & (prediction::REALTIME | prediction::UNIGRAM |
+                               prediction::PREFIX | prediction::NUMBER))) {
       continue;
     }
 
@@ -341,13 +334,12 @@ int DictionaryPredictor::CalculateSingleKanjiCostOffset(
       }
     }
 
-    if (((result.types & (prediction::REALTIME | prediction::UNIGRAM)) &&
+    if (((result.attributes & (prediction::REALTIME | prediction::UNIGRAM)) &&
          Util::CharsLen(result.value) != 1)) {
       continue;
     }
     int lm_cost = GetLMCost(result, rid);
-    if (result.candidate_attributes &
-        converter::Attribute::PARTIALLY_KEY_CONSUMED) {
+    if (result.attributes & Attribute::PARTIALLY_KEY_CONSUMED) {
       lm_cost += CalculatePrefixPenalty(request, result);
     }
     const auto it = min_cost_map.find(result.value);
@@ -382,7 +374,7 @@ int DictionaryPredictor::GetLMCost(const Result& result, int rid) const {
 
   int lm_cost = 0;
 
-  if (result.types & PredictionType::SUFFIX) {
+  if (result.attributes & Attribute::SUFFIX_DICTIONARY) {
     // We always respect the previous context to calculate the cost of SUFFIX.
     // Otherwise, the suffix that doesn't match the context will be promoted.
     lm_cost = cost_with_context + result.wcost;
@@ -398,7 +390,7 @@ int DictionaryPredictor::GetLMCost(const Result& result, int rid) const {
     lm_cost = std::min(cost_with_context, cost_without_context) + result.wcost;
   }
 
-  if (!(result.types & PredictionType::REALTIME)) {
+  if (!(result.attributes & Attribute::REALTIME_CONVERSION)) {
     // Realtime conversion already adds prefix/suffix penalties to the result.
     // Note that we don't add prefix penalty the role of "bunsetsu" is
     // ambiguous on zero-query suggestion.
@@ -426,7 +418,7 @@ void DictionaryPredictor::SetPredictionCost(const ConversionRequest& request,
     const int cost = GetLMCost(result, history_rid);
     size_t query_len = request_key_len;
     size_t key_len = Util::CharsLen(result.key);
-    if (result.types & PredictionType::BIGRAM) {
+    if (result.attributes & Attribute::BIGRAM) {
       query_len += history_key_len;
       key_len += history_key_len;
     }
@@ -523,7 +515,7 @@ void DictionaryPredictor::SetPredictionCostForMixedConversion(
       MOZC_WORD_LOG(result, "BadSuggestionPenalty: ", cost);
     }
 
-    if (result.types & PredictionType::BIGRAM) {
+    if (result.attributes & Attribute::BIGRAM) {
       // When user inputs "六本木" and there is an entry
       // "六本木ヒルズ" in the dictionary, we can suggest
       // "ヒルズ" as a ZeroQuery suggestion. In this case,
@@ -547,7 +539,7 @@ void DictionaryPredictor::SetPredictionCostForMixedConversion(
       MOZC_WORD_LOG(result, "Bigram: ", cost);
     }
 
-    if (result.types & PredictionType::SINGLE_KANJI) {
+    if (result.attributes & Attribute::SINGLE_KANJI) {
       cost += single_kanji_offset;
       if (cost <= 0) {
         // single_kanji_offset can be negative.
@@ -557,7 +549,7 @@ void DictionaryPredictor::SetPredictionCostForMixedConversion(
       MOZC_WORD_LOG(result, "SingleKanji: ", cost);
     }
 
-    if (result.candidate_attributes & converter::Attribute::USER_DICTIONARY &&
+    if (result.attributes & Attribute::USER_DICTIONARY &&
         result.lid != general_symbol_id_) {
       // Decrease cost for words from user dictionary in order to promote them,
       // provided that it is not a general symbol (Note: emoticons are mapped to
@@ -578,7 +570,7 @@ void DictionaryPredictor::SetPredictionCostForMixedConversion(
     //   candidates area.
     const size_t candidate_lookup_key_len = Util::CharsLen(request.key());
     const size_t candidate_key_len = Util::CharsLen(result.key);
-    if (!(result.types & PredictionType::SUFFIX) &&
+    if (!(result.attributes & Attribute::SUFFIX_DICTIONARY) &&
         candidate_key_len > candidate_lookup_key_len) {
       const size_t predicted_key_len =
           candidate_key_len - candidate_lookup_key_len;
@@ -588,9 +580,7 @@ void DictionaryPredictor::SetPredictionCostForMixedConversion(
       cost += predictive_penalty;
       MOZC_WORD_LOG(result, "Predictive: ", cost);
     }
-    // Penalty for prefix results.
-    if (result.candidate_attributes &
-        converter::Attribute::PARTIALLY_KEY_CONSUMED) {
+    if (result.attributes & Attribute::PARTIALLY_KEY_CONSUMED) {
       const int prefix_penalty = CalculatePrefixPenalty(request, result);
       result.penalty += prefix_penalty;
       cost += prefix_penalty;
@@ -608,17 +598,18 @@ void DictionaryPredictor::SetPredictionCostForMixedConversion(
 // static
 void DictionaryPredictor::RemoveMissSpelledCandidates(
     const ConversionRequest& request, absl::Span<Result> results) {
-  const size_t request_key_len = Util::CharsLen(request.key());
-
   if (results.size() <= 1) {
     return;
   }
 
+  const bool is_mixed_conversion = IsMixedConversionEnabled(request);
+  const size_t request_key_len = Util::CharsLen(request.key());
+
   int spelling_correction_size = 5;
   for (size_t i = 0; i < results.size(); ++i) {
-    const Result& result = results[i];
-    if (!(result.candidate_attributes &
-          converter::Attribute::SPELLING_CORRECTION)) {
+    Result& result = results[i];
+    if (result.removed ||
+        !(result.attributes & Attribute::SPELLING_CORRECTION)) {
       continue;
     }
 
@@ -634,8 +625,8 @@ void DictionaryPredictor::RemoveMissSpelledCandidates(
         continue;
       }
       const Result& target_result = results[j];
-      if (target_result.candidate_attributes &
-          converter::Attribute::SPELLING_CORRECTION) {
+      if (target_result.removed ||
+          (target_result.attributes & Attribute::SPELLING_CORRECTION)) {
         continue;
       }
       if (target_result.key == result.key) {
@@ -648,24 +639,30 @@ void DictionaryPredictor::RemoveMissSpelledCandidates(
 
     // delete same_key_index and same_value_index
     if (!same_key_index.empty() && !same_value_index.empty()) {
-      results[i].removed = true;
-      MOZC_WORD_LOG(results[i], "Removed. same_(key|value)_index.");
-      for (const size_t k : same_key_index) {
-        results[k].removed = true;
-        MOZC_WORD_LOG(results[k], "Removed. same_(key|value)_index.");
+      result.removed = true;
+      MOZC_WORD_LOG(result, "Removed. same_(key|value)_index.");
+      // Keep literal same-key candidates (e.g., "ビックバン") on mobile.
+      if (!is_mixed_conversion) {
+        for (const size_t k : same_key_index) {
+          results[k].removed = true;
+          MOZC_WORD_LOG(results[k], "Removed. same_(key|value)_index.");
+        }
       }
     } else if (same_key_index.empty() && !same_value_index.empty()) {
-      results[i].removed = true;
-      MOZC_WORD_LOG(results[i], "Removed. same_value_index.");
+      result.removed = true;
+      MOZC_WORD_LOG(result, "Removed. same_value_index.");
     } else if (!same_key_index.empty() && same_value_index.empty()) {
-      for (const size_t k : same_key_index) {
-        results[k].removed = true;
-        MOZC_WORD_LOG(results[k], "Removed. same_key_index.");
+      // Keep literal same-key candidates (e.g., "ビックバン") on mobile.
+      if (!is_mixed_conversion) {
+        for (const size_t k : same_key_index) {
+          results[k].removed = true;
+          MOZC_WORD_LOG(results[k], "Removed. same_key_index.");
+        }
       }
       if (request_key_len <=
           filter::GetMissSpelledPosition(result.key, result.value)) {
-        results[i].removed = true;
-        MOZC_WORD_LOG(results[i], "Removed. Invalid MissSpelledPosition.");
+        result.removed = true;
+        MOZC_WORD_LOG(result, "Removed. Invalid MissSpelledPosition.");
       }
     }
   }
@@ -792,15 +789,18 @@ std::shared_ptr<Result> DictionaryPredictor::MaybeGetPreviousTopResult(
       cur_top_key_length);  // returns the old value.
 
   // Insert condition.
-  // 1. prev key length < current key length (incrementally character is added)
+  // 1. 0 < prev key length < current key length (incrementally character is
+  //    added)
   // 2. cost diff is less than max_diff.
-  // 3. current key is shorter than previous key.
+  // 3. current key is non-empty and shorter than previous key.
   // 4. current key is the prefix of previous key.
   // 5. current result is not a partial suggestion.
-  if (prev_top_result && cur_top_key_length >= prev_top_key_length &&
-      std::abs(current_top_result.cost - prev_top_result->cost) < max_diff &&
+  if (prev_top_result && 0 < prev_top_key_length &&
+      prev_top_key_length < cur_top_key_length &&
+      !current_top_result.key.empty() &&
       current_top_result.key.size() < prev_top_result->key.size() &&
-      !(current_top_result.types & PREFIX) &&
+      std::abs(current_top_result.cost - prev_top_result->cost) < max_diff &&
+      !(current_top_result.attributes & Attribute::PARTIALLY_KEY_CONSUMED) &&
       prev_top_result->key.starts_with(current_top_result.key)) {
     // Do not need to remember the previous key as `prev_top_result` is still
     // top result.

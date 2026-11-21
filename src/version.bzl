@@ -46,6 +46,20 @@ MOZKEY_RELEASE_VERSION_MAJOR = 0
 MOZKEY_RELEASE_VERSION_MINOR = 10
 MOZKEY_RELEASE_VERSION_PATCH = 4
 
+# macOS bundle and installer versions must advance beyond existing Mozc builds
+# (such as 3.33.6153.101) while retaining the user-visible Mozkey version.
+# Keep this mapping aligned with MozcVersion.GetMozkeyInstallerVersion().
+MOZKEY_RELEASE_VERSION = "%d.%d.%d" % (
+    MOZKEY_RELEASE_VERSION_MAJOR,
+    MOZKEY_RELEASE_VERSION_MINOR,
+    MOZKEY_RELEASE_VERSION_PATCH,
+)
+MOZKEY_MACOS_INSTALL_VERSION = "%d.%d.%d" % (
+    100 + MOZKEY_RELEASE_VERSION_MAJOR,
+    MOZKEY_RELEASE_VERSION_MINOR,
+    MOZKEY_RELEASE_VERSION_PATCH,
+)
+
 # LINT.IfChange
 DEFAULT_BUILD_LABEL_MACOS = "%d.%d.%d.%d" % (MAJOR, MINOR, BUILD, REVISION + 1)
 # LINT.ThenChange(//data/version/BUILD.bazel)

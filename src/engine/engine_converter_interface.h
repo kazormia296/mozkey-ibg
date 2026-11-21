@@ -33,6 +33,7 @@
 #define MOZC_ENGINE_SESSION_CONVERTER_INTERFACE_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,6 +43,7 @@
 #include "absl/types/span.h"
 #include "composer/composer.h"
 #include "converter/converter_interface.h"
+#include "converter/segments.h"
 #include "dictionary/project_dictionary.h"
 #include "protocol/commands.pb.h"
 #include "protocol/config.pb.h"
@@ -64,6 +66,14 @@ struct ConversionPreferences {
   // TODO(hidehiko,komatsu): Remove this flag, when the full EngineConverter
   //   refactoring is done and gets safer for future development/extensions.
   bool request_suggestion;
+
+  // Skip only Zenz feedback reuse on this conversion request. Ordinary
+  // Mozc user history and user dictionary remain available.
+  bool ignore_zenz_feedback = false;
+
+  // Keep a postal-code numeric literal TOP1 during live conversion, as well
+  // as explicit conversion in live mode; leave the ZIP dictionary enabled.
+  bool prefer_zipcode_literal_top = false;
 };
 
 // Class handling ConverterInterface with a session state.  This class
@@ -93,11 +103,31 @@ class EngineConverterInterface {
   // conversion.
   virtual const ConversionPreferences& conversion_preferences() const = 0;
 
-  // Send a conversion request to the converter.
-  virtual bool Convert(const composer::Composer& composer) = 0;
+  // Sends a conversion request to the converter.
+  virtual bool Convert(const composer::Composer& composer,
+                       const commands::Context& context,
+                       const ConversionPreferences& preferences) = 0;
+  virtual bool Convert(const composer::Composer& composer,
+                       const commands::Context& context) {
+    return Convert(composer, context, conversion_preferences());
+  }
+  virtual bool Convert(const composer::Composer& composer,
+                       const ConversionPreferences& preferences) {
+    return Convert(composer, commands::Context::default_instance(),
+                   preferences);
+  }
+  virtual bool Convert(const composer::Composer& composer) {
+    return Convert(composer, commands::Context::default_instance(),
+                   conversion_preferences());
+  }
+
+  // Mozkey compatibility wrapper for fork-specific callers.
   virtual bool ConvertWithPreferences(
       const composer::Composer& composer,
-      const ConversionPreferences& preferences) = 0;
+      const ConversionPreferences& preferences) {
+    return Convert(composer, commands::Context::default_instance(),
+                   preferences);
+  }
 
   // Selects a unique high-confidence raw-input correction already attached to
   // the active conversion.  The source Composer remains unchanged; callers
@@ -131,19 +161,55 @@ class EngineConverterInterface {
   // half-width Katakana by rotation.
   virtual bool SwitchKanaType(const composer::Composer& composer) = 0;
 
-  // Send a suggestion request to the converter.
+  // Sends a suggestion request to the converter.
   virtual bool Suggest(const composer::Composer& composer,
-                       const commands::Context& context) = 0;
+                       const commands::Context& context,
+                       const ConversionPreferences& preferences) = 0;
+  virtual bool Suggest(const composer::Composer& composer,
+                       const commands::Context& context) {
+    return Suggest(composer, context, conversion_preferences());
+  }
+  virtual bool Suggest(const composer::Composer& composer,
+                       const ConversionPreferences& preferences) {
+    return Suggest(composer, commands::Context::default_instance(),
+                   preferences);
+  }
+  virtual bool Suggest(const composer::Composer& composer) {
+    return Suggest(composer, commands::Context::default_instance(),
+                   conversion_preferences());
+  }
+
+  // Mozkey compatibility wrapper for fork-specific callers.
   virtual bool SuggestWithPreferences(
       const composer::Composer& composer, const commands::Context& context,
-      const ConversionPreferences& preferences) = 0;
+      const ConversionPreferences& preferences) {
+    return Suggest(composer, context, preferences);
+  }
+  // Sends a prediction request to the converter.
+  virtual bool Predict(const composer::Composer& composer,
+                       const commands::Context& context,
+                       const ConversionPreferences& preferences) = 0;
+  virtual bool Predict(const composer::Composer& composer,
+                       const commands::Context& context) {
+    return Predict(composer, context, conversion_preferences());
+  }
+  virtual bool Predict(const composer::Composer& composer,
+                       const ConversionPreferences& preferences) {
+    return Predict(composer, commands::Context::default_instance(),
+                   preferences);
+  }
+  virtual bool Predict(const composer::Composer& composer) {
+    return Predict(composer, commands::Context::default_instance(),
+                   conversion_preferences());
+  }
 
-  // Send a prediction request to the converter.
-  virtual bool Predict(const composer::Composer& composer) = 0;
+  // Mozkey compatibility wrapper for fork-specific callers.
   virtual bool PredictWithPreferences(
       const composer::Composer& composer,
-      const ConversionPreferences& preferences) = 0;
-
+      const ConversionPreferences& preferences) {
+    return Predict(composer, commands::Context::default_instance(),
+                   preferences);
+  }
   // Clear conversion segments, but keep the context.
   virtual void Cancel() = 0;
 
@@ -172,7 +238,7 @@ class EngineConverterInterface {
     return false;
   }
 
-  // Learns an externally committed multi-segment conversion result without
+  // Learns an externally committed segmented conversion result without
   // changing the current session-visible conversion state.  This is used when
   // an accepted Zenz correction can be safely projected onto Mozc
   // live-conversion phrase boundaries.
@@ -180,6 +246,85 @@ class EngineConverterInterface {
   virtual bool LearnExternalConversionSegments(
       absl::Span<const ExternalConversionSegment> segments,
       const commands::Context& context) {
+    return false;
+  }
+
+  // Applies the same external learning as the APIs above while retaining an
+  // opaque rollback handle. Zero means that no reversible learning was applied.
+  [[nodiscard]]
+  virtual uint64_t LearnExternalConversionResultReversibly(
+      absl::string_view key,
+      absl::string_view value,
+      const commands::Context& context) {
+    return 0;
+  }
+
+  [[nodiscard]]
+  virtual uint64_t LearnExternalConversionSegmentsReversibly(
+      absl::Span<const ExternalConversionSegment> segments,
+      const commands::Context& context) {
+    return 0;
+  }
+
+  // Rolls back or confirms one reversible external-learning operation.
+  // Revert must be invoked in reverse application order when several handles
+  // belong to one higher-level user transaction.
+  virtual bool RevertExternalConversionLearning(uint64_t revert_id) {
+    return false;
+  }
+  virtual bool ConfirmExternalConversionLearning(uint64_t revert_id) {
+    return false;
+  }
+
+  // After a successfully completed detached re-conversion, move (never
+  // copy) any pending rollback handles to its successor. On failure the
+  // original converter must retain full ownership. Unsupported converter
+  // implementations fail closed.
+  [[nodiscard]]
+  virtual bool TransferExternalConversionLearningOwnershipTo(
+      EngineConverterInterface* successor) {
+    (void)successor;
+    return false;
+  }
+
+  // Internal half of the ownership handoff. Receivers must verify
+  // identical backing ConverterInterface identity and reject nonempty
+  // destination ownership before moving any handles.
+  virtual bool ReceiveExternalConversionLearningOwnership(
+      const ConverterInterface* source_backend,
+      std::vector<Segments>* handles) {
+    (void)source_backend;
+    (void)handles;
+    return false;
+  }
+
+  // Resolves an accepted external full-sequence result into Mozc-native
+  // phrase boundaries without changing session-visible converter state or
+  // writing history.  This is a conservative fallback for Zenz corrections
+  // whose accepted surface cannot be projected onto the current live
+  // conversion boundaries.
+  [[nodiscard]]
+  virtual bool ResolveExternalConversionSegments(
+      absl::string_view key, absl::string_view value,
+      const commands::Context& context,
+      std::vector<ExternalConversionSegment>* segments) {
+    if (segments != nullptr) {
+      segments->clear();
+    }
+    return false;
+  }
+
+  // Evaluates an already-known segment sequence with those exact boundaries,
+  // without mutating history. This is used for context-loss hardening when the
+  // live full-context Mozc segmentation is already trustworthy.
+  [[nodiscard]]
+  virtual bool EvaluateExternalConversionSegments(
+      absl::Span<const ExternalConversionSegment> segments,
+      const commands::Context& context,
+      std::vector<ExternalConversionSegment>* evaluated_segments) {
+    if (evaluated_segments != nullptr) {
+      evaluated_segments->clear();
+    }
     return false;
   }
 
@@ -263,6 +408,14 @@ class EngineConverterInterface {
   // Returns false if the candidate was not found or deletion failed.
   virtual bool DeleteCandidateFromHistory(std::optional<int> id) = 0;
 
+  // Handles the keymap-level DeleteSelectedCandidate action.
+  // History-derived candidates lose only their history. Other suppressible
+  // regular candidates are registered as suppression words.
+  virtual bool DeleteOrSuppressCandidate(std::optional<int> id) {
+    (void)id;
+    return false;
+  }
+
   // Move the focus of segments.
   virtual void SegmentFocusRight() = 0;
   virtual void SegmentFocusLast() = 0;
@@ -284,6 +437,17 @@ class EngineConverterInterface {
   virtual void CandidateNextPage() = 0;
   virtual void CandidatePrev() = 0;
   virtual void CandidatePrevPage() = 0;
+
+  // Promotes the currently displayed SUGGESTION list to PREDICTION and focuses
+  // |id| without issuing a new prediction request.  This is used when the
+  // session intentionally keeps an exact passive-suggestion snapshot visible.
+  // Lightweight implementations that do not support this transition can keep
+  // the default failure behavior.
+  virtual bool FocusSuggestionCandidateWithoutPrediction(int id) {
+    (void)id;
+    return false;
+  }
+
   // Move the focus to the candidate represented by the id.
   virtual void CandidateMoveToId(int id,
                                  const composer::Composer& composer) = 0;

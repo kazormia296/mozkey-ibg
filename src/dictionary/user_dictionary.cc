@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -71,6 +72,9 @@
 namespace mozc {
 namespace dictionary {
 namespace {
+
+constexpr absl::string_view kHiddenCandidateDictionaryName =
+    "非表示候補";
 
 struct OrderByKey {
   bool operator()(const UserPos::Token& token, absl::string_view key) const {
@@ -153,6 +157,7 @@ class UserDictionary::TokensIndex {
 
   bool empty() const { return user_pos_tokens_.empty(); }
   size_t size() const { return user_pos_tokens_.size(); }
+  int cost_penalty() const { return cost_penalty_; }
 
   std::vector<UserPos::Token>::const_iterator begin() const {
     return user_pos_tokens_.begin();
@@ -218,6 +223,30 @@ class UserDictionary::TokensIndex {
     std::sort(user_pos_tokens_.begin(), user_pos_tokens_.end(),
               OrderByKeyThenById());
 
+    // Adds cost penalty based on dictionary entry count N: 500 * log(N + 1).
+    //
+    // Background:
+    // User dictionary entries default to static minimum costs defined in
+    // user_pos.def. When users carelessly or unconsciously import large
+    // 3rd-party dictionaries, low-quality entries over-trigger and overpower
+    // standard system candidates.
+    //
+    // Theoretical Justification:
+    // Assuming a uniform prior probability P = 1/N across N entries, the
+    // self-information penalty in Mozc cost scaling (approx. 500 * (-ln P)) is
+    // 500 * ln(N + 1). Using N + 1 generalizes to 0 penalty when N = 0.
+    //
+    // Cost penalty examples per N:
+    // - N = 0: +0
+    // - N = 1: +346
+    // - N = 10: +1,198
+    // - N = 100: +2,307
+    // - N = 1,000: +3,454
+    // - N = 10,000: +4,605
+    // - N = 100,000: +5,756
+    cost_penalty_ =
+        static_cast<int>(500.0 * std::log(user_pos_tokens_.size() + 1));
+
     MOZC_VLOG(1) << user_pos_tokens_.size() << " user dic entries loaded";
   }
 
@@ -233,6 +262,7 @@ class UserDictionary::TokensIndex {
   const UserPos& user_pos_;
   SuppressionDictionary suppression_dictionary_;
   std::vector<UserPos::Token> user_pos_tokens_;
+  int cost_penalty_ = 0;
 };
 
 class UserDictionary::UserDictionaryReloader {
@@ -245,14 +275,9 @@ class UserDictionary::UserDictionaryReloader {
   ~UserDictionaryReloader() { Wait(); }
 
   // When the user dictionary exists AND the modification time has been updated,
-  // reloads the dictionary.  Returns true when reloader thread is started.
+  // reloads the dictionary. Returns true when reloader thread is started or
+  // scheduled to reload in the running thread.
   bool MaybeStartReload() {
-    if (reload_.IsRunning()) {
-      // Previously started reload is still running.
-      // TODO(tomokinat): test this path.
-      return false;
-    }
-
     absl::StatusOr<FileTimeStamp> modification_time =
         FileUtil::GetModificationTime(dic_.GetFileName());
     if (!modification_time.ok()) {
@@ -264,32 +289,50 @@ class UserDictionary::UserDictionaryReloader {
                    << modification_time.status();
       return false;
     }
-    if (modified_at_ == *modification_time) {
+
+    if (modified_at_.exchange(*modification_time) == *modification_time) {
       return false;
     }
-    modified_at_ = *modification_time;
-    // Runs `ThreadMain()` in a background thread.
-    reload_.Schedule([this] { ThreadMain(); });
+    if (state_.exchange(State::kRunningWithPending) == State::kIdle) {
+      // Runs `ThreadMain()` in a background thread.
+      reload_.Schedule([this] { ThreadMain(); });
+    }
     return true;
   }
 
   void Wait() { reload_.Wait(); }
 
  private:
+  enum class State {
+    kIdle,
+    kRunning,
+    kRunningWithPending,
+  };
+
   void ThreadMain() {
-    UserDictionaryStorage storage(dic_.GetFileName());
+    while (!dic_.canceled_signal_.load()) {
+      state_.store(State::kRunning);
 
-    // Load from file
-    if (absl::Status s = storage.Load(); !s.ok()) {
-      LOG(ERROR) << "Failed to load the user dictionary: " << s;
-      return;
+      UserDictionaryStorage storage(dic_.GetFileName());
+
+      // Load from file
+      if (absl::Status s = storage.Load(); !s.ok()) {
+        LOG(ERROR) << "Failed to load the user dictionary: " << s;
+      } else {
+        dic_.Load(storage.GetProto());
+      }
+
+      State expected = State::kRunning;
+      if (state_.compare_exchange_strong(expected, State::kIdle)) {
+        return;
+      }
     }
-
-    dic_.Load(storage.GetProto());
+    state_.store(State::kIdle);
   }
 
   TaskManager reload_;
-  FileTimeStamp modified_at_ = 0;
+  std::atomic<FileTimeStamp> modified_at_ = 0;
+  std::atomic<State> state_ = State::kIdle;
   UserDictionary& dic_;
 };
 
@@ -346,7 +389,6 @@ void UserDictionary::LookupPredictive(absl::string_view key,
   }
 
   // Find the starting point of iteration over dictionary contents.
-  Token token;
   for (auto [begin, end] = std::equal_range(tokens->begin(), tokens->end(), key,
                                             OrderByKeyPrefix());
        begin != end; ++begin) {
@@ -366,9 +408,10 @@ void UserDictionary::LookupPredictive(absl::string_view key,
         Callback::TRAVERSE_DONE) {
       return;
     }
+    Token token;
     PopulateTokenFromUserPosToken(user_pos_token, PREDICTIVE, &token);
-    if (callback->OnToken(user_pos_token.key, user_pos_token.key, token) ==
-        Callback::TRAVERSE_DONE) {
+    if (callback->OnToken(user_pos_token.key, user_pos_token.key,
+                          std::move(token)) == Callback::TRAVERSE_DONE) {
       return;
     }
   }
@@ -390,7 +433,6 @@ void UserDictionary::LookupPrefix(absl::string_view key,
 
   // Find the starting point for iteration over dictionary contents.
   const absl::string_view first_char = Utf8AsChars(key).front();
-  Token token;
   for (auto it = std::lower_bound(tokens->begin(), tokens->end(), first_char,
                                   OrderByKey());
        it != tokens->end(); ++it) {
@@ -421,8 +463,10 @@ void UserDictionary::LookupPrefix(absl::string_view key,
         Callback::TRAVERSE_DONE) {
       return;
     }
+    Token token;
     PopulateTokenFromUserPosToken(user_pos_token, PREFIX, &token);
-    switch (callback->OnToken(user_pos_token.key, user_pos_token.key, token)) {
+    switch (callback->OnToken(user_pos_token.key, user_pos_token.key,
+                              std::move(token))) {
       case Callback::TRAVERSE_DONE:
         return;
       case Callback::TRAVERSE_CULL:
@@ -454,15 +498,16 @@ void UserDictionary::LookupExact(absl::string_view key,
     return;
   }
 
-  Token token;
   for (; begin != end; ++begin) {
     const UserPos::Token& user_pos_token = *begin;
     if (user_pos_token.pos_type() ==
         user_dictionary::UserDictionary::SUGGESTION_ONLY) {
       continue;
     }
+    Token token;
     PopulateTokenFromUserPosToken(user_pos_token, EXACT, &token);
-    if (callback->OnToken(key, key, token) != Callback::TRAVERSE_CONTINUE) {
+    if (callback->OnToken(key, key, std::move(token)) !=
+        Callback::TRAVERSE_CONTINUE) {
       return;
     }
   }
@@ -506,6 +551,107 @@ bool UserDictionary::HasSuppressedEntries() const {
   return GetTokens()->HasSuppressedEntries();
 }
 
+bool UserDictionary::AddSuppressionEntry(absl::string_view key,
+                                         absl::string_view value) {
+  if (key.empty() || value.empty()) {
+    LOG(WARNING) << "Suppression key and value must not be empty";
+    return false;
+  }
+
+  const std::string normalized_key = japanese::NormalizeVoicedSoundMark(
+      user_dictionary::NormalizeReading(key));
+
+  UserDictionaryStorage::UserDictionaryEntry new_entry;
+  new_entry.set_key(normalized_key);
+  new_entry.set_value(value);
+  new_entry.set_pos(user_dictionary::UserDictionary::SUPPRESSION_WORD);
+  if (const absl::Status status = user_dictionary::ValidateEntry(new_entry);
+      !status.ok()) {
+    LOG(ERROR) << "Invalid suppression entry: " << status;
+    return false;
+  }
+
+  WaitForReloader();
+
+  UserDictionaryStorage storage(filename_);
+  if (!storage.Lock()) {
+    LOG(ERROR) << "Failed to lock user dictionary storage";
+    return false;
+  }
+
+  const auto unlock = [&storage]() {
+    if (!storage.UnLock()) {
+      LOG(ERROR) << "Failed to unlock user dictionary storage";
+    }
+  };
+
+  const absl::Status load_status = storage.Load();
+  if (!load_status.ok() && load_status.code() != absl::StatusCode::kNotFound) {
+    LOG(ERROR) << "Failed to load user dictionary storage: " << load_status;
+    unlock();
+    return false;
+  }
+
+  auto dictionary_id =
+      storage.GetUserDictionaryId(kHiddenCandidateDictionaryName);
+  if (!dictionary_id.ok()) {
+    if (dictionary_id.status().code() != absl::StatusCode::kNotFound) {
+      LOG(ERROR) << "Failed to find hidden-candidate dictionary: "
+                 << dictionary_id.status();
+      unlock();
+      return false;
+    }
+    dictionary_id = storage.CreateDictionary(kHiddenCandidateDictionaryName);
+    if (!dictionary_id.ok()) {
+      LOG(ERROR) << "Failed to create hidden-candidate dictionary: "
+                 << dictionary_id.status();
+      unlock();
+      return false;
+    }
+  }
+
+  UserDictionaryStorage::UserDictionary* dictionary =
+      storage.GetUserDictionary(*dictionary_id);
+  if (dictionary == nullptr) {
+    LOG(ERROR) << "Hidden-candidate dictionary disappeared";
+    unlock();
+    return false;
+  }
+
+  for (const UserDictionaryStorage::UserDictionaryEntry& entry :
+       dictionary->entries()) {
+    if (entry.pos() != user_dictionary::UserDictionary::SUPPRESSION_WORD ||
+        entry.value() != value) {
+      continue;
+    }
+    const std::string existing_key = japanese::NormalizeVoicedSoundMark(
+        user_dictionary::NormalizeReading(entry.key()));
+    if (existing_key == normalized_key) {
+      const bool loaded = Load(storage.GetProto());
+      unlock();
+      return loaded;
+    }
+  }
+
+  if (UserDictionaryStorage::IsDictionaryFull(*dictionary)) {
+    LOG(ERROR) << "Hidden-candidate dictionary is full";
+    unlock();
+    return false;
+  }
+
+  *dictionary->add_entries() = new_entry;
+
+  if (const absl::Status save_status = storage.Save(); !save_status.ok()) {
+    LOG(ERROR) << "Failed to save suppression entry: " << save_status;
+    unlock();
+    return false;
+  }
+
+  const bool loaded = Load(storage.GetProto());
+  unlock();
+  return loaded;
+}
+
 bool UserDictionary::Reload() {
   if (!reloader_->MaybeStartReload()) {
     LOG(INFO) << "MaybeStartReload() didn't start reloading";
@@ -546,6 +692,10 @@ void UserDictionary::PopulateTokenFromUserPosToken(
   token->value = user_pos_token.value;
   token->lid = token->rid = user_pos_token.id;
   token->attributes = Token::USER_DICTIONARY;
+  if (user_pos_token.pos_type() ==
+      user_dictionary::UserDictionary::EMOTICON) {
+    token->attributes |= Token::EMOTICON;
+  }
 
   // * Overwrites POS ids.
   // Actual pos id of suggestion-only candidates are 名詞-サ変.
@@ -561,7 +711,8 @@ void UserDictionary::PopulateTokenFromUserPosToken(
   if (user_pos_token.has_attribute(UserPos::Token::NON_JA_LOCALE)) {
     token->cost = 10000;
   } else {
-    token->cost = UserPos::GetCostFromPosType(user_pos_token.pos_type());
+    token->cost = UserPos::GetCostFromPosType(user_pos_token.pos_type(),
+                                              GetTokens()->cost_penalty());
     DCHECK_GT(token->cost, 0);
   }
 

@@ -181,7 +181,7 @@ help_output="${probe_dir}/help.txt"
 
 for required_flag in \
   '--api-key' '--host' '--port' '--model' '--ctx-size' '--threads' \
-  '--device' '--list-devices' '--flash-attn'
+  '--device' '--list-devices' '--flash-attn' '--parallel' '--cache-ram'
 do
   grep -Fq -- "${required_flag}" "${help_output}" || {
     echo "llama-server is missing required CLI flag: ${required_flag}" >&2

@@ -31,6 +31,7 @@
 
 #include <cstdint>
 
+#include "protocol/candidate_window.pb.h"
 #include "protocol/renderer_style.pb.h"
 #include "testing/gunit.h"
 
@@ -43,6 +44,7 @@ TEST(RendererStyleHandlerTest, GetRendererStyle) {
   EXPECT_TRUE(style.has_window_border());
   EXPECT_TRUE(style.has_infolist_style());
   EXPECT_TRUE(style.infolist_style().has_focused_border_color());
+  EXPECT_EQ(400, style.candidate_style().font_weight());
 }
 
 TEST(RendererStyleHandlerTest, ApplyCandidateRubyFont) {
@@ -99,6 +101,7 @@ TEST(RendererStyleHandlerTest, ApplyCandidateWindowCustomColors) {
   EXPECT_EQ(0x0d0e0f, Rgb(style.border_color()));
   EXPECT_EQ(0x101112, Rgb(style.shortcut_style().foreground_color()));
   EXPECT_EQ(0x131415, Rgb(style.shortcut_style().background_color()));
+  EXPECT_EQ(0x010203, Rgb(style.gap1_style().background_color()));
   EXPECT_EQ(0x161718, Rgb(style.description_style().foreground_color()));
   EXPECT_EQ(0x191a1b, Rgb(style.footer_style().foreground_color()));
   EXPECT_EQ(0x1c1d1e, Rgb(style.footer_top_color()));
@@ -107,6 +110,51 @@ TEST(RendererStyleHandlerTest, ApplyCandidateWindowCustomColors) {
   EXPECT_EQ(0x252627, Rgb(style.scrollbar_indicator_color()));
 }
 
+
+TEST(RendererStyleHandlerTest,
+     ApplyCandidateWindowThemeSetsGapBackground) {
+  RendererStyle style;
+  RendererStyleHandler::GetDefaultRendererStyle(&style);
+
+  RendererStyleHandler::ApplyCandidateWindowTheme(false, &style);
+  EXPECT_TRUE(style.gap1_style().has_background_color());
+  EXPECT_EQ(Rgb(style.candidate_style().background_color()),
+            Rgb(style.gap1_style().background_color()));
+
+  RendererStyleHandler::ApplyCandidateWindowTheme(true, &style);
+  EXPECT_TRUE(style.gap1_style().has_background_color());
+  EXPECT_EQ(Rgb(style.candidate_style().background_color()),
+            Rgb(style.gap1_style().background_color()));
+}
+
+TEST(RendererStyleHandlerTest, CandidateWindowCategorySelectsAppearanceBucket) {
+  commands::CandidateWindow candidate;
+
+  candidate.set_category(commands::CONVERSION);
+  EXPECT_EQ(RendererStyleHandler::RendererStyleType::kCandidate,
+            RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+                candidate));
+
+  candidate.set_category(commands::TRANSLITERATION);
+  EXPECT_EQ(RendererStyleHandler::RendererStyleType::kCandidate,
+            RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+                candidate));
+
+  candidate.set_category(commands::USAGE);
+  EXPECT_EQ(RendererStyleHandler::RendererStyleType::kCandidate,
+            RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+                candidate));
+
+  candidate.set_category(commands::SUGGESTION);
+  EXPECT_EQ(RendererStyleHandler::RendererStyleType::kSuggestion,
+            RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+                candidate));
+
+  candidate.set_category(commands::PREDICTION);
+  EXPECT_EQ(RendererStyleHandler::RendererStyleType::kSuggestion,
+            RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+                candidate));
+}
 
 TEST(RendererStyleHandlerTest, ApplyCandidateWindowSize) {
   RendererStyle style;
@@ -135,6 +183,10 @@ TEST(RendererStyleHandlerTest, SetRendererWindowStylesSeparatesSuggestion) {
   ruby_style.text_color = 0x123456;
   ruby_style.border_color = 0x654321;
   ruby_style.corner_radius = 12;
+  ruby_style.font_weight = 700;
+  ruby_style.horizontal_padding = 20;
+  ruby_style.vertical_padding = 8;
+  ruby_style.composition_gap = 7;
 
   RendererStyleHandler::CandidateWindowEffectStyle candidate_effect;
   candidate_effect.opacity_percent = 95;
@@ -173,6 +225,11 @@ TEST(RendererStyleHandlerTest, SetRendererWindowStylesSeparatesSuggestion) {
   EXPECT_EQ(0xabcdef,
             RendererStyleHandler::GetRubyWindowStyle().background_color);
   EXPECT_EQ(12u, RendererStyleHandler::GetRubyWindowStyle().corner_radius);
+  EXPECT_EQ(700u, RendererStyleHandler::GetRubyWindowStyle().font_weight);
+  EXPECT_EQ(20u,
+            RendererStyleHandler::GetRubyWindowStyle().horizontal_padding);
+  EXPECT_EQ(8u, RendererStyleHandler::GetRubyWindowStyle().vertical_padding);
+  EXPECT_EQ(7u, RendererStyleHandler::GetRubyWindowStyle().composition_gap);
   EXPECT_EQ(95u, RendererStyleHandler::GetCandidateWindowEffectStyle(
                       RendererStyleHandler::RendererStyleType::kCandidate)
                       .opacity_percent);

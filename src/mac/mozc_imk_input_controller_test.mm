@@ -95,6 +95,7 @@
   NSRange expectedRange;
   NSDictionary *expectedAttributes;
   int lastCharacterIndex_;
+  NSRange lastMarkedSelectionRange_;
   std::string selectedMode_;
   NSString *insertedText_;
   NSString *overriddenLayout_;
@@ -108,6 +109,7 @@
 @property(readwrite) NSDictionary *expectedAttributes;
 @property(readwrite, assign) NSRange expectedRange;
 @property(readonly) int lastCharacterIndex;
+@property(readonly) NSRange lastMarkedSelectionRange;
 @property(readonly) std::string selectedMode;
 @property(readonly) NSString *insertedText;
 @property(readonly) NSString *overriddenLayout;
@@ -122,6 +124,7 @@
 @synthesize expectedAttributes;
 @synthesize expectedRange;
 @synthesize lastCharacterIndex = lastCharacterIndex_;
+@synthesize lastMarkedSelectionRange = lastMarkedSelectionRange_;
 @synthesize selectedMode = selectedMode_;
 @synthesize insertedText = insertedText_;
 @synthesize overriddenLayout = overriddenLayout_;
@@ -133,6 +136,7 @@
   self.bundleIdentifier = @"com.google.exampleBundle";
   expectedRange = NSMakeRange(NSNotFound, NSNotFound);
   lastCharacterIndex_ = NSNotFound;
+  lastMarkedSelectionRange_ = NSMakeRange(NSNotFound, NSNotFound);
   textAPIsBeforeSecureTransition_ = -1;
   return self;
 }
@@ -150,6 +154,8 @@
 
 - (NSDictionary *)attributesForCharacterIndex:(int)index lineHeightRectangle:(NSRect *)rect {
   counters_["attributesForCharacterIndex:lineHeightRectangle:"]++;
+  counters_[std::string("attributesForCharacterIndex:") +
+            std::to_string(index)]++;
   lastCharacterIndex_ = index;
   *rect = expectedCursor;
   return expectedAttributes;
@@ -184,6 +190,9 @@
 
 - (NSAttributedString *)attributedSubstringFromRange:(NSRange)range {
   counters_["attributedSubstringFromRange:"]++;
+  counters_[std::string("attributedSubstringFromRange:") +
+            std::to_string(range.location) + ":" +
+            std::to_string(range.length)]++;
   [self maybeTransitionSecureInputAfterTextAPI];
   return [attributedString_ attributedSubstringFromRange:range];
 }
@@ -194,7 +203,7 @@
   }
   --textAPIsBeforeSecureTransition_;
   if (textAPIsBeforeSecureTransition_ == 0) {
-    controllerForSecureTransition_.secureInputOverrideForTest = 1;
+    controllerForSecureTransition_.secureEventInputStateForTest = 1;
   }
 }
 
@@ -203,6 +212,7 @@
        selectionRange:(NSRange)selectionRange
      replacementRange:(NSRange)replacementRange {
   counters_["setMarkedText:selectionRange:replacementRange:"]++;
+  lastMarkedSelectionRange_ = selectionRange;
 }
 
 - (void)insertText:(NSString *)result replacementRange:(NSRange)range {
@@ -221,6 +231,7 @@ namespace {
 
 using ::testing::_;
 using ::testing::DoAll;
+using ::testing::InSequence;
 using ::testing::Invoke;
 using ::testing::Mock;
 using ::testing::NotNull;
@@ -386,7 +397,7 @@ bool ComparePreedit(NSAttributedString *expected, NSAttributedString *actual) {
     // Check attributes for underlines
     NSNumber *expectedUnderlineStyle =
         [expectedAttributes valueForKey:NSUnderlineStyleAttributeName];
-    NSNumber *actualUnderlineStyle = [expectedAttributes valueForKey:NSUnderlineStyleAttributeName];
+    NSNumber *actualUnderlineStyle = [actualAttributes valueForKey:NSUnderlineStyleAttributeName];
     if (![expectedUnderlineStyle isEqualToNumber:actualUnderlineStyle] ||
         actualUnderlineStyle == nil) {
       LOG(ERROR) << "underline style is different at range (" << expectedRange.location << ", "
@@ -482,6 +493,138 @@ TEST_F(MozcImkInputControllerTest, UpdateComposedString) {
       << [[NSString stringWithFormat:@"expected:%@ actual:%@", expected, actual] UTF8String];
 }
 
+TEST_F(MozcImkInputControllerTest, ExplicitConversionPreservesFocusedClauseCursor) {
+  commands::Preedit preedit;
+  preedit.set_cursor(4);
+
+  commands::Preedit::Segment *segment = preedit.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::HIGHLIGHT);
+  segment->set_value("どういう");
+  segment->set_value_length(4);
+
+  segment = preedit.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::UNDERLINE);
+  segment->set_value("こと");
+  segment->set_value_length(2);
+
+  [controller_ updateComposedString:&preedit];
+
+  EXPECT_TRUE(NSEqualRanges(mock_client_.lastMarkedSelectionRange, NSMakeRange(4, 0)));
+  NSDictionary *highlightAttributes =
+      [controller_ markForStyle:kTSMHiliteSelectedConvertedText
+                        atRange:NSMakeRange(NSNotFound, 0)];
+  NSDictionary *underlineAttributes =
+      [controller_ markForStyle:kTSMHiliteConvertedText
+                        atRange:NSMakeRange(NSNotFound, 0)];
+  NSMutableAttributedString *expected =
+      [[NSMutableAttributedString alloc] initWithString:@"どういうこと"];
+  [expected addAttributes:highlightAttributes range:NSMakeRange(0, 4)];
+  [expected addAttributes:underlineAttributes range:NSMakeRange(4, 2)];
+  NSAttributedString *actual = [controller_ composedString:nil];
+  EXPECT_TRUE(ComparePreedit(expected, actual))
+      << [[NSString stringWithFormat:@"expected:%@ actual:%@", expected, actual] UTF8String];
+}
+
+TEST_F(MozcImkInputControllerTest,
+       LiveConversionUsesUnfocusedTextAndUnspecifiedSelection) {
+  commands::Preedit preedit;
+  preedit.set_cursor(4);
+
+  commands::Preedit::Segment *segment = preedit.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::HIGHLIGHT);
+  segment->set_value("どういう");
+  segment->set_value_length(4);
+
+  segment = preedit.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::UNDERLINE);
+  segment->set_value("こと");
+  segment->set_value_length(2);
+
+  [controller_ updateComposedString:&preedit liveConversion:true];
+
+  EXPECT_TRUE(NSEqualRanges(mock_client_.lastMarkedSelectionRange,
+                            NSMakeRange(NSNotFound, 0)));
+  NSAttributedString *actual = [controller_ composedString:nil];
+  EXPECT_EQ([actual length], 6);
+  EXPECT_EQ([[actual attributesAtIndex:0 effectiveRange:nullptr] count], 0);
+  EXPECT_EQ([[actual attributesAtIndex:4 effectiveRange:nullptr] count], 0);
+  EXPECT_EQ([mock_client_ getCounter:"attributesForCharacterIndex:lineHeightRectangle:"], 0);
+}
+
+TEST_F(MozcImkInputControllerTest, ProcessOutputAppliesLiveConversionPresentation) {
+  commands::Output output;
+  output.set_consumed(true);
+  output.set_live_conversion(true);
+  commands::Preedit *preedit = output.mutable_preedit();
+  preedit->set_cursor(1);
+  commands::Preedit::Segment *segment = preedit->add_segment();
+  segment->set_annotation(commands::Preedit::Segment::HIGHLIGHT);
+  segment->set_value("愛");
+  segment->set_value_length(1);
+
+  [controller_ processOutput:&output client:mock_client_];
+
+  EXPECT_TRUE(NSEqualRanges(mock_client_.lastMarkedSelectionRange,
+                            NSMakeRange(NSNotFound, 0)));
+  NSAttributedString *actual = [controller_ composedString:nil];
+  EXPECT_EQ([[actual attributesAtIndex:0 effectiveRange:nullptr] count], 0);
+}
+
+TEST_F(MozcImkInputControllerTest, CompositionConvertsCodePointCursorToUtf16) {
+  commands::Preedit preedit;
+  preedit.set_cursor(1);
+
+  commands::Preedit::Segment *segment = preedit.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::UNDERLINE);
+  segment->set_value("😀あ");
+  segment->set_value_length(2);
+
+  [controller_ updateComposedString:&preedit];
+
+  EXPECT_TRUE(NSEqualRanges(mock_client_.lastMarkedSelectionRange, NSMakeRange(2, 0)));
+}
+
+TEST_F(MozcImkInputControllerTest, LiveConversionUsesDisplayedValueWithoutClauseFocus) {
+  commands::Preedit preedit;
+  preedit.set_cursor(2);
+
+  commands::Preedit::Segment *segment = preedit.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::HIGHLIGHT);
+  segment->set_key("あい");
+  segment->set_value("愛");
+  segment->set_value_length(1);
+
+  [controller_ updateComposedString:&preedit liveConversion:true];
+
+  EXPECT_TRUE(NSEqualRanges(mock_client_.lastMarkedSelectionRange,
+                            NSMakeRange(NSNotFound, 0)));
+  NSAttributedString *actual = [controller_ composedString:nil];
+  EXPECT_TRUE([[actual string] isEqualToString:@"愛"]);
+  EXPECT_EQ([[actual attributesAtIndex:0 effectiveRange:nullptr] count], 0);
+}
+
+TEST_F(MozcImkInputControllerTest, ExplicitCompositionRestoresSpecifiedSelectionAfterLiveConversion) {
+  commands::Preedit live_preedit;
+  live_preedit.set_cursor(1);
+  commands::Preedit::Segment *segment = live_preedit.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::HIGHLIGHT);
+  segment->set_value("愛");
+  segment->set_value_length(1);
+  [controller_ updateComposedString:&live_preedit liveConversion:true];
+  ASSERT_TRUE(NSEqualRanges(mock_client_.lastMarkedSelectionRange,
+                            NSMakeRange(NSNotFound, 0)));
+
+  commands::Preedit composition;
+  composition.set_cursor(1);
+  segment = composition.add_segment();
+  segment->set_annotation(commands::Preedit::Segment::UNDERLINE);
+  segment->set_value("あ");
+  segment->set_value_length(1);
+  [controller_ updateComposedString:&composition];
+
+  EXPECT_TRUE(NSEqualRanges(mock_client_.lastMarkedSelectionRange, NSMakeRange(1, 0)));
+}
+
 TEST_F(MozcImkInputControllerTest, ClearCandidates) {
   [controller_ clearCandidates];
   EXPECT_EQ(mock_renderer_->counter_ExecCommand(), 1);
@@ -550,32 +693,79 @@ TEST_F(MozcImkInputControllerTest, UpdateCandidates) {
 }
 
 TEST_F(MozcImkInputControllerTest,
-       SuppressCandidateWindowWhileLiveConversionEnabledUntilSpace) {
+       SuppressUnfocusedSuggestionOutsideLiveConversionOutput) {
   controller_.useLiveConversionForTest = true;
-  controller_.allowCandidateWindowForLiveConversionForTest = false;
 
   commands::Output output;
-  commands::CandidateWindow *candidate_window = output.mutable_candidate_window();
-  candidate_window->set_focused_index(0);
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_category(commands::SUGGESTION);
   candidate_window->set_size(1);
-  commands::CandidateWindow::Candidate *candidate = candidate_window->add_candidate();
+
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
   candidate->set_index(0);
   candidate->set_value("abc");
 
   [controller_ updateCandidates:&output];
-  [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
 
   EXPECT_EQ(mock_renderer_->counter_ExecCommand(), 1);
   EXPECT_FALSE(controller_.rendererCommand.visible());
 }
 
 TEST_F(MozcImkInputControllerTest,
-       AllowCandidateWindowAfterExplicitSpaceDuringLiveConversion) {
+       PreLiveReadingKeepsRendererVisibleWhileSuggestionIsSuppressed) {
   controller_.useLiveConversionForTest = true;
-  controller_.allowCandidateWindowForLiveConversionForTest = true;
+
+  commands::Output output;
+  output.set_pre_live_conversion_reading(true);
+
+  commands::Preedit *preedit = output.mutable_preedit();
+  preedit->set_cursor(1);
+  commands::Preedit::Segment *segment = preedit->add_segment();
+  segment->set_annotation(commands::Preedit::Segment::UNDERLINE);
+  segment->set_key("あ");
+  segment->set_value("あ");
+  segment->set_value_length(1);
+
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_category(commands::SUGGESTION);
+  candidate_window->set_size(1);
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_value("ありがとう");
+
+  mock_client_.expectedCursor = NSMakeRect(50, 50, 1, 10);
+  mock_client_.expectedAttributes =
+      @{@"IMKBaseline" : [NSValue valueWithPoint:NSMakePoint(50, 718)]};
+
+  [controller_ updateCandidates:&output];
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  const commands::RendererCommand &renderer_command =
+      controller_.rendererCommand;
+  EXPECT_EQ(mock_renderer_->counter_ExecCommand(), 1);
+  EXPECT_TRUE(renderer_command.visible());
+  EXPECT_TRUE(renderer_command.output().pre_live_conversion_reading());
+  EXPECT_FALSE(renderer_command.output().live_conversion());
+  EXPECT_FALSE(renderer_command.output().has_candidate_window());
+  EXPECT_EQ(mock_client_.lastCharacterIndex, 0);
+  EXPECT_TRUE(renderer_command.has_ruby_preedit_rectangle());
+}
+
+TEST_F(MozcImkInputControllerTest,
+       ShowFocusedConversionCandidateWindowWhileLiveConversionEnabled) {
+  controller_.useLiveConversionForTest = true;
 
   commands::Output output;
   commands::CandidateWindow *candidate_window = output.mutable_candidate_window();
+  candidate_window->set_category(commands::CONVERSION);
   candidate_window->set_focused_index(0);
   candidate_window->set_size(1);
   commands::CandidateWindow::Candidate *candidate = candidate_window->add_candidate();
@@ -593,6 +783,93 @@ TEST_F(MozcImkInputControllerTest,
   EXPECT_TRUE(controller_.rendererCommand.visible());
 }
 
+TEST_F(MozcImkInputControllerTest,
+       TabShowsPredictionCandidateWindowDuringLiveConversion) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useLiveConversionForTest = true;
+
+  commands::Output output;
+  output.set_consumed(true);
+
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_category(commands::PREDICTION);
+  candidate_window->set_focused_index(0);
+  candidate_window->set_size(2);
+
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_value("ありがとう");
+
+  candidate = candidate_window->add_candidate();
+  candidate->set_index(1);
+  candidate->set_value("ありがたい");
+
+  mock_client_.expectedCursor = NSMakeRect(50, 50, 1, 10);
+  mock_client_.expectedAttributes =
+      @{@"IMKBaseline" : [NSValue valueWithPoint:NSMakePoint(50, 718)]};
+
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SetArgPointee<2>(output), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  EXPECT_TRUE(controller_.rendererCommand.visible());
+  EXPECT_EQ(controller_.rendererCommand.output().candidate_window().category(),
+            commands::PREDICTION);
+  EXPECT_EQ(
+      controller_.rendererCommand.output().candidate_window().focused_index(),
+      0);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       DownKeepsFocusedPredictionWindowVisibleDuringLiveConversion) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useLiveConversionForTest = true;
+
+  commands::Output output;
+  output.set_consumed(true);
+
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_category(commands::PREDICTION);
+  candidate_window->set_focused_index(1);
+  candidate_window->set_size(2);
+
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_value("abc");
+
+  candidate = candidate_window->add_candidate();
+  candidate->set_index(1);
+  candidate->set_value("def");
+
+  mock_client_.expectedCursor = NSMakeRect(50, 50, 1, 10);
+  mock_client_.expectedAttributes =
+      @{@"IMKBaseline" : [NSValue valueWithPoint:NSMakePoint(50, 718)]};
+
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::DOWN), _, NotNull()))
+      .WillOnce(DoAll(SetArgPointee<2>(output), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_DownArrow, controller_, mock_client_));
+
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  EXPECT_TRUE(controller_.rendererCommand.visible());
+  EXPECT_EQ(
+      controller_.rendererCommand.output().candidate_window().focused_index(),
+      1);
+}
 TEST_F(MozcImkInputControllerTest, UpdateCandidatesForLiveConversionWithoutCandidateWindow) {
   commands::Output output;
   output.set_live_conversion(true);
@@ -625,6 +902,75 @@ TEST_F(MozcImkInputControllerTest, UpdateCandidatesForLiveConversionWithoutCandi
   EXPECT_EQ(preedit_rectangle.top(), 708);
   EXPECT_EQ(preedit_rectangle.right(), 51);
   EXPECT_EQ(preedit_rectangle.bottom(), 718);
+}
+
+TEST_F(
+    MozcImkInputControllerTest,
+    LiveConversionSuggestionUsesCandidateWindowPosition) {
+  commands::Output output;
+  output.set_live_conversion(true);
+
+  commands::Preedit *preedit = output.mutable_preedit();
+  preedit->set_cursor(4);
+
+  commands::Preedit::Segment *segment = preedit->add_segment();
+  segment->set_annotation(commands::Preedit::Segment::HIGHLIGHT);
+  segment->set_key("こうほひょうじ");
+  segment->set_value("候補表示");
+  segment->set_value_length(4);
+
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_category(commands::SUGGESTION);
+  candidate_window->set_position(1);
+  candidate_window->set_size(1);
+
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_value("候補表示");
+
+  mock_client_.expectedCursor = NSMakeRect(50, 50, 1, 10);
+  mock_client_.expectedAttributes =
+      @{@"IMKBaseline" :
+            [NSValue valueWithPoint:NSMakePoint(50, 718)]};
+
+  [controller_ updateCandidates:&output];
+
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  EXPECT_EQ(
+      [mock_client_
+          getCounter:"attributesForCharacterIndex:lineHeightRectangle:"],
+      2);
+  EXPECT_EQ(
+      [mock_client_ getCounter:"attributesForCharacterIndex:1"], 1);
+  EXPECT_EQ(
+      [mock_client_ getCounter:"attributesForCharacterIndex:0"], 1);
+
+  // Candidate geometry is queried at index 1. Ruby geometry is queried
+  // independently at composition index 0.
+  EXPECT_EQ(mock_client_.lastCharacterIndex, 0);
+  EXPECT_EQ(mock_renderer_->counter_ExecCommand(), 1);
+  EXPECT_TRUE(controller_.rendererCommand.visible());
+
+  ASSERT_TRUE(controller_.rendererCommand.has_preedit_rectangle());
+  ASSERT_TRUE(controller_.rendererCommand.has_ruby_preedit_rectangle());
+
+  EXPECT_EQ(controller_.rendererCommand.preedit_rectangle().left(), 50);
+  EXPECT_EQ(controller_.rendererCommand.preedit_rectangle().top(), 708);
+  EXPECT_EQ(controller_.rendererCommand.preedit_rectangle().right(), 51);
+  EXPECT_EQ(controller_.rendererCommand.preedit_rectangle().bottom(), 718);
+
+  EXPECT_EQ(
+      controller_.rendererCommand.ruby_preedit_rectangle().left(), 50);
+  EXPECT_EQ(
+      controller_.rendererCommand.ruby_preedit_rectangle().top(), 708);
+  EXPECT_EQ(
+      controller_.rendererCommand.ruby_preedit_rectangle().right(), 51);
+  EXPECT_EQ(
+      controller_.rendererCommand.ruby_preedit_rectangle().bottom(), 718);
 }
 
 TEST_F(MozcImkInputControllerTest, LiveConversionRecalculatesRendererPosition) {
@@ -660,6 +1006,127 @@ TEST_F(MozcImkInputControllerTest, LiveConversionRecalculatesRendererPosition) {
   EXPECT_TRUE(controller_.rendererCommand.visible());
   EXPECT_EQ(controller_.rendererCommand.preedit_rectangle().left(), 50);
   EXPECT_EQ(controller_.rendererCommand.preedit_rectangle().right(), 51);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       VerticalWritingDirectionPropagatesToRendererAndKeyContext) {
+  controller_.mode = commands::HIRAGANA;
+
+  commands::Output output;
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_focused_index(0);
+  candidate_window->set_size(1);
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_value("候補");
+
+  mock_client_.expectedCursor = NSMakeRect(50, 50, 10, 1);
+  mock_client_.expectedAttributes = @{
+    @"IMKBaseline" : [NSValue valueWithPoint:NSMakePoint(60, 718)],
+    IMKTextOrientationName : @(NO),
+  };
+
+  [controller_ updateCandidates:&output];
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  const commands::RendererCommand &renderer_command =
+      controller_.rendererCommand;
+  ASSERT_TRUE(renderer_command.has_application_info());
+  ASSERT_TRUE(
+      renderer_command.application_info().has_composition_target());
+  ASSERT_TRUE(renderer_command.application_info()
+                  .composition_target()
+                  .has_vertical_writing());
+  EXPECT_TRUE(renderer_command.application_info()
+                  .composition_target()
+                  .vertical_writing());
+
+  commands::Output send_output;
+  send_output.set_consumed(true);
+  commands::Context send_context;
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::LEFT), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&send_context),
+                      SetArgPointee<2>(send_output), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_LeftArrow, controller_, mock_client_));
+  EXPECT_TRUE(send_context.vertical_writing());
+
+  [controller_ updateComposedString:nullptr];
+  EXPECT_FALSE(renderer_command.application_info()
+                   .composition_target()
+                   .has_vertical_writing());
+}
+
+TEST_F(MozcImkInputControllerTest,
+       HorizontalWritingDirectionOverridesGeometryHeuristic) {
+  commands::Output output;
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_focused_index(0);
+  candidate_window->set_size(1);
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_value("候補");
+
+  // Deliberately use a geometry shape that the historical heuristic would
+  // interpret as vertical.  Explicit IMK orientation must win.
+  mock_client_.expectedCursor = NSMakeRect(50, 50, 10, 1);
+  mock_client_.expectedAttributes = @{
+    @"IMKBaseline" : [NSValue valueWithPoint:NSMakePoint(60, 718)],
+    IMKTextOrientationName : @(YES),
+  };
+
+  [controller_ updateCandidates:&output];
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  const commands::RendererCommand &renderer_command =
+      controller_.rendererCommand;
+  ASSERT_TRUE(renderer_command.has_application_info());
+  ASSERT_TRUE(
+      renderer_command.application_info().has_composition_target());
+  ASSERT_TRUE(renderer_command.application_info()
+                  .composition_target()
+                  .has_vertical_writing());
+  EXPECT_FALSE(renderer_command.application_info()
+                   .composition_target()
+                   .vertical_writing());
+}
+
+TEST_F(MozcImkInputControllerTest,
+       MissingWritingDirectionKeepsRendererOrientationUnknown) {
+  commands::Output output;
+  commands::CandidateWindow *candidate_window =
+      output.mutable_candidate_window();
+  candidate_window->set_focused_index(0);
+  candidate_window->set_size(1);
+  commands::CandidateWindow::Candidate *candidate =
+      candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_value("候補");
+
+  mock_client_.expectedCursor = NSMakeRect(50, 50, 1, 10);
+  mock_client_.expectedAttributes =
+      @{@"IMKBaseline" : [NSValue valueWithPoint:NSMakePoint(50, 718)]};
+
+  [controller_ updateCandidates:&output];
+  [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+
+  const commands::RendererCommand &renderer_command =
+      controller_.rendererCommand;
+  ASSERT_TRUE(renderer_command.has_application_info());
+  if (renderer_command.application_info().has_composition_target()) {
+    EXPECT_FALSE(renderer_command.application_info()
+                     .composition_target()
+                     .has_vertical_writing());
+  }
 }
 
 TEST_F(MozcImkInputControllerTest, OpenLink) {
@@ -763,12 +1230,16 @@ TEST_F(MozcImkInputControllerTest, handleConfig) {
   config.set_preedit_method(config::Config::KANA);
   config.set_yen_sign_character(config::Config::BACKSLASH);
   config.set_use_japanese_layout(true);
+  config.set_use_live_conversion(true);
+  config.set_use_zenz_live_correction(true);
   EXPECT_CALL(*mock_mozc_client_, GetConfig(NotNull()))
       .WillOnce(DoAll(SetArgPointee<0>(config), Return(true)));
 
   [controller_ handleConfig];
   EXPECT_EQ(controller_.keyCodeMap.inputMode, KANA);
   EXPECT_EQ(controller_.yenSignCharacter, config::Config::BACKSLASH);
+  EXPECT_TRUE(controller_.useLiveConversionForTest);
+  EXPECT_TRUE(controller_.useZenzContextAcquisitionForTest);
   EXPECT_EQ([mock_client_ getCounter:"overrideKeyboardWithKeyboardNamed:"], 1);
   EXPECT_TRUE([@"com.apple.keylayout.US" isEqualToString:mock_client_.overriddenLayout])
       << [mock_client_.overriddenLayout UTF8String];
@@ -952,6 +1423,322 @@ TEST_F(MozcImkInputControllerTest, DoubleTapEisuCommitRawText) {
   EXPECT_EQ(SendKeyEvent(kVK_JIS_Eisu, controller_, mock_client_), YES);
 }
 
+TEST_F(MozcImkInputControllerTest,
+       ZenzContextPreflightAttachesRequestedDirectionalContext) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useZenzContextAcquisitionForTest = true;
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:@"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"]];
+  mock_client_.expectedRange = NSMakeRange(30, 0);
+
+  commands::Output testOutput;
+  testOutput.set_zenz_preceding_text_request_length(24);
+  testOutput.set_zenz_following_text_request_length(3);
+  commands::Output sendOutput;
+  sendOutput.set_consumed(true);
+  commands::Context testContext;
+  commands::Context sendContext;
+
+  {
+    InSequence sequence;
+    EXPECT_CALL(*mock_mozc_client_,
+                TestSendKeyWithContext(
+                    HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+        .WillOnce(DoAll(SaveArg<1>(&testContext),
+                        SetArgPointee<2>(testOutput), Return(true)));
+    EXPECT_CALL(*mock_mozc_client_,
+                SendKeyWithContext(
+                    HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+        .WillOnce(DoAll(SaveArg<1>(&sendContext),
+                        SetArgPointee<2>(sendOutput), Return(true)));
+  }
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+  EXPECT_EQ(testContext.preceding_text(), "ABCDEFGHIJKLMNOPQRST");
+  EXPECT_FALSE(testContext.has_zenz_preceding_text());
+  EXPECT_FALSE(testContext.has_zenz_following_text());
+
+  EXPECT_EQ(sendContext.preceding_text(), "ABCDEFGHIJKLMNOPQRST");
+  EXPECT_EQ(sendContext.zenz_preceding_text(),
+            "6789ABCDEFGHIJKLMNOPQRST");
+  EXPECT_EQ(sendContext.zenz_following_text(), "UVW");
+  // The Grimodex client context also carries bounded following text, so the
+  // generic acquisition reads both sides of the caret before the Zenz reads.
+  EXPECT_EQ(sendContext.following_text(), "UVWXYZabcdefghijklmn");
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:"], 4);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:10:20"], 1);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:30:20"], 1);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:0:30"], 1);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:30:7"], 1);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       ZenzContextPreflightDoesNotReadZeroRequestDirection) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useZenzContextAcquisitionForTest = true;
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:@"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"]];
+  mock_client_.expectedRange = NSMakeRange(20, 0);
+
+  commands::Output testOutput;
+  testOutput.set_zenz_following_text_request_length(3);
+  commands::Output sendOutput;
+  sendOutput.set_consumed(true);
+  commands::Context sendContext;
+
+  EXPECT_CALL(*mock_mozc_client_,
+              TestSendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SetArgPointee<2>(testOutput), Return(true)));
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&sendContext),
+                      SetArgPointee<2>(sendOutput), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+  EXPECT_FALSE(sendContext.has_zenz_preceding_text());
+  EXPECT_EQ(sendContext.zenz_following_text(), "KLM");
+  // Generic preceding (0:20) and following (20:16) reads, then the Zenz read.
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:"], 3);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:0:20"], 1);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:20:16"], 1);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:20:7"], 1);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       ZenzContextPreflightFailureFallsBackToGenericSend) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useZenzContextAcquisitionForTest = true;
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:@"abcdefghij"]];
+  mock_client_.expectedRange = NSMakeRange(5, 0);
+
+  commands::Output sendOutput;
+  sendOutput.set_consumed(true);
+  commands::Context sendContext;
+
+  EXPECT_CALL(*mock_mozc_client_,
+              TestSendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&sendContext),
+                      SetArgPointee<2>(sendOutput), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+  EXPECT_EQ(sendContext.preceding_text(), "abcde");
+  EXPECT_EQ(sendContext.following_text(), "fghij");
+  EXPECT_FALSE(sendContext.has_zenz_preceding_text());
+  EXPECT_FALSE(sendContext.has_zenz_following_text());
+  // Generic preceding and following reads only.
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:"], 2);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       LongDocumentStillAcquiresBoundedZenzContext) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useZenzContextAcquisitionForTest = true;
+  controller_.secureEventInputStateForTest = 0;
+
+  NSMutableString *document =
+      [NSMutableString stringWithCapacity:1200];
+  for (int i = 0; i < 1100; ++i) {
+    [document appendString:@"L"];
+  }
+  for (int i = 0; i < 100; ++i) {
+    [document appendString:@"R"];
+  }
+
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:document]];
+  mock_client_.expectedRange = NSMakeRange(1100, 0);
+
+  commands::Output testOutput;
+  testOutput.set_zenz_preceding_text_request_length(4);
+  testOutput.set_zenz_following_text_request_length(5);
+
+  commands::Output sendOutput;
+  sendOutput.set_consumed(true);
+  commands::Context testContext;
+  commands::Context sendContext;
+
+  EXPECT_CALL(*mock_mozc_client_,
+              TestSendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&testContext),
+                      SetArgPointee<2>(testOutput), Return(true)));
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&sendContext),
+                      SetArgPointee<2>(sendOutput), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+
+  EXPECT_FALSE(testContext.has_preceding_text());
+  EXPECT_FALSE(sendContext.has_preceding_text());
+
+  EXPECT_EQ(sendContext.zenz_preceding_text(), "LLLL");
+  EXPECT_EQ(sendContext.zenz_following_text(), "RRRRR");
+
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:"], 2);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:1091:9"], 1);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:1100:11"], 1);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       SecureEventInputSuppressesAllSurroundingContext) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useZenzContextAcquisitionForTest = true;
+  controller_.secureEventInputStateForTest = 1;
+
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:@"secret-neighboring-application-text"]];
+  mock_client_.expectedRange = NSMakeRange(10, 0);
+
+  commands::Output sendOutput;
+  sendOutput.set_consumed(true);
+  commands::Context sendContext;
+
+  EXPECT_CALL(*mock_mozc_client_, TestSendKeyWithContext(_, _, _)).Times(0);
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&sendContext),
+                      SetArgPointee<2>(sendOutput), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+
+  ASSERT_TRUE(sendContext.has_input_field_type());
+  EXPECT_EQ(sendContext.input_field_type(), commands::Context::PASSWORD);
+  EXPECT_FALSE(sendContext.has_preceding_text());
+  EXPECT_FALSE(sendContext.has_following_text());
+  EXPECT_FALSE(sendContext.has_zenz_preceding_text());
+  EXPECT_FALSE(sendContext.has_zenz_following_text());
+
+  EXPECT_EQ([mock_client_ getCounter:"selectedRange"], 0);
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:"], 0);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       NonSecureOverridePreservesZenzContextPreflight) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useZenzContextAcquisitionForTest = true;
+  controller_.secureEventInputStateForTest = 0;
+
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:@"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"]];
+  mock_client_.expectedRange = NSMakeRange(20, 0);
+
+  commands::Output testOutput;
+  testOutput.set_zenz_following_text_request_length(3);
+  commands::Output sendOutput;
+  sendOutput.set_consumed(true);
+  commands::Context sendContext;
+
+  EXPECT_CALL(*mock_mozc_client_,
+              TestSendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SetArgPointee<2>(testOutput), Return(true)));
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&sendContext),
+                      SetArgPointee<2>(sendOutput), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+
+  EXPECT_FALSE(sendContext.has_input_field_type());
+  EXPECT_EQ(sendContext.preceding_text(), "0123456789ABCDEFGHIJ");
+  EXPECT_EQ(sendContext.zenz_following_text(), "KLM");
+}
+
+TEST_F(MozcImkInputControllerTest,
+       ZenzContextPreflightIsSkippedWhenFeatureGateIsDisabled) {
+  controller_.mode = commands::HIRAGANA;
+  controller_.useZenzContextAcquisitionForTest = false;
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:@"abcdefghij"]];
+  mock_client_.expectedRange = NSMakeRange(5, 0);
+
+  commands::Output sendOutput;
+  sendOutput.set_consumed(true);
+  commands::Context sendContext;
+
+  EXPECT_CALL(*mock_mozc_client_, TestSendKeyWithContext(_, _, _)).Times(0);
+  EXPECT_CALL(*mock_mozc_client_,
+              SendKeyWithContext(
+                  HasSpecialKey(commands::KeyEvent::TAB), _, NotNull()))
+      .WillOnce(DoAll(SaveArg<1>(&sendContext),
+                      SetArgPointee<2>(sendOutput), Return(true)));
+
+  EXPECT_TRUE(SendKeyEvent(kVK_Tab, controller_, mock_client_));
+  EXPECT_EQ(sendContext.preceding_text(), "abcde");
+  EXPECT_EQ(sendContext.following_text(), "fghij");
+  EXPECT_FALSE(sendContext.has_zenz_preceding_text());
+  EXPECT_FALSE(sendContext.has_zenz_following_text());
+  // Generic preceding and following reads only.
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:"], 2);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       ZenzContextPrecedingReadDropsLeadingLowSurrogate) {
+  const unichar characters[] = {'A', 0xD83D, 0xDE00, 'B', 'C'};
+  NSString *nativeText = [NSString stringWithCharacters:characters length:5];
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:nativeText]];
+  mock_client_.expectedRange = NSMakeRange(5, 0);
+
+  commands::Context context;
+  EXPECT_TRUE([controller_ fillZenzSurroundingContext:&context
+                                               client:(id)mock_client_
+                                      precedingLength:1
+                                      followingLength:0]);
+
+  ASSERT_TRUE(context.has_zenz_preceding_text());
+  EXPECT_EQ(context.zenz_preceding_text(), "C");
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:2:3"], 1);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       ZenzContextFollowingReadDropsTrailingHighSurrogate) {
+  const unichar characters[] = {'A', 'B', 0xD83D, 0xDE00, 'C'};
+  NSString *nativeText = [NSString stringWithCharacters:characters length:5];
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:nativeText]];
+  mock_client_.expectedRange = NSMakeRange(0, 0);
+
+  commands::Context context;
+  EXPECT_TRUE([controller_ fillZenzSurroundingContext:&context
+                                               client:(id)mock_client_
+                                      precedingLength:0
+                                      followingLength:1]);
+
+  ASSERT_TRUE(context.has_zenz_following_text());
+  EXPECT_EQ(context.zenz_following_text(), "A");
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:0:3"], 1);
+}
+
+TEST_F(MozcImkInputControllerTest,
+       ZenzContextBoundarySetsExplicitEmptyWithoutNativeRead) {
+  [mock_client_ setAttributedString:[[NSAttributedString alloc]
+      initWithString:@"abcde"]];
+  mock_client_.expectedRange = NSMakeRange(0, 0);
+
+  commands::Context context;
+  EXPECT_TRUE([controller_ fillZenzSurroundingContext:&context
+                                               client:(id)mock_client_
+                                      precedingLength:4
+                                      followingLength:0]);
+  EXPECT_TRUE(context.has_zenz_preceding_text());
+  EXPECT_TRUE(context.zenz_preceding_text().empty());
+  EXPECT_FALSE(context.has_zenz_following_text());
+  EXPECT_EQ([mock_client_ getCounter:"attributedSubstringFromRange:"], 0);
+}
+
 TEST_F(MozcImkInputControllerTest, fillSurroundingContext) {
   [mock_client_ setAttributedString:[[NSAttributedString alloc] initWithString:@"abcde"]];
   mock_client_.expectedRange = NSMakeRange(2, 1);
@@ -996,7 +1783,7 @@ TEST_F(MozcImkInputControllerTest, fillSurroundingContext) {
 
 TEST_F(MozcImkInputControllerTest, GrimodexContextUsesExactBundleIdentity) {
   ResetClientBundleIdentifier(@"com.miyakey.grimodex");
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
 
   const commands::Context context =
       [controller_ buildClientContextForClient:(id)mock_client_
@@ -1010,7 +1797,7 @@ TEST_F(MozcImkInputControllerTest, GrimodexContextUsesExactBundleIdentity) {
 
 TEST_F(MozcImkInputControllerTest, GrimodexContextClearsUnknownBundleIdentity) {
   ResetClientBundleIdentifier(nil);
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
 
   const commands::Context context =
       [controller_ buildClientContextForClient:(id)mock_client_
@@ -1021,7 +1808,7 @@ TEST_F(MozcImkInputControllerTest, GrimodexContextClearsUnknownBundleIdentity) {
 }
 
 TEST_F(MozcImkInputControllerTest, GrimodexEpochTracksBundleAndSecurityDomain) {
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
   [controller_ buildClientContextForClient:(id)mock_client_
                     includeSurroundingText:NO];
   const uint64_t initialEpoch = controller_.grimodexFocusEpochForTest;
@@ -1035,7 +1822,7 @@ TEST_F(MozcImkInputControllerTest, GrimodexEpochTracksBundleAndSecurityDomain) {
   const uint64_t bundleEpoch = controller_.grimodexFocusEpochForTest;
   EXPECT_NE(bundleEpoch, initialEpoch);
 
-  controller_.secureInputOverrideForTest = 1;
+  controller_.secureEventInputStateForTest = 1;
   const commands::Context secureContext =
       [controller_ buildClientContextForClient:(id)mock_client_
                         includeSurroundingText:NO];
@@ -1047,7 +1834,7 @@ TEST_F(MozcImkInputControllerTest, GrimodexEpochTracksBundleAndSecurityDomain) {
                     includeSurroundingText:NO];
   EXPECT_EQ(controller_.grimodexFocusEpochForTest, secureEpoch);
 
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
   [controller_ buildClientContextForClient:(id)mock_client_
                     includeSurroundingText:NO];
   EXPECT_NE(controller_.grimodexFocusEpochForTest, secureEpoch);
@@ -1057,7 +1844,7 @@ TEST_F(MozcImkInputControllerTest, SecureContextNeverQueriesClientText) {
   [mock_client_ setAttributedString:
                     [[NSAttributedString alloc] initWithString:@"private"]];
   mock_client_.expectedRange = NSMakeRange(3, 0);
-  controller_.secureInputOverrideForTest = 1;
+  controller_.secureEventInputStateForTest = 1;
   const int lengthCalls = [mock_client_ getCounter:"length"];
   const int selectedRangeCalls = [mock_client_ getCounter:"selectedRange"];
   const int substringCalls =
@@ -1082,7 +1869,7 @@ TEST_F(MozcImkInputControllerTest, GrimodexContextCarriesBoundedSurroundingText)
   [mock_client_ setAttributedString:
                     [[NSAttributedString alloc] initWithString:@"abcdefghij"]];
   mock_client_.expectedRange = NSMakeRange(3, 2);
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
 
   const commands::Context context =
       [controller_ buildClientContextForClient:(id)mock_client_
@@ -1096,7 +1883,7 @@ TEST_F(MozcImkInputControllerTest,
   [mock_client_ setAttributedString:
                     [[NSAttributedString alloc] initWithString:@"abcdefghij"]];
   mock_client_.expectedRange = NSMakeRange(5, 0);
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
   const uint64_t initialEpoch = controller_.grimodexFocusEpochForTest;
   // length, selectedRange, then attributedSubstringFromRange:.  Secure Event
   // Input becomes active while the fetched substring is being returned.
@@ -1117,7 +1904,7 @@ TEST_F(MozcImkInputControllerTest,
 
 TEST_F(MozcImkInputControllerTest,
        SynchronousOutputIsDiscardedWhenSendingEpochBecomesStale) {
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
   commands::SessionCommand command;
   command.set_type(commands::SessionCommand::SELECT_CANDIDATE);
   const int insertCalls =
@@ -1129,7 +1916,7 @@ TEST_F(MozcImkInputControllerTest,
             output->set_consumed(true);
             output->mutable_result()->set_type(commands::Result::STRING);
             output->mutable_result()->set_value("must-not-commit");
-            controller_.secureInputOverrideForTest = 1;
+            controller_.secureEventInputStateForTest = 1;
             return true;
           }));
 
@@ -1140,7 +1927,7 @@ TEST_F(MozcImkInputControllerTest,
 }
 
 TEST_F(MozcImkInputControllerTest, DelayedCallbackIsDiscardedAfterDomainChange) {
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
   [controller_ buildClientContextForClient:(id)mock_client_
                     includeSurroundingText:NO];
   commands::Output output;
@@ -1152,14 +1939,14 @@ TEST_F(MozcImkInputControllerTest, DelayedCallbackIsDiscardedAfterDomainChange) 
       .Times(0);
 
   [controller_ processOutput:&output client:mock_client_];
-  controller_.secureInputOverrideForTest = 1;
+  controller_.secureEventInputStateForTest = 1;
   [[NSRunLoop currentRunLoop]
       runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
 }
 
 TEST_F(MozcImkInputControllerTest,
        DeactivationRevokesEpochAndCancelsDelayedCallback) {
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
   const uint64_t activeEpoch = controller_.grimodexFocusEpochForTest;
   commands::Output output;
   output.set_consumed(true);
@@ -1178,7 +1965,7 @@ TEST_F(MozcImkInputControllerTest,
 
 TEST_F(MozcImkInputControllerTest,
        SecureTransitionDuringPreeditPositioningDropsHostMutation) {
-  controller_.secureInputOverrideForTest = 0;
+  controller_.secureEventInputStateForTest = 0;
   commands::Preedit preedit;
   preedit.set_cursor(0);
   commands::Preedit::Segment *segment = preedit.add_segment();
@@ -1259,7 +2046,7 @@ TEST_F(MozcImkInputControllerTest,
   ShowCandidateWindow();
   ASSERT_TRUE(controller_.rendererCommand.application_info()
                   .has_renderer_callback_token());
-  controller_.secureInputOverrideForTest = 1;
+  controller_.secureEventInputStateForTest = 1;
   [controller_ buildClientContextForClient:(id)mock_client_
                     includeSurroundingText:NO];
   EXPECT_FALSE(controller_.rendererCommand.application_info()

@@ -158,6 +158,117 @@ class ProductIdentityContractTest(unittest.TestCase):
             (launch_agents / "org.mozc.inputmethod.Japanese.Converter.plist").exists()
         )
 
+    def test_macos_installer_lifecycle_scripts_only_name_the_fork(self) -> None:
+        # Upstream v1.0.0 added a preinstall/postinstall lifecycle that names
+        # /Library/Input Methods/Mozc.app and org.mozc.*.  The fork's copies
+        # must gate on, verify and signal Mozkey IbG only.
+        scripts = {
+            path: read(path)
+            for path in (
+                "src/mac/preflight_mozkey_release.sh",
+                "src/mac/preflight_mozkey_stage1.sh",
+                "src/mac/postflight_mozkey_oss_cleanup.sh",
+                "src/mac/postflight_mozkey_oss_filter.py",
+                "src/mac/installer/preflight_template.sh",
+                "src/mac/installer/postflight_template.sh",
+            )
+        }
+        for path, text in scripts.items():
+            for upstream_identifier in (
+                "org.mozc.",
+                "/Mozc.app",
+                "/Applications/Mozc",
+                "UninstallMozc",
+                "killall Mozc",
+                "MozcConverter",
+                "MozcRenderer",
+                "killall mozc_zenz_scorer",
+            ):
+                self.assertNotIn(upstream_identifier, text, path)
+
+        preflight = scripts["src/mac/preflight_mozkey_release.sh"]
+        for required in (
+            "_mozkey_pkg_id='io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput'",
+            "_mozkey_bundle_id='io.github.kazormia296.mozkey-ibg.inputmethod.Japanese'",
+            "_mozkey_app='/Library/Input Methods/MozkeyIbG.app'",
+            "_mozkey_uninstaller='/Applications/MozkeyIbG/UninstallMozkeyIbG.app'",
+        ):
+            self.assertIn(required, preflight)
+        self.assertIn(
+            "_mozkey_app='/Library/Input Methods/MozkeyIbG.app'",
+            scripts["src/mac/postflight_mozkey_oss_cleanup.sh"],
+        )
+        self.assertIn(
+            "MOZKEY_IBG_INSTALLER_SCRIPT_IDENTITY_GUARD",
+            read("src/mac/BUILD.bazel"),
+        )
+        self.assertIn(
+            "--define=MOZKEY_INSTALLABLE=1",
+            read(".github/workflows/macos.yaml"),
+        )
+
+    def test_upstream_v1_runtime_surfaces_are_fork_specific(self) -> None:
+        custom_action = read("src/win32/custom_action/custom_action.cc")
+        self.assertNotIn('L"Mozc Offline - ', custom_action)
+        for program in (
+            "mozc_server",
+            "mozc_tool",
+            "mozc_renderer",
+            "mozc_broker",
+            "mozc_cache_service",
+            "mozc_zenz_scorer",
+            "llama-server",
+        ):
+            self.assertIn(
+                f'L"Mozkey IbG Offline - Block {program} outbound"',
+                custom_action,
+            )
+
+        # macOS scorer endpoint (socket and lock directory).
+        socket_path = read("src/zenz/zenz_unix_socket_path.cc")
+        self.assertIn('"/tmp/mozkey-ibg_zenz_"', socket_path)
+        self.assertNotIn('"/tmp/mozc_zenz_"', socket_path)
+
+        # TSF display attribute GUIDs added by upstream v1.0.0.
+        display_attributes = read(
+            "src/win32/tip/tip_display_attributes.cc"
+        ).lower()
+        for upstream_guid in (
+            "ba4e3a96-8078-41fa-a1bb-72a64c3ed494",
+            "519662d0-bef1-459d-bd03-b02f1ef8fd88",
+            "84ca1e7e-3020-4d1c-8968-dda372d1e067",
+            "8a4028e5-2dcd-4365-a5dc-71f67e797437",
+        ):
+            self.assertNotIn(upstream_guid, display_attributes)
+            self.assertNotIn(
+                "0x" + upstream_guid.split("-")[0] + ",", display_attributes
+            )
+
+        # Renderer window class, callback message and per-user registry state.
+        self.assertIn(
+            'L"MozkeyIbGConversionStatusWindow"',
+            read("src/renderer/win32/conversion_status_window.h"),
+        )
+        self.assertIn(
+            'L"mozkeyibg.renderer.submit.message"', read("src/base/const.h")
+        )
+        config_dialog = read("src/gui/config_dialog/config_dialog.cc")
+        self.assertNotIn("Software\\\\Mozkey\\\\", config_dialog)
+        self.assertNotIn("koyasi777/mozkey", read("src/gui/about_dialog/about_dialog.cc"))
+
+        for verifier in (
+            "tools/release/verify_source_contract.py",
+            "tools/release/Verify-WindowsMsiCandidate.ps1",
+            ".github/scripts/windows_zenz_arm64_installer_lifecycle_audit.ps1",
+        ):
+            text = read(verifier)
+            self.assertIn("422E6070-C76C-4F9B-96BE-FD9569E4B762", text, verifier)
+            self.assertNotIn("Mozc Offline - ", text, verifier)
+        self.assertNotIn(
+            "'DD94B570-B5E2-4100-9D42-61930C611D8A')",
+            read("tools/release/Verify-WindowsMsiCandidate.ps1"),
+        )
+
     def test_release_asset_names_use_the_fork_identity(self) -> None:
         windows = read(".github/workflows/windows.yaml")
         macos = read(".github/workflows/macos.yaml")

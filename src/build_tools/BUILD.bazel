@@ -84,6 +84,13 @@ mozc_py_binary(
     srcs = ["mozc_version.py"],
 )
 
+py_test(
+    name = "mozc_version_mozkey_test",
+    size = "small",
+    srcs = ["mozc_version_mozkey_test.py"],
+    deps = [":mozc_version_lib"],
+)
+
 # TODO(noriyukit): Stop using //testing/pybase to support tests on iOS.
 py_test(
     name = "mozc_version_test",

@@ -29,6 +29,7 @@
 
 #include "gui/config_dialog/keymap_editor.h"
 
+#include <QCoreApplication>
 #include <QFile>
 #include <QFileDialog>
 #include <QMenu>
@@ -54,6 +55,7 @@
 #include "base/config_file_stream.h"
 #include "base/util.h"
 #include "base/vlog.h"
+#include "composer/key_event_util.h"
 #include "composer/key_parser.h"
 #include "gui/base/table_util.h"
 #include "gui/base/util.h"
@@ -80,7 +82,8 @@ constexpr config::Config::SessionKeymap kKeyMaps[] = {
 
 constexpr absl::string_view kKeyMapStatus[] = {
     "DirectInput", "Precomposition", "Composition",
-    "Conversion",  "Suggestion",     "Prediction",
+    "Conversion", "LiveConversion", "ZenzConversion", "Suggestion",
+    "Prediction",
 };
 
 constexpr char kInsertCharacterCommand[] = "InsertCharacter";
@@ -126,8 +129,14 @@ QString DisplayCommandSequenceForEditor(
   for (const std::string& raw_command :
        SplitCommandSequenceForEditor(command_sequence)) {
     const auto it = localized_command_map.find(raw_command);
-    display_commands << QString::fromStdString(
-        it != localized_command_map.end() ? it->second : raw_command);
+    if (raw_command.starts_with("Delay(") && raw_command.ends_with(")")) {
+      display_commands << QCoreApplication::translate(
+          "mozc::gui::KeyMapEditorDialog", "Delay %1 ms").arg(
+          QString::fromStdString(raw_command.substr(6, raw_command.size() - 7)));
+    } else {
+      display_commands << QString::fromStdString(
+          it != localized_command_map.end() ? it->second : raw_command);
+    }
   }
 
   return display_commands.join(QString::fromUtf8(" → "));
@@ -280,6 +289,7 @@ class KeyMapTableLoader {
     for (const std::string &command : commands) {
       commands_ << QString::fromStdString(command);
     }
+    commands_ << QStringLiteral("Delay");
 
     for (const absl::string_view status : kKeyMapStatus) {
       status_ << QString::fromUtf8(status.data(), status.size());
@@ -469,6 +479,14 @@ bool KeyMapEditorDialog::Update() {
 
   absl::flat_hash_set<std::string> new_direct_mode_commands;
 
+  struct ValidatedBinding {
+    std::string status;
+    std::string key;
+    std::string command;
+    commands::KeyEvent key_event;
+  };
+  std::vector<ValidatedBinding> validated_bindings;
+
   std::string *keymap_table = mutable_table();
 
   *keymap_table = "status\tkey\tcommand\n";
@@ -516,6 +534,42 @@ bool KeyMapEditorDialog::Update() {
                .arg(QString::fromUtf8(key.data(), key.size()))));
       return false;
     }
+
+    commands::KeyEvent parsed_key_event;
+    if (!KeyParser::ParseKey(key, &parsed_key_event)) {
+      QMessageBox::warning(
+          this, windowTitle(),
+          (tr("Invalid key:\n%1")
+               .arg(QString::fromUtf8(key.data(), key.size()))));
+      return false;
+    }
+
+    for (const ValidatedBinding &existing : validated_bindings) {
+      if (existing.status != status || existing.command == command) {
+        continue;
+      }
+      if (!KeyEventUtil::KeyBindingPatternsOverlap(existing.key_event,
+                                                   parsed_key_event)) {
+        continue;
+      }
+
+      QMessageBox::warning(
+          this, windowTitle(),
+          tr("Conflicting key assignments:\n"
+             "%1 -> %2\n"
+             "%3 -> %4\n\n"
+             "These assignments can match the same physical key input. "
+             "Choose non-overlapping left/right conditions.")
+              .arg(QString::fromStdString(existing.key))
+              .arg(QString::fromStdString(existing.command))
+              .arg(QString::fromStdString(key))
+              .arg(QString::fromStdString(command)));
+      return false;
+    }
+
+    validated_bindings.push_back(
+        ValidatedBinding{status, key, command, parsed_key_event});
+
     absl::StrAppend(keymap_table, status, "\t", key, "\t", command, "\n");
 
     if (status == kDirectMode) {

@@ -9,13 +9,15 @@ This product includes third-party software and model files.
 - Original model file: ggml-model-Q5_K_M.gguf
 - Windows included file: models/zenz-v3.2-small-Q5_K_M.gguf
 - Linux included file: /usr/lib/mozkey-ibg/models/zenz-v3.2-small-Q5_K_M.gguf
-- macOS included file: MozkeyIbGConverter.app/Contents/Resources/models/zenz-v3.2-small-Q5_K_M.gguf
+- macOS included file: MozkeyIbG.app/Contents/Resources/ZenzRuntime/models/zenz-v3.2-small-Q5_K_M.gguf
+  (unmodified source file; see the macOS notices in
+  `src/mac/installer/zenz_runtime/licenses/THIRD_PARTY_NOTICES.md`)
 - License: Apache License 2.0
 - Source repository URL: https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf
 - Source file URL: https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf/blob/c67e03e07d215c869f591b274c1631170d3e11fe/ggml-model-Q5_K_M.gguf
-- Source commit: c67e03e07d215c869f591b274c1631170d3e11fe
+- Source commit observed for the model upload: c67e03e07d215c869f591b274c1631170d3e11fe
 - Source SHA-256: 29c223d4c23327b80fd13ebb5ab2555057a46317997d5da391584ffbef0db673
-- Windows, Linux, and macOS modification notice (2026-07-17): Mozkey deterministically changes
+- Windows and Linux modification notice (2026-07-17): Mozkey deterministically changes
   only `tokenizer.ggml.pre`, `tokenizer.ggml.bos_token_id`,
   `tokenizer.ggml.eos_token_id`, and `tokenizer.ggml.unknown_token_id` so the
   fixed model loads in unmodified upstream llama.cpp. Tensor descriptors and
@@ -47,15 +49,13 @@ This product includes third-party software and model files.
   distribution-provided `llama-server`. Debian and RPM packages bundle a
   static CPU-only `llama-server` built from the same pinned b9637 archive and
   install the llama.cpp, cpp-httplib, and nlohmann/json MIT notices.
-- macOS runtime: `llama-server` is built from the official llama.cpp `b9637`
-  source archive, pinned by SHA-256
-  `762283319feb3de30886dc850d42f0e426b06600e7f9639d34e06506597309ca`.
-  The package contains an arm64-only static CPU/Accelerate build with deployment
-  target 12.0. Metal, CURL, RPC, dynamic backends, multimodal video, tests,
-  examples, the unified app, and the Web UI are disabled. The tools subtree is
-  configured because b9637 defines `llama-server` there, but only the
-  `llama-server` target is built and staged; no other llama.cpp tool binaries
-  are packaged.
+- macOS runtime: since the sync to upstream Mozkey v1.0.0 the macOS package
+  uses upstream Mozkey's Universal (arm64 and x86_64) `llama-server`, built by
+  `src/mac/installer/zenz_runtime/build_universal_runtime.zsh` from llama.cpp
+  `v0.7.0` (commit `620d2225cc436ab0b001e3200e590e3b286ef9ab`) with the tracked
+  tokenizer and dual-liveness patches, deployment target 12.0. It loads the
+  unmodified source GGUF. Its notices are packaged from
+  `src/mac/installer/zenz_runtime/licenses/`.
 - Notes: Used as local inference runtime components for the bundled Zenz GGUF model.
 
 ## cpp-httplib
@@ -79,6 +79,27 @@ This product includes third-party software and model files.
 - License file SHA-256:
   `c0d068392ea65358b798b8c165103560f06e9e3b38c4ab4e2d8810a7b931af86`
 - Notes: Used by `llama-server` for JSON request and response handling.
+
+## Upstream Mozkey reference llama.cpp runtime (source tree only)
+
+The source tree additionally tracks the lock-pinned Windows `llama-server.exe`
+reference binaries maintained by upstream Mozkey
+(`src/zenz_runtime/llama_runtime.lock.json`). Mozkey IbG installers do not
+package these files; they package the runtime described in the section above.
+The entries below are kept in sync by `tools/zenz_runtime/runtime_lock.py`.
+
+- Project: ggml-org/llama.cpp
+- Source tag: v0.7.0
+- Source commit: 620d2225cc436ab0b001e3200e590e3b286ef9ab
+- Mozkey tokenizer compatibility patch SHA256: 6DB5C11B2DA8415D6B37200EC6AA4F3FDCDDE8EFB1E7A71375FE331A7B0E829A
+- Patched src/llama-vocab.cpp SHA256: 2CEF3BDD758D9F2EB4CB80C1FC149C75461E9E32AF06E03D67D99E36FF69BBED
+- Source assets:
+  - x64/llama-server.exe
+  - arm64/llama-server.exe
+- Installed file name: llama-server.exe
+- Runtime policy: CPU-only; ggml/llama are statically linked into llama-server.exe. Windows x64 is an isolated MSVC Release build with the tracked tokenizer and dual-liveness patches (SHA256 35B953C97F870CBD7426DC865783BE36090F841C273AE779BD098E9F080F3735). Windows ARM64 is a ClangCL build with the tokenizer patch, GGML_NATIVE=OFF, GGML_CPU_ARM_ARCH=armv8-a (SHA256 6BDE0FAF466261C8233298ECB2BDF01A78AAEBE9729C03BA4EA95F045F772737). Source is pinned to upstream v0.7.0; MSI installed-lifecycle validation remains pending.
+- Microsoft Visual C++ runtime DLLs remain external dependencies and are supplied by the architecture-specific MSI runtime payload.
+- License: MIT License
 
 ## Privacy note
 

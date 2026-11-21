@@ -224,6 +224,13 @@ Expected DebugView markers:
 [zenz] async response ok=true timeout=false
 ```
 
+- [ ] a partial or stalled named-pipe request is bounded and the scorer accepts a subsequent client after its configured I/O deadline
+- [ ] an unread scorer response does not leave `FlushFileBuffers` blocked indefinitely
+- [ ] after a stalled peer is released, the scorer can process the next request successfully
+- [ ] an idle named-pipe accept deadline is treated as normal polling and does not emit repeated error logs
+- [ ] Windows client stalled-response and `ZenzLiveCorrector::Stop()` cancellation tests pass without cached test results
+- [ ] macOS Unix-domain socket shutdown cancellation tests pass
+
 ## Windows Firewall checks
 
 - [ ] Outbound block rules exist for Mozc runtime executables
@@ -248,6 +255,8 @@ C:\Program Files (x86)\MozkeyIbG\mozc_tool.exe
 C:\Program Files (x86)\MozkeyIbG\mozc_renderer.exe
 C:\Program Files (x86)\MozkeyIbG\mozc_broker.exe
 C:\Program Files (x86)\MozkeyIbG\mozc_cache_service.exe
+C:\Program Files (x86)\MozkeyIbG\mozc_zenz_scorer.exe
+C:\Program Files (x86)\MozkeyIbG\llama-server.exe
 ```
 
 - [ ] Firewall rules are outbound block rules
@@ -274,6 +283,43 @@ Get-NetFirewallRule -DisplayName "Mozkey IbG Offline - Block *" -ErrorAction Sil
 ```
 
 Expected after uninstall: no rules are returned.
+
+## Architecture / package lifecycle checks
+
+For architecture-specific Windows Zenz releases:
+
+- [ ] x64 MSI contains x64 `mozc_zenz_scorer.exe` and x64 `llama-server.exe`
+- [ ] ARM64 MSI contains ARM64 `mozc_zenz_scorer.exe` and ARM64 `llama-server.exe`
+- [ ] bundled model SHA256 matches the normalized model pinned in
+      `tools/release/zenz_gguf_normalization.lock.json` and recorded in the
+      packaged `runtime-manifest.json` (Mozkey IbG packages the generated
+      runtime; `WINDOWS_ZENZ_RUNTIME_CONTRACT.md` describes upstream Mozkey's
+      reference binaries and the unmodified source model)
+- [ ] ARM64 MSI is tested on a native `windows-11-arm` runner from the exact
+      package artifact that would be released
+- [ ] installed ARM64 `llama-server.exe --version` succeeds
+- [ ] installed ARM64 canonical Zenz semantic gate passes
+- [ ] installed scorer named-pipe context E2E passes
+- [ ] scorer-owned llama listener is loopback-only
+- [ ] scorer / llama have no non-loopback TCP connection during the audit
+
+For a published upgrade:
+
+- [ ] ProductVersion is greater than the previous published release
+- [ ] ProductCode differs from the previous package
+- [ ] Mozkey IbG UpgradeCode remains `{422E6070-C76C-4F9B-96BE-FD9569E4B762}`
+      (never upstream Mozkey's `{DD94B570-B5E2-4100-9D42-61930C611D8A}`)
+- [ ] normal MSI upgrade from the previous release succeeds without forced
+      `REINSTALL=ALL REINSTALLMODE=amus`
+- [ ] legacy Zenz runtime files that are no longer part of the current package
+      are removed by the upgrade
+- [ ] post-upgrade Zenz scorer E2E passes
+- [ ] uninstall removes current Zenz payload, product registration, and firewall
+      rules
+
+Development CI artifacts may intentionally exercise same-version upgrade
+mechanics, but this does not replace the ProductVersion-increase requirement for
+a published release.
 
 ## Runtime checks
 

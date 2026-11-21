@@ -1,0 +1,156 @@
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@build_bazel_rules_apple//apple:apple.bzl", "apple_universal_binary")
+
+package(default_visibility = ["//visibility:private"])
+
+config_setting(
+    name = "macos_with_runtime",
+    constraint_values = [
+        "@platforms//os:macos",
+    ],
+    define_values = {
+        "macos_zenz_runtime": "1",
+    },
+)
+
+exports_files(
+    ["llama-server"],
+    visibility = ["//mac/installer/zenz_runtime/checked:__pkg__"],
+)
+
+filegroup(
+    name = "llama_server",
+    srcs = select({
+        ":macos_with_runtime": [
+            "//mac/installer/zenz_runtime/checked:llama_server_checked",
+        ],
+        "//conditions:default": [],
+    }),
+    target_compatible_with = [
+        "@platforms//os:macos",
+    ],
+    visibility = ["//mac:__pkg__"],
+)
+
+filegroup(
+    name = "model",
+    srcs = select({
+        ":macos_with_runtime": ["models/zenz-v3.2-small-Q5_K_M.gguf"],
+        "//conditions:default": [],
+    }),
+    target_compatible_with = [
+        "@platforms//os:macos",
+    ],
+    visibility = ["//mac:__pkg__"],
+)
+
+filegroup(
+    name = "build_contract",
+    srcs = select({
+        ":macos_with_runtime": ["BUILD-CONTRACT.txt"],
+        "//conditions:default": [],
+    }),
+    target_compatible_with = [
+        "@platforms//os:macos",
+    ],
+    visibility = ["//mac:__pkg__"],
+)
+
+# Keep the cross-platform scorer target itself architecture-agnostic. The
+# macOS packaging layer is responsible for producing one same-path Universal
+# executable for the final app bundle.
+apple_universal_binary(
+    name = "mozc_zenz_guard_macos_universal",
+    binary = "//zenz_scorer:mozc_zenz_guard",
+    forced_cpus = [
+        "x86_64",
+        "arm64",
+    ],
+    minimum_deployment_os_version = "12.0",
+    minimum_os_version = "12.0",
+    platform_type = "macos",
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+genrule(
+    name = "mozc_zenz_guard_runtime",
+    srcs = [":mozc_zenz_guard_macos_universal"],
+    outs = ["mozc_zenz_guard"],
+    cmd = "/bin/cp $< $@ && /bin/chmod 0755 $@",
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//mac:__pkg__"],
+)
+
+apple_universal_binary(
+    name = "mozc_zenz_scorer_macos_universal",
+    binary = "//zenz_scorer:mozc_zenz_scorer",
+    forced_cpus = [
+        "x86_64",
+        "arm64",
+    ],
+    minimum_deployment_os_version = "12.0",
+    minimum_os_version = "12.0",
+    platform_type = "macos",
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+genrule(
+    name = "mozc_zenz_scorer_runtime",
+    srcs = [":mozc_zenz_scorer_macos_universal"],
+    outs = ["mozc_zenz_scorer"],
+    cmd = "/bin/cp $< $@ && /bin/chmod 0755 $@",
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//mac:__pkg__"],
+)
+
+filegroup(
+    name = "apache_license",
+    srcs = ["licenses/Apache-2.0.txt"],
+    visibility = ["//mac:__pkg__"],
+)
+
+filegroup(
+    name = "llama_cpp_license",
+    srcs = ["licenses/llama.cpp-MIT.txt"],
+    visibility = ["//mac:__pkg__"],
+)
+
+filegroup(
+    name = "third_party_notices",
+    srcs = ["licenses/THIRD_PARTY_NOTICES.md"],
+    visibility = ["//mac:__pkg__"],
+)
+
+filegroup(
+    name = "zenz_model_notice",
+    srcs = ["licenses/zenz-v3.2-small-gguf.txt"],
+    visibility = ["//mac:__pkg__"],
+)
+
+# Mozkey IbG addition: llama-server statically links the cpp-httplib and
+# nlohmann/json copies vendored by llama.cpp, so their MIT notices ship next to
+# the llama.cpp notice.  The texts are shared with the Windows and Linux
+# packages; rules_apple keeps the package-relative "licenses/" directory.
+copy_file(
+    name = "cpp_httplib_license",
+    src = "//win32/installer/zenz_runtime:licenses/cpp-httplib-MIT.txt",
+    out = "licenses/cpp-httplib-MIT.txt",
+    allow_symlink = False,
+    is_executable = False,
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//mac:__pkg__"],
+)
+
+copy_file(
+    name = "nlohmann_json_license",
+    src = "//win32/installer/zenz_runtime:licenses/nlohmann-json-MIT.txt",
+    out = "licenses/nlohmann-json-MIT.txt",
+    allow_symlink = False,
+    is_executable = False,
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//mac:__pkg__"],
+)

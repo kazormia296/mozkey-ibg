@@ -11,34 +11,53 @@ $OutDir = Join-Path $RepoRoot "src\data\dictionary_koyasi\generated\personal_nam
 $Bz2 = Join-Path $OutDir "mozcdic-ut-personal-names.txt.bz2"
 $Txt = Join-Path $OutDir "mozcdic-ut-personal-names.txt"
 $SourceId = "mozcdic-ut-personal-names"
-$Payload = Get-DailyLockedPayload -SourceId $SourceId -PayloadId "dictionary_bz2"
-$Url = $Payload.url
-$Bz2Download = "$Bz2.download"
-$TxtDownload = "$Txt.download"
+$PayloadId = "dictionary_bz2"
+
+# The reviewed repository, revision, URL and SHA-256 all come from
+# tools/dictionary/daily_sources.lock.json, the single lock shared with the
+# Linux and native release pipelines.
+$LockedSource = Get-DailyLockedSource -Id $SourceId
+$Payload = Get-DailyLockedPayload -SourceId $SourceId -PayloadId $PayloadId
+$Revision = [string]$LockedSource.revision
+if ([string]$LockedSource.repository -ne 'https://github.com/utuhiro78/mozcdic-ut-personal-names.git' -or
+    $Revision -notmatch '^[0-9a-f]{40}$') {
+    throw "Invalid pinned personal-names repository or revision"
+}
+$ExpectedHash = ([string]$Payload.sha256).ToUpperInvariant()
+$Url = [string]$Payload.url
+if ($Url -ne "https://raw.githubusercontent.com/utuhiro78/mozcdic-ut-personal-names/$Revision/$($Payload.path)") {
+    throw "Pinned personal-names URL does not match the locked repository and revision: $Url"
+}
+$TxtDownload = $Txt + "." + [guid]::NewGuid().ToString('N') + ".tmp"
 
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 if (-not $SkipDownload) {
-  Write-Host "Downloading mozcdic-ut personal names dictionary..."
+  Write-Host "Downloading SHA256-locked personal names dictionary..."
   Write-Host "  $Url"
+  $Tmp = $Bz2 + "." + [guid]::NewGuid().ToString('N') + ".tmp"
   try {
-    Invoke-WebRequest -Uri $Url -OutFile $Bz2Download
-    Assert-DailyLockedFile -SourceId $SourceId -PayloadId "dictionary_bz2" -Path $Bz2Download
-    Move-Item -LiteralPath $Bz2Download -Destination $Bz2 -Force
-  } finally {
-    if (Test-Path -LiteralPath $Bz2Download) {
-      Remove-Item -LiteralPath $Bz2Download -Force
+    Invoke-WebRequest -Uri $Url -OutFile $Tmp -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $Tmp -Algorithm SHA256).Hash -ne $ExpectedHash) {
+      throw "Pinned personal names SHA256 mismatch"
     }
+    Assert-DailyLockedFile -SourceId $SourceId -PayloadId $PayloadId -Path $Tmp
+    Move-Item -LiteralPath $Tmp -Destination $Bz2 -Force
+  } finally {
+    if (Test-Path -LiteralPath $Tmp) { Remove-Item -LiteralPath $Tmp -Force }
   }
 } else {
-  Write-Host "Skipping download."
+  Write-Host "Skipping download; verifying pinned archive."
 }
 
-if (-not (Test-Path $Bz2)) {
+if (-not (Test-Path -LiteralPath $Bz2 -PathType Leaf)) {
   throw "bz2 file does not exist: $Bz2"
 }
+if ((Get-FileHash -LiteralPath $Bz2 -Algorithm SHA256).Hash -ne $ExpectedHash) {
+  throw "Pinned personal names archive differs from lock; refusing to unpack"
+}
 
-Assert-DailyLockedFile -SourceId $SourceId -PayloadId "dictionary_bz2" -Path $Bz2
+Assert-DailyLockedFile -SourceId $SourceId -PayloadId $PayloadId -Path $Bz2
 
 $env:MOZKEY_PERSONAL_NAMES_BZ2 = (Resolve-Path $Bz2).Path
 $env:MOZKEY_PERSONAL_NAMES_TXT = $TxtDownload

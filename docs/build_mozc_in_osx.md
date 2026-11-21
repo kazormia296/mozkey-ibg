@@ -18,13 +18,22 @@ python3 build_tools/update_deps.py
 # CMake is required to build both Qt and the bundled Zenz runtime.
 python3 build_tools/build_qt.py --release --confirm_license --macos_cpus=arm64
 
-python3 ../tools/release/prepare_macos_zenz_runtime.py
-bazelisk build package --config release_build --macos_cpus=arm64
+# Build and stage the source-pinned Universal Zenz runtime (llama.cpp v0.7.0).
+RUNTIME="$(mktemp -d)/mozkey-ibg-zenz-runtime"
+MOZKEY_ZENZ_MODEL_SOURCE="$PWD/win32/installer/zenz_runtime/models/zenz-v3.2-small-Q5_K_M.gguf" \
+  mac/installer/zenz_runtime/build_universal_runtime.zsh "$RUNTIME"
+mac/installer/zenz_runtime/stage_runtime_assets.zsh "$RUNTIME"
+
+bazelisk build package --config release_build --macos_cpus=arm64 \
+  --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1
 open bazel-bin/mac/MozkeyIbG.pkg
 ```
 
-💡 Mozkey for macOS is distributed for Apple Silicon only. The application,
-installer, Zenz scorer, and `llama-server` runtime are all arm64-only.
+💡 Mozkey IbG for macOS is distributed for Apple Silicon only: the application
+and installer are arm64-only. Since the sync to upstream Mozkey v1.0.0 the
+bundled Zenz runtime helpers (`mozc_zenz_scorer`, `mozc_zenz_guard`, and
+`llama-server`) are upstream's Universal binaries under
+`MozkeyIbG.app/Contents/Resources/ZenzRuntime`.
 
 💡 You can also download `MozkeyIbG.pkg` from GitHub Actions. Check
 [Build with GitHub Actions](#build-with-github-actions) for details.
@@ -93,7 +102,7 @@ The explicit `--macos_cpus=arm64` option matches the Mozkey release contract.
 
 You can skip this process if you have already installed Qt prebuilt binaries.
 
-CMake is required by the Zenz runtime preparation step even when you use
+CMake is required by the Zenz runtime build step even when you use
 prebuilt Qt binaries. If you use `brew`, you can install `cmake` as follows.
 
 ```
@@ -106,19 +115,44 @@ brew install cmake
 
 ### Build installer
 
-First stage the pinned arm64 Zenz runtime. This command downloads the
-official pinned llama.cpp archive when it is not already cached, verifies its
-SHA-256, and builds the arm64 runtime.
+First build and stage the source-pinned Zenz runtime. The builder clones
+llama.cpp `v0.7.0` at the pinned commit, applies the tracked tokenizer and
+dual-liveness patches, builds `llama-server` for arm64 and x86_64 with a
+macOS 12 deployment target, merges them into one Universal executable, and
+writes `BUILD-CONTRACT.txt`. `stage_runtime_assets.zsh` re-verifies that
+contract and copies the ignored runtime files next to
+`mac/installer/zenz_runtime/BUILD.bazel`. See
+[the runtime README](../src/mac/installer/zenz_runtime/README.md) for the
+contract details.
 
 ```
-python3 ../tools/release/prepare_macos_zenz_runtime.py
-bazelisk build package --config release_build --macos_cpus=arm64
+RUNTIME="$(mktemp -d)/mozkey-ibg-zenz-runtime"
+MOZKEY_ZENZ_MODEL_SOURCE="$PWD/win32/installer/zenz_runtime/models/zenz-v3.2-small-Q5_K_M.gguf" \
+  mac/installer/zenz_runtime/build_universal_runtime.zsh "$RUNTIME"
+mac/installer/zenz_runtime/stage_runtime_assets.zsh "$RUNTIME"
+
+bazelisk build package --config release_build --macos_cpus=arm64 \
+  --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1
 open bazel-bin/mac/MozkeyIbG.pkg
 ```
 
-The runtime preparation command has no architecture option because its output
-is intentionally fixed to arm64 with a macOS 12 deployment target. The package
-build uses the matching explicit `--macos_cpus=arm64` contract.
+*   `--define=macos_zenz_runtime=1` packages the staged `llama-server`, model,
+    and `BUILD-CONTRACT.txt`. Without it the package build fails closed in
+    `mac/tweak_installer_files.py`, because the Zenz runtime would be
+    incomplete.
+*   `--define=MOZKEY_INSTALLABLE=1` selects the release preinstall script
+    (`mac/preflight_mozkey_release.sh`). Without it the package embeds the
+    stage-1 gate and refuses to install.
+*   The application keeps the explicit `--macos_cpus=arm64` contract; the Zenz
+    runtime helpers are Universal regardless of that flag.
+
+To verify a built package, including a real inference request through the
+packaged scorer:
+
+```
+MOZKEY_ZENZ_VERIFY_APP_ARCHITECTURES=arm64 \
+  mac/installer/zenz_runtime/verify_release_package.zsh bazel-bin/mac/MozkeyIbG.pkg
+```
 
 ### Unit tests
 

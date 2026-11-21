@@ -30,13 +30,13 @@
 #include "rewriter/variants_rewriter.h"
 
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/log/check.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -112,6 +112,41 @@ bool HasCharacterFormDescription(const absl::string_view value) {
   // returns false here only if all the characters are fullwidth and they're not
   // convertible to their corresponding halfwidth forms.
   return IsConvertibleToHalfWidthForm(value);
+}
+
+// Determines the form (FULL_WIDTH / HALF_WIDTH) based on the variable-width
+// scripts (alphabet, number, symbol, and half-width katakana) in |value|,
+// ignoring fixed scripts like kanji, hiragana, and full-width katakana.
+Util::FormType GetVariableWidthFormType(const absl::string_view value) {
+  Util::FormType result_form = Util::UNKNOWN_FORM;
+  const Utf8AsChars32 chars(value);
+  for (auto it = chars.begin(); it != chars.end(); ++it) {
+    if (!it.ok()) {
+      continue;
+    }
+    const char32_t c = *it;
+    const Util::ScriptType script = Util::GetScriptType(c);
+    if (script == Util::KANJI || script == Util::HIRAGANA) {
+      continue;
+    }
+    const Util::FormType form = Util::GetFormType(c);
+    if (script == Util::KATAKANA && form == Util::FULL_WIDTH) {
+      continue;
+    }
+    if (script == Util::UNKNOWN_SCRIPT && form == Util::FULL_WIDTH &&
+        !IsConvertibleToHalfWidthForm(it.view())) {
+      continue;
+    }
+    if (form == Util::UNKNOWN_FORM) {
+      continue;
+    }
+    if (result_form == Util::UNKNOWN_FORM) {
+      result_form = form;
+    } else if (result_form != form) {
+      return Util::UNKNOWN_FORM;
+    }
+  }
+  return result_form;
 }
 
 // Returns NumberString::Style corresponding to the given form
@@ -206,6 +241,14 @@ std::string VariantsRewriter::GetDescription(const PosMatcher pos_matcher,
       case Util::UNKNOWN_SCRIPT:  // mixed character
         if (HasCharacterFormDescription(candidate.value)) {
           description_type |= FULL_HALF_WIDTH;
+        } else if (GetVariableWidthFormType(candidate.value) !=
+                   Util::UNKNOWN_FORM) {
+          // Follow the same policy as pure NUMBER/ALPHABET: suppress [半] on
+          // standalone candidates (clearing FULL_HALF_WIDTH while setting
+          // FULL_WIDTH), but retain explicit HALF_WIDTH when alternative
+          // candidates are generated in RewriteSegment().
+          description_type &= ~FULL_HALF_WIDTH;
+          description_type |= FULL_WIDTH;
         } else {
           description_type &= ~FULL_HALF_WIDTH;
         }
@@ -223,7 +266,7 @@ std::string VariantsRewriter::GetDescription(const PosMatcher pos_matcher,
     character_form_message = absl::string_view();
   }
 
-  const Util::FormType form = Util::GetFormType(candidate.value);
+  const Util::FormType form = GetVariableWidthFormType(candidate.value);
   // full/half char description
   if (description_type & FULL_HALF_WIDTH) {
     switch (form) {
@@ -442,6 +485,39 @@ VariantsRewriter::CreateAlternativeCandidate(
   return result;
 }
 
+bool VariantsRewriter::RewriteTopCandidateForSuggestion(Segment* seg) const {
+  if (seg == nullptr || seg->candidates_size() == 0) {
+    return false;
+  }
+  Candidate* top_candidate = seg->mutable_candidate(0);
+  if (!(top_candidate->attributes & Attribute::REALTIME_CONVERSION)) {
+    return false;
+  }
+
+  std::string primary_value, secondary_value;
+  std::string primary_content_value, secondary_content_value;
+  converter::InnerSegmentBoundary primary_inner_segment_boundary;
+  converter::InnerSegmentBoundary secondary_inner_segment_boundary;
+
+  if (!GenerateAlternatives(*top_candidate, &primary_value, &secondary_value,
+                            &primary_content_value, &secondary_content_value,
+                            &primary_inner_segment_boundary,
+                            &secondary_inner_segment_boundary)) {
+    return false;
+  }
+
+  if (top_candidate->value == primary_value) {
+    return false;
+  }
+
+  top_candidate->value = std::move(primary_value);
+  top_candidate->content_value = std::move(primary_content_value);
+  top_candidate->inner_segment_boundary =
+      std::move(primary_inner_segment_boundary);
+  top_candidate->attributes |= Attribute::NO_EXTRA_DESCRIPTION;
+  return true;
+}
+
 bool VariantsRewriter::RewriteSegment(RewriteType type, Segment* seg) const {
   CHECK(seg);
   bool modified = false;
@@ -569,15 +645,27 @@ bool VariantsRewriter::GenerateAlternatives(
 
 void VariantsRewriter::Finish(const ConversionRequest& request,
                               const Segments& segments) {
+  if (request.options().reversible_external_learning) {
+    // Phase 2 external Zenz learning is a reversible user-history transaction.
+    // Character-form preference learning has no per-commit revert snapshot, so
+    // keep it outside this transaction.
+    return;
+  }
+
+  // Match upstream: private/incognito commits must never persist form choices.
+  if (request.incognito_mode()) {
+    MOZC_VLOG(2) << "incognito mode";
+    return;
+  }
+
   if (request.config().history_learning_level() !=
       config::Config::DEFAULT_HISTORY) {
     MOZC_VLOG(2) << "history_learning_level is not DEFAULT_HISTORY";
     return;
   }
-  if (!request.request().mixed_conversion() &&
-      request.request_type() != ConversionRequest::CONVERSION) {
-    return;
-  }
+  // Committed FIXED_VALUE segments may originate from desktop suggestion and
+  // prediction requests as well as ordinary conversion.  Only the committed
+  // candidate at index 0 is eligible for learning.
 
   // save character form
   for (const Segment& segment : segments.conversion_segments()) {
@@ -588,29 +676,32 @@ void VariantsRewriter::Finish(const ConversionRequest& request,
     }
 
     const Candidate& candidate = segment.candidate(0);
-    if (candidate.attributes & Attribute::NO_VARIANTS_EXPANSION) {
-      continue;
-    }
-
+    // Explicit number styles must remain learnable even if NumberRewriter
+    // marked the committed candidate NO_VARIANTS_EXPANSION.  For other
+    // candidates, keep upstream's normal no-variants/user-dictionary guards.
     switch (candidate.style) {
       case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH:
-        // treat NUMBER_SEPARATED_ARABIC as half_width num
+      case NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_HALFWIDTH:
+        // Explicit half-width number style, including Arabic-and-Kanji.
         CharacterFormManager::GetCharacterFormManager()->SetCharacterForm(
             "0", config::Config::HALF_WIDTH);
         continue;
       case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH:
-        // treat NUMBER_SEPARATED_WIDE_ARABIC as full_width num
+      case NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_FULLWIDTH:
+        // Explicit full-width number style, including Arabic-and-Kanji.
         CharacterFormManager::GetCharacterFormManager()->SetCharacterForm(
             "0", config::Config::FULL_WIDTH);
         continue;
       default:
         break;
     }
-    // Special handling for number compounds like 3時.  Note:
-    // GuessAndSetCharacterForm() below this if-block cannot guess the
-    // character form for number compounds.  Since this module adds
-    // annotation in the description for character width, using it is
-    // more reliable than guessing from |candidate.value|.
+
+    if (candidate.attributes &
+        (Attribute::NO_VARIANTS_EXPANSION | Attribute::USER_DICTIONARY)) {
+      continue;
+    }
+    // Preserve annotated number compound rules, then fall back to the
+    // upstream per-script-chunk form learning from CharacterFormManager.
     if (Util::GetFirstScriptType(candidate.value) == Util::NUMBER) {
       if (absl::StrContains(candidate.description, kHalfWidth)) {
         CharacterFormManager::GetCharacterFormManager()->SetCharacterForm(
@@ -624,7 +715,7 @@ void VariantsRewriter::Finish(const ConversionRequest& request,
       }
     }
     CharacterFormManager::GetCharacterFormManager()->GuessAndSetCharacterForm(
-        candidate.value);
+        absl::StripTrailingAsciiWhitespace(candidate.value));
   }
 }
 
@@ -636,6 +727,26 @@ bool VariantsRewriter::Rewrite(const ConversionRequest& request,
                                Segments* segments) const {
   CHECK(segments);
   bool modified = false;
+
+  // NOTE:
+  // 1. In realtime conversion, conversion segments are already aggregated into
+  //    a single segment (with inner_segments) by the time post-correction
+  //    rewriters are applied.
+  // 2. This is a workaround to make variant rewriting work properly for such
+  //    realtime conversion results (e.g. full-width / half-width character
+  //    form normalization) using inner_segments.
+  // 3. This is a transitional implementation; ideally, this logic should be
+  //    refactored and placed in a cleaner, more appropriate layer.
+  if (request.request_type() != ConversionRequest::PARTIAL_SUGGESTION &&
+      request.request_type() != ConversionRequest::PARTIAL_PREDICTION &&
+      request.request()
+          .decoder_experiment_params()
+          .suppress_realtime_conversion_with_converter()) {
+    if (segments->conversion_segments_size() > 0) {
+      modified |= RewriteTopCandidateForSuggestion(
+          segments->mutable_conversion_segment(0));
+    }
+  }
 
   RewriteType type;
   if (request.request().mixed_conversion()) {  // For mobile.

@@ -39,6 +39,7 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "base/strings/japanese.h"
 #include "base/util.h"
@@ -53,7 +54,11 @@
 
 namespace mozc::prediction::filter {
 
+using ::mozc::converter::Attribute;
+
 namespace {
+
+constexpr absl::string_view kNwpPrefix = "<NWP>";
 
 // Returns true if the |target| may be redundant result.
 bool MaybeRedundant(const Result& reference_result,
@@ -118,8 +123,7 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
   }
 
   if (!auto_partial_suggestion_ &&
-      (result.candidate_attributes &
-       converter::Attribute::PARTIALLY_KEY_CONSUMED)) {
+      (result.attributes & Attribute::PARTIALLY_KEY_CONSUMED)) {
     return true;
   }
 
@@ -130,7 +134,13 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
       return true;
     }
     if ((strategies & kFilterByHistoryAndValue) &&
-        suggestion_filter_.IsBadSuggestion(history_value_ + result.value)) {
+        suggestion_filter_.IsBadSuggestion(
+            absl::StrCat(history_value_, result.value))) {
+      return true;
+    }
+    if ((strategies & kFilterByNwp) &&
+        suggestion_filter_.IsBadSuggestion(
+            absl::StrCat(kNwpPrefix, result.value))) {
       return true;
     }
   }
@@ -143,7 +153,8 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
 
   // Don't suggest exactly the same candidate as key.
   // if |include_exact_key| is true, that's not the case.
-  if (!include_exact_key_ && !(result.types & PredictionType::REALTIME) &&
+  if (!include_exact_key_ &&
+      !(result.attributes & Attribute::REALTIME_CONVERSION) &&
       request_key_ == result.value) {
     return true;
   }
@@ -154,8 +165,7 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
 
   // User input: "おーすとり" (len = 5)
   // key/value:  "おーすとりら" "オーストラリア" (miss match pos = 4)
-  if ((result.candidate_attributes &
-       converter::Attribute::SPELLING_CORRECTION) &&
+  if ((result.attributes & Attribute::SPELLING_CORRECTION) &&
       result.key != request_key_ &&
       request_key_len_ <=
           GetMissSpelledPosition(result.key, result.value) + 1) {
@@ -165,13 +175,14 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
   const size_t lookup_key_len = Util::CharsLen(request_key_);
 
   if (suffix_nwp_transition_cost_threshold_ > 0 && lookup_key_len == 0 &&
-      history_rid_ != 0 && result.types & PredictionType::SUFFIX &&
+      history_rid_ != 0 && result.attributes & Attribute::SUFFIX_DICTIONARY &&
       connector_.GetTransitionCost(history_rid_, result.lid) >
           suffix_nwp_transition_cost_threshold_) {
     return true;
   }
 
-  if ((result.types & PredictionType::SUFFIX) && suffix_count_++ >= 20) {
+  if ((result.attributes & Attribute::SUFFIX_DICTIONARY) &&
+      suffix_count_++ >= 20) {
     // TODO(toshiyuki): Need refactoring for controlling suffix
     // prediction number after we will fix the appropriate number.
     return true;
@@ -193,7 +204,7 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
     return true;
   }
 
-  if ((result.types & PredictionType::REALTIME) &&
+  if ((result.attributes & Attribute::REALTIME_CONVERSION) &&
       // Do not remove one-segment / on-char realtime candidates
       // example:
       // - "勝った" for the reading, "かった".
@@ -207,13 +218,13 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
   constexpr int kTcMaxCount = 3;
   constexpr int kTcMaxRank = 10;
 
-  if ((result.types & PredictionType::TYPING_CORRECTION) &&
+  if ((result.attributes & Attribute::TYPING_CORRECTION) &&
       (tc_count_++ >= kTcMaxCount || added_num >= kTcMaxRank)) {
     return true;
   }
 
-  if ((result.types & PredictionType::PREFIX) &&
-      (result.candidate_attributes & converter::Attribute::TYPING_CORRECTION) &&
+  if ((result.attributes & Attribute::PARTIALLY_KEY_CONSUMED) &&
+      (result.attributes & Attribute::TYPING_CORRECTION) &&
       (prefix_tc_count_++ >= 3 || added_num >= 10)) {
     return true;
   }
@@ -224,10 +235,10 @@ bool ResultFilter::ShouldRemove(const Result& result, int added_num) {
 uint32_t ResultFilter::SelectSuggestionFilterStrategies(
     const Result& result, absl::string_view request_key,
     absl::string_view history_value, bool include_exact_key) {
-  // For next word prediction, we always apply the filter by value and
-  // history+value.
+  // For next word prediction, we always apply the filter by value,
+  // history+value, and <NWP>-prefixed entries.
   if (request_key.empty() || result.key.empty())
-    return kFilterByValue | kFilterByHistoryAndValue;
+    return kFilterByValue | kFilterByHistoryAndValue | kFilterByNwp;
 
   if (include_exact_key) {
     // If `include_exact_key_` is true, we don't apply the filter to the results
@@ -294,9 +305,9 @@ void RemoveRedundantResults(std::vector<Result>* results) {
     for (auto iter = min_iter; iter != max_iter;) {
       // Keep user and project dictionary provenance for the final candidate
       // ranking/dedup pass.
-      if (iter->candidate_attributes &
-          (converter::Attribute::USER_DICTIONARY |
-           converter::Attribute::PROJECT_DICTIONARY)) {
+      if ((iter->attributes & Attribute::USER_DICTIONARY) ||
+          (iter->ranking_constraints &
+           converter::RankingConstraint::PROJECT_DICTIONARY)) {
         ++iter;
         continue;
       }

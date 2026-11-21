@@ -41,6 +41,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -139,6 +140,14 @@ volatile DWORD g_tls_index = TLS_OUT_OF_INDEXES;
 constexpr UINT kUpdateUIMessage = WM_USER;
 constexpr UINT_PTR kDelayedSessionCommandTimerId = 1;
 
+// This flag is available in Windows SDK 8.0 and later. Keep the fallback
+// value used by upstream Mozc so older SDK headers can still build the TIP.
+#ifndef TF_TMF_IMMERSIVEMODE
+constexpr DWORD kTfTmfImmersiveMode = 0x40000000;
+#else
+constexpr DWORD kTfTmfImmersiveMode = TF_TMF_IMMERSIVEMODE;
+#endif
+
 bool NeedsRendererUpdateOnLayoutChange(TipTextService* text_service,
                                        ITfContext* context) {
   if (text_service == nullptr || context == nullptr) {
@@ -171,7 +180,8 @@ bool NeedsRendererUpdateOnLayoutChange(TipTextService* text_service,
 
   const commands::Output& output = private_context->last_output();
 
-  if (output.live_conversion() && output.has_preedit()) {
+  if ((output.live_conversion() || output.pre_live_conversion_reading()) &&
+      output.has_preedit()) {
     return true;
   }
 
@@ -195,6 +205,8 @@ bool NeedsRendererUpdateOnLayoutChange(TipTextService* text_service,
 constexpr char kHelpUrl[] = "http://www.google.com/support/ime/japanese";
 constexpr wchar_t kTaskWindowClassName[] =
     L"Google Japanese Input Task Message Window";
+constexpr wchar_t kThemeWindowClassName[] =
+    L"Google Japanese Input Theme Change Window";
 
 // {67526BED-E4BE-47CA-97F8-3C84D5B408DA}
 constexpr GUID kTipPreservedKey_Kanji = {
@@ -229,6 +241,8 @@ constexpr GUID kTipFunctionProvider = {
 constexpr char kHelpUrl[] = "https://github.com/kazormia296/mozkey-ibg";
 constexpr wchar_t kTaskWindowClassName[] =
     L"Mozkey IbG Immersive Task Message Window";
+constexpr wchar_t kThemeWindowClassName[] =
+    L"Mozkey IbG Theme Change Window";
 
 // {6B866013-769D-4BBA-B2EA-314E82354485}
 constexpr GUID kTipPreservedKey_Kanji = {
@@ -540,10 +554,12 @@ class TipTextServiceImpl
         keyboard_inputmode_conversion_cookie_(TF_INVALID_COOKIE),
         input_attribute_(TF_INVALID_GUIDATOM),
         converted_attribute_(TF_INVALID_GUIDATOM),
+        zenz_live_correction_attribute_(TF_INVALID_GUIDATOM),
+        pending_roman_attribute_(TF_INVALID_GUIDATOM),
         thread_context_(nullptr),
         task_window_handle_(nullptr),
-        renderer_callback_window_handle_(nullptr),
-        has_pending_delayed_session_command_(false) {}
+        theme_window_handle_(nullptr),
+        renderer_callback_window_handle_(nullptr) {}
 
   static bool OnDllProcessAttach(HMODULE module_handle) {
     if (!RegisterWindowClass(module_handle, kTaskWindowClassName,
@@ -555,12 +571,17 @@ class TipTextServiceImpl
                              RendererCallbackWidnowProc)) {
       return false;
     }
+    if (!RegisterWindowClass(module_handle, kThemeWindowClassName,
+                             ThemeWindowProc)) {
+      return false;
+    }
     return true;
   }
 
   static void OnDllProcessDetach(HMODULE module_handle) {
     ::UnregisterClass(kTaskWindowClassName, module_handle);
     ::UnregisterClass(kMessageReceiverClassName, module_handle);
+    ::UnregisterClass(kThemeWindowClassName, module_handle);
   }
 
   // ITfTextInputProcessorEx
@@ -615,6 +636,9 @@ class TipTextServiceImpl
 
     // Stop advising the ITfKeyEvent events.
     UninitKeyEventSink();
+
+    // Stop theme broadcasts before removing language bar items.
+    UninitThemeWindow();
 
     // Remove our button menus from the language bar.
     UninitLanguageBar();
@@ -718,6 +742,17 @@ class TipTextServiceImpl
     result = InitTaskWindow();
     if (init_failed_or_cancelled(result)) {
       LOG(ERROR) << "InitTaskWindow failed: " << result;
+      return abort_activation();
+    }
+
+    // Theme following is non-critical to text input itself.  Keep the IME
+    // usable even if the hidden broadcast receiver cannot be created.
+    result = InitThemeWindow();
+    if (FAILED(result)) {
+      LOG(WARNING) << "InitThemeWindow failed: " << result;
+    }
+    if (activation_cancel_requested_) {
+      // Creating a top-level window can dispatch messages and reenter TSF.
       return abort_activation();
     }
 
@@ -904,6 +939,12 @@ class TipTextServiceImpl
       *attribute = MakeComPtr<TipDisplayAttributeInput>().detach();
     } else if (::IsEqualGUID(guid, TipDisplayAttributeConverted::guid())) {
       *attribute = MakeComPtr<TipDisplayAttributeConverted>().detach();
+    } else if (::IsEqualGUID(
+                   guid, TipDisplayAttributeZenzLiveCorrection::guid())) {
+      *attribute =
+          MakeComPtr<TipDisplayAttributeZenzLiveCorrection>().detach();
+    } else if (::IsEqualGUID(guid, TipDisplayAttributePendingRoman::guid())) {
+      *attribute = MakeComPtr<TipDisplayAttributePendingRoman>().detach();
     } else {
       *attribute = nullptr;
       return E_INVALIDARG;
@@ -1498,9 +1539,18 @@ class TipTextServiceImpl
   // TipTextService
   TfClientId GetClientID() const override { return client_id_; }
   ITfThreadMgr* GetThreadManager() const override { return thread_mgr_.get(); }
+  bool IsImmersiveMode() const override {
+    return (activate_flags_ & kTfTmfImmersiveMode) != 0;
+  }
   TfGuidAtom input_attribute() const override { return input_attribute_; }
   TfGuidAtom converted_attribute() const override {
     return converted_attribute_;
+  }
+  TfGuidAtom zenz_live_correction_attribute() const override {
+    return zenz_live_correction_attribute_;
+  }
+  TfGuidAtom pending_roman_attribute() const override {
+    return pending_roman_attribute_;
   }
   HWND renderer_callback_window_handle() const override {
     return renderer_callback_window_handle_;
@@ -1623,36 +1673,52 @@ class TipTextServiceImpl
       return;
     }
 
-    pending_delayed_session_context_ = context;
-    pending_delayed_session_command_ = command;
-    pending_delayed_session_focus_epoch_ =
-        thread_context->GetGrimodexFocusEpoch();
-    pending_delayed_session_focus_revision_ =
-        thread_context->GetFocusRevision();
+    // Use an independent timer per callback. The previous single-slot timer
+    // silently replaced an earlier Zenz poll when a user macro added a delay.
+    // Bound outstanding timers to avoid retaining arbitrarily many COM TSF
+    // contexts if a key repeats rapidly or a client stops dispatching timers.
+    constexpr size_t kMaxPendingDelayedSessionCommands = 512;
+    while (delayed_session_commands_.size() >=
+           kMaxPendingDelayedSessionCommands) {
+      const auto oldest = delayed_session_commands_.begin();
+      ::KillTimer(task_window, oldest->first);
+      delayed_session_commands_.erase(oldest);
+    }
+    if (!IsCurrentActivation(thread_context)) {
+      return;
+    }
+    UINT_PTR id = next_delayed_session_timer_id_++;
+    if (next_delayed_session_timer_id_ < kDelayedSessionCommandTimerId + 1) {
+      next_delayed_session_timer_id_ = kDelayedSessionCommandTimerId + 1;
+    }
+    while (delayed_session_commands_.contains(id) || id == 0 ||
+           id == kDelayedSessionCommandTimerId) {
+      id = next_delayed_session_timer_id_++;
+    }
+    PendingDelayedSessionCommand pending;
+    pending.context = context;
+    pending.command = command;
+    pending.focus_epoch = thread_context->GetGrimodexFocusEpoch();
+    pending.focus_revision = thread_context->GetFocusRevision();
     // Output-application generations are intentionally short lived.  In
     // particular, the key-up following the key-down that produced this
     // callback reserves the next generation even when it has no output.  Bind
     // the delayed command to the TSF composition instead so that ordinary key
     // transitions do not cancel live conversion while commit/cancel still do.
-    pending_delayed_session_composition_generation_ =
-        private_context->composition_generation();
-    has_pending_delayed_session_command_ = true;
+    pending.composition_generation = private_context->composition_generation();
+    delayed_session_commands_.emplace(id, std::move(pending));
 
-    ::KillTimer(task_window, kDelayedSessionCommandTimerId);
-    if (!IsCurrentActivation(thread_context)) {
-      return;
+    const UINT delay = std::max<UINT>(1, delay_millisec);
+    if (::SetTimer(task_window, id, delay, nullptr) == 0) {
+      delayed_session_commands_.erase(id);
     }
-
-    const UINT delay =
-        delay_millisec == 0 ? 1 : static_cast<UINT>(delay_millisec);
-    ::SetTimer(task_window,
-              kDelayedSessionCommandTimerId,
-              delay,
-              nullptr);
   }
 
   void UpdateLangbar(bool enabled, uint32_t mozc_mode) override {
-    langbar_.UpdateMenu(enabled, mozc_mode);
+    const bool private_input =
+        thread_context_ != nullptr &&
+        thread_context_->GetInputModeManager()->IsPrivateInput();
+    langbar_.UpdateMenu(enabled, mozc_mode, private_input);
   }
 
   bool IsLangbarInitialized() const override {
@@ -2282,12 +2348,17 @@ class TipTextServiceImpl
       return E_UNEXPECTED;
     }
 
-    // register the display attribute for input strings and the one for
-    // converted strings.
+    // Register display attributes for normal input, converted text, applied
+    // Zenz correction, and unresolved trailing Roman input.
     RETURN_IF_FAILED_HRESULT(category->RegisterGUID(
         TipDisplayAttributeInput::guid(), &input_attribute_));
-    return category->RegisterGUID(TipDisplayAttributeConverted::guid(),
-                                  &converted_attribute_);
+    RETURN_IF_FAILED_HRESULT(category->RegisterGUID(
+        TipDisplayAttributeConverted::guid(), &converted_attribute_));
+    RETURN_IF_FAILED_HRESULT(category->RegisterGUID(
+        TipDisplayAttributeZenzLiveCorrection::guid(),
+        &zenz_live_correction_attribute_));
+    return category->RegisterGUID(TipDisplayAttributePendingRoman::guid(),
+                                  &pending_roman_attribute_);
   }
 
   HRESULT InitTaskWindow() {
@@ -2305,22 +2376,69 @@ class TipTextServiceImpl
 
   HRESULT UninitTaskWindow() {
     if (!::IsWindow(task_window_handle_)) {
+      // The timers died with the window; do not keep leasing their contexts.
+      delayed_session_commands_.clear();
       return S_FALSE;
     }
 
-    ::KillTimer(task_window_handle_, kDelayedSessionCommandTimerId);
-    has_pending_delayed_session_command_ = false;
-    pending_delayed_session_command_.Clear();
-    pending_delayed_session_context_.reset();
-    pending_delayed_session_focus_epoch_ = 0;
-    pending_delayed_session_focus_revision_ = 0;
-    pending_delayed_session_composition_generation_ = 0;
+    for (const auto& [id, pending] : delayed_session_commands_) {
+      ::KillTimer(task_window_handle_, id);
+    }
+    delayed_session_commands_.clear();
 
     ::DestroyWindow(task_window_handle_);
     task_window_handle_ = nullptr;
     return S_OK;
   }
 
+  HRESULT InitThemeWindow() {
+    if (::IsWindow(theme_window_handle_)) {
+      return S_FALSE;
+    }
+
+    // WM_SETTINGCHANGE broadcasts are not delivered to HWND_MESSAGE windows.
+    // Keep the existing task window message-only and use a separate hidden
+    // top-level tool window solely as a system-theme broadcast receiver.
+    theme_window_handle_ = ::CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kThemeWindowClassName, L"",
+        WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, g_module, nullptr);
+
+    if (!::IsWindow(theme_window_handle_)) {
+      return E_FAIL;
+    }
+    return S_OK;
+  }
+
+  HRESULT UninitThemeWindow() {
+    if (!::IsWindow(theme_window_handle_)) {
+      theme_window_handle_ = nullptr;
+      return S_FALSE;
+    }
+
+    ::DestroyWindow(theme_window_handle_);
+    theme_window_handle_ = nullptr;
+    return S_OK;
+  }
+
+  static LRESULT WINAPI ThemeWindowProc(HWND window_handle, UINT message,
+                                        WPARAM wparam, LPARAM lparam) {
+    TipTextServiceImpl* self = Self();
+    if (self == nullptr) {
+      return ::DefWindowProcW(window_handle, message, wparam, lparam);
+    }
+
+    if (window_handle == self->theme_window_handle_ &&
+        message == WM_SETTINGCHANGE && lparam != 0 &&
+        ::lstrcmpW(reinterpret_cast<LPCWSTR>(lparam),
+                   L"ImmersiveColorSet") == 0) {
+      if (self->langbar_.IsInitialized()) {
+        self->langbar_.RefreshInputModeIconForThemeChange();
+      }
+      return 0;
+    }
+
+    return ::DefWindowProcW(window_handle, message, wparam, lparam);
+  }
   static LRESULT WINAPI TaskWindowProc(HWND window_handle,
                                       UINT message,
                                       WPARAM wparam,
@@ -2337,8 +2455,7 @@ class TipTextServiceImpl
       }
 
       if (message == WM_TIMER &&
-          wparam == kDelayedSessionCommandTimerId) {
-        self->OnDelayedSessionCommandTimer();
+          self->OnDelayedSessionCommandTimer(static_cast<UINT_PTR>(wparam))) {
         return 0;
       }
     }
@@ -2346,40 +2463,32 @@ class TipTextServiceImpl
     return ::DefWindowProcW(window_handle, message, wparam, lparam);
   }
 
-  void OnDelayedSessionCommandTimer() {
+  bool OnDelayedSessionCommandTimer(UINT_PTR id) {
+    auto it = delayed_session_commands_.find(id);
+    if (it == delayed_session_commands_.end()) {
+      return false;
+    }
+    // Consume the entry before any call that can reenter TSF.
+    PendingDelayedSessionCommand pending = std::move(it->second);
+    delayed_session_commands_.erase(it);
+
     const std::shared_ptr<TipThreadContext> thread_context =
         GetThreadContextLease();
     const HWND task_window = task_window_handle_;
+    if (::IsWindow(task_window)) {
+      ::KillTimer(task_window, id);
+    }
     if (!thread_context || !::IsWindow(task_window) ||
         !IsCurrentActivation(thread_context)) {
-      return;
+      return true;
     }
 
-    ::KillTimer(task_window, kDelayedSessionCommandTimerId);
-    if (!IsCurrentActivation(thread_context)) {
-      return;
-    }
-
-    if (!has_pending_delayed_session_command_) {
-      return;
-    }
-
-    commands::SessionCommand command = pending_delayed_session_command_;
-    wil::com_ptr_nothrow<ITfContext> context =
-        pending_delayed_session_context_;
-    const uint64_t scheduled_focus_epoch =
-        pending_delayed_session_focus_epoch_;
-    const int32_t scheduled_focus_revision =
-        pending_delayed_session_focus_revision_;
+    const wil::com_ptr_nothrow<ITfContext> context =
+        std::move(pending.context);
+    const uint64_t scheduled_focus_epoch = pending.focus_epoch;
+    const int32_t scheduled_focus_revision = pending.focus_revision;
     uint64_t scheduled_composition_generation =
-        pending_delayed_session_composition_generation_;
-
-    has_pending_delayed_session_command_ = false;
-    pending_delayed_session_command_.Clear();
-    pending_delayed_session_context_.reset();
-    pending_delayed_session_focus_epoch_ = 0;
-    pending_delayed_session_focus_revision_ = 0;
-    pending_delayed_session_composition_generation_ = 0;
+        pending.composition_generation;
 
     const std::shared_ptr<TipPrivateContext> private_context =
         context ? GetPrivateContext(context.get()) : nullptr;
@@ -2387,7 +2496,7 @@ class TipTextServiceImpl
         scheduled_focus_epoch != thread_context->GetGrimodexFocusEpoch() ||
         scheduled_focus_revision != thread_context->GetFocusRevision() ||
         !IsCurrentActivation(thread_context)) {
-      return;
+      return true;
     }
 
     // The first output of a composition can schedule a delayed callback before
@@ -2401,13 +2510,14 @@ class TipTextServiceImpl
     if (!private_context->IsCompositionForFocusDomainAndGeneration(
             scheduled_focus_epoch, scheduled_focus_revision,
             scheduled_composition_generation)) {
-      return;
+      return true;
     }
 
     TipEditSession::SendDelayedSessionCommandAsync(
-        this, context.get(), command, scheduled_focus_epoch,
+        this, context.get(), pending.command, scheduled_focus_epoch,
         scheduled_focus_revision,
         scheduled_composition_generation);
+    return true;
   }
 
   void OnUpdateUI() {
@@ -2452,12 +2562,22 @@ class TipTextServiceImpl
         ::RegisterWindowMessage(mozc::kMessageReceiverMessageName);
     static UINT renderer_highlight_callback_message =
         ::RegisterWindowMessage(mozc::kMessageReceiverHighlightMessageName);
+    static UINT renderer_submit_callback_message =
+        ::RegisterWindowMessage(mozc::kMessageReceiverSubmitMessageName);
 
-    if (!WindowUtil::ChangeMessageFilter(renderer_callback_window_handle_,
-                                         renderer_callback_message) ||
-        !WindowUtil::ChangeMessageFilter(
-            renderer_callback_window_handle_,
-            renderer_highlight_callback_message)) {
+    // In immersive mode the renderer runs in-process inside the host.
+    // The callback is therefore posted from another thread in the same
+    // process, so no UIPI exception for lower-integrity senders is needed.
+    // Keep the existing message-filter requirement for the external renderer.
+    if ((activate_flags_ & kTfTmfImmersiveMode) == 0 &&
+        (!WindowUtil::ChangeMessageFilter(renderer_callback_window_handle_,
+                                          renderer_callback_message) ||
+         !WindowUtil::ChangeMessageFilter(
+             renderer_callback_window_handle_,
+             renderer_highlight_callback_message) ||
+         !WindowUtil::ChangeMessageFilter(
+             renderer_callback_window_handle_,
+             renderer_submit_callback_message))) {
       ::DestroyWindow(renderer_callback_window_handle_);
       renderer_callback_window_handle_ = nullptr;
       return E_FAIL;
@@ -2490,10 +2610,13 @@ class TipTextServiceImpl
         ::RegisterWindowMessage(mozc::kMessageReceiverMessageName);
     static UINT renderer_highlight_callback_message =
         ::RegisterWindowMessage(mozc::kMessageReceiverHighlightMessageName);
+    static UINT renderer_submit_callback_message =
+        ::RegisterWindowMessage(mozc::kMessageReceiverSubmitMessageName);
     if (window_handle == self->renderer_callback_window_handle_) {
       switch (commands::GetRendererCallbackKindForMessage(
           message, renderer_callback_message,
-          renderer_highlight_callback_message)) {
+          renderer_highlight_callback_message,
+          renderer_submit_callback_message)) {
         case commands::RendererCallbackKind::kSelect:
           self->OnRendererCallback(commands::SessionCommand::SELECT_CANDIDATE,
                                    wparam, lparam);
@@ -2501,6 +2624,12 @@ class TipTextServiceImpl
         case commands::RendererCallbackKind::kHighlight:
           self->OnRendererCallback(
               commands::SessionCommand::HIGHLIGHT_CANDIDATE, wparam, lparam);
+          return 0;
+        case commands::RendererCallbackKind::kSubmit:
+          // WPARAM carries the provenance token, so SUBMIT_CANDIDATE has its
+          // own registered message instead of upstream's type-in-WPARAM.
+          self->OnRendererCallback(commands::SessionCommand::SUBMIT_CANDIDATE,
+                                   wparam, lparam);
           return 0;
         case commands::RendererCallbackKind::kUnsupported:
           break;
@@ -2572,7 +2701,9 @@ class TipTextServiceImpl
             expected_provenance.output_generation)) {
       return;
     }
-    if (type == commands::SessionCommand::SELECT_CANDIDATE) {
+    if (type == commands::SessionCommand::SELECT_CANDIDATE ||
+        type == commands::SessionCommand::SUBMIT_CANDIDATE) {
+      // Both commit, so the capability is one-shot.
       SetRendererCallbackProvenance(/*token=*/0, /*focus_epoch=*/0,
                                     /*focus_revision=*/0,
                                     /*output_generation=*/0);
@@ -2608,6 +2739,8 @@ class TipTextServiceImpl
   // Represents the display attributes.
   TfGuidAtom input_attribute_;
   TfGuidAtom converted_attribute_;
+  TfGuidAtom zenz_live_correction_attribute_;
+  TfGuidAtom pending_roman_attribute_;
 
   // Used for LangBar integration.
   TipLangBar langbar_;
@@ -2636,18 +2769,24 @@ class TipTextServiceImpl
   std::vector<std::pair<bool, wil::com_ptr_nothrow<ITfContext>>>
       pending_context_lifecycle_events_;
   HWND task_window_handle_;
+  HWND theme_window_handle_;
   HWND renderer_callback_window_handle_;
   uint64_t renderer_callback_token_ = 0;
   uint64_t renderer_callback_focus_epoch_ = 0;
   int32_t renderer_callback_focus_revision_ = 0;
   uint64_t renderer_callback_output_generation_ = 0;
 
-  bool has_pending_delayed_session_command_;
-  commands::SessionCommand pending_delayed_session_command_;
-  wil::com_ptr_nothrow<ITfContext> pending_delayed_session_context_;
-  uint64_t pending_delayed_session_focus_epoch_ = 0;
-  int32_t pending_delayed_session_focus_revision_ = 0;
-  uint64_t pending_delayed_session_composition_generation_ = 0;
+  struct PendingDelayedSessionCommand {
+    commands::SessionCommand command;
+    wil::com_ptr_nothrow<ITfContext> context;
+    // Fork hardening: every delayed command stays bound to the TSF focus
+    // domain and composition that scheduled it.
+    uint64_t focus_epoch = 0;
+    int32_t focus_revision = 0;
+    uint64_t composition_generation = 0;
+  };
+  UINT_PTR next_delayed_session_timer_id_ = kDelayedSessionCommandTimerId + 1;
+  std::map<UINT_PTR, PendingDelayedSessionCommand> delayed_session_commands_;
 };
 
 }  // namespace

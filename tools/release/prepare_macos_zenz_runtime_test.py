@@ -178,11 +178,17 @@ class PrepareMacosZenzRuntimeTest(unittest.TestCase):
                     target._verify_arm64_scorer(scorer)
 
     def test_macos_package_and_workflow_are_arm64_only(self):
+        # Since the sync to upstream Mozkey v1.0.0 the macOS package ships
+        # upstream's Universal Zenz runtime under Resources/ZenzRuntime.  The
+        # application and installer stay arm64-only.
         server_build = (
             target.REPOSITORY_ROOT / "src/server/BUILD.bazel"
         ).read_text(encoding="utf-8")
+        mac_build = (
+            target.REPOSITORY_ROOT / "src/mac/BUILD.bazel"
+        ).read_text(encoding="utf-8")
         runtime_build = (
-            target.REPOSITORY_ROOT / "src/mac/zenz_runtime/BUILD.bazel"
+            target.REPOSITORY_ROOT / "src/mac/installer/zenz_runtime/BUILD.bazel"
         ).read_text(encoding="utf-8")
         distribution = (
             target.REPOSITORY_ROOT / "src/mac/installer/distribution.xml"
@@ -191,32 +197,47 @@ class PrepareMacosZenzRuntimeTest(unittest.TestCase):
             target.REPOSITORY_ROOT / ".github/workflows/macos.yaml"
         ).read_text(encoding="utf-8")
 
-        staged_label = (
-            '"//mac/zenz_runtime:packaged_mozc_zenz_scorer": '
-            '"Resources"'
-        )
-        self.assertIn(staged_label, server_build)
+        self.assertNotIn("//mac/zenz_runtime:", server_build)
+        self.assertNotIn("//mac/zenz_runtime:", mac_build)
+        for runtime_target in (
+            "llama_server",
+            "model",
+            "build_contract",
+            "mozc_zenz_scorer_runtime",
+            "mozc_zenz_guard_runtime",
+        ):
+            with self.subTest(runtime_target=runtime_target):
+                self.assertIn(
+                    f'"//mac/installer/zenz_runtime:{runtime_target}": '
+                    '"Resources/ZenzRuntime"',
+                    mac_build,
+                )
+        self.assertIn('"macos_zenz_runtime": "1"', runtime_build)
         self.assertIn(
-            '_TARGET_COMPATIBLE_WITH = ["@platforms//os:macos"]',
-            runtime_build,
+            "src/mac/installer/zenz_runtime/build_universal_runtime.zsh",
+            workflow,
         )
-        self.assertEqual(
-            runtime_build.count(
-                "target_compatible_with = _TARGET_COMPATIBLE_WITH"
-            ),
-            10,
+        self.assertIn(
+            "src/mac/installer/zenz_runtime/stage_runtime_assets.zsh",
+            workflow,
         )
-        self.assertNotIn(
-            '"//zenz_scorer:mozc_zenz_scorer": "Resources"',
-            server_build,
+        self.assertIn(
+            "src/mac/installer/zenz_runtime/verify_release_package.zsh",
+            workflow,
         )
-        self.assertIn('"generated/mozc_zenz_scorer"', runtime_build)
-        self.assertIn('out = "mozc_zenz_scorer"', runtime_build)
-        self.assertIn("is_executable = True", runtime_build)
-        self.assertIn("runtime._verify_arm64_scorer", workflow)
-        self.assertIn("macos-zenz-runtime-arm64-b9637", workflow)
+        self.assertIn("MOZKEY_ZENZ_VERIFY_APP_ARCHITECTURES=arm64", workflow)
+        self.assertNotIn("prepare_macos_zenz_runtime.py", workflow)
+        self.assertNotIn("probe_macos_zenz_runtime", workflow)
+        package_commands = [
+            line.strip()
+            for line in workflow.splitlines()
+            if line.lstrip().startswith("bazelisk build package ")
+        ]
+        self.assertEqual(len(package_commands), 1)
+        self.assertIn("--define=macos_zenz_runtime=1", package_commands[0])
+        self.assertIn("--define=MOZKEY_INSTALLABLE=1", package_commands[0])
+        self.assertIn("-o -name mozc_zenz_guard", workflow)
         self.assertIn("--macos_cpus=arm64", workflow)
-        self.assertIn("--timeout-seconds 300", workflow)
         self.assertIn("  pull_request:\n", workflow)
         self.assertIn("  push:\n    branches:\n      - main\n", workflow)
         self.assertIn("  workflow_call:\n    inputs:\n      release:\n", workflow)
@@ -228,7 +249,7 @@ class PrepareMacosZenzRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(workflow.count("name: macos-daily-dictionary"), 3)
         self.assertEqual(
-            workflow.count("name: macos-zenz-runtime-arm64-b9637"),
+            workflow.count("name: macos-zenz-runtime-universal-v0.7.0"),
             2,
         )
         self.assertEqual(
@@ -270,11 +291,15 @@ class PrepareMacosZenzRuntimeTest(unittest.TestCase):
                 )
 
     def test_dependency_licenses_are_packaged_on_macos_and_windows(self):
-        server_build = (
-            target.REPOSITORY_ROOT / "src/server/BUILD.bazel"
+        mac_build = (
+            target.REPOSITORY_ROOT / "src/mac/BUILD.bazel"
         ).read_text(encoding="utf-8")
         mac_runtime_build = (
-            target.REPOSITORY_ROOT / "src/mac/zenz_runtime/BUILD.bazel"
+            target.REPOSITORY_ROOT / "src/mac/installer/zenz_runtime/BUILD.bazel"
+        ).read_text(encoding="utf-8")
+        mac_notices = (
+            target.REPOSITORY_ROOT
+            / "src/mac/installer/zenz_runtime/licenses/THIRD_PARTY_NOTICES.md"
         ).read_text(encoding="utf-8")
         windows_runtime_build = (
             target.REPOSITORY_ROOT
@@ -289,21 +314,22 @@ class PrepareMacosZenzRuntimeTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         mac_targets = {
-            "cpp-httplib-MIT.txt": "packaged_license_cpp_httplib_mit",
-            "nlohmann-json-MIT.txt": "packaged_license_nlohmann_json_mit",
+            "cpp-httplib-MIT.txt": "cpp_httplib_license",
+            "nlohmann-json-MIT.txt": "nlohmann_json_license",
         }
         for name, mac_target in mac_targets.items():
             with self.subTest(name=name):
                 self.assertIn(
-                    f'"//mac/zenz_runtime:{mac_target}": '
-                    '"Resources/licenses"',
-                    server_build,
+                    f'"//mac/installer/zenz_runtime:{mac_target}": '
+                    '"Resources/ZenzRuntime"',
+                    mac_build,
                 )
                 self.assertIn(
                     f'src = "//win32/installer/zenz_runtime:licenses/{name}"',
                     mac_runtime_build,
                 )
-                self.assertIn(f'out = "{name}"', mac_runtime_build)
+                self.assertIn(f'out = "licenses/{name}"', mac_runtime_build)
+                self.assertIn(f"`{name}`", mac_notices)
                 self.assertIn(f'"licenses/{name}"', windows_runtime_build)
                 self.assertIn(
                     f'"//win32/installer/zenz_runtime:licenses/{name}"',

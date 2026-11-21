@@ -77,6 +77,7 @@ class KeyMapManagerAccessorTestPeer : public testing::TestPeer<SessionHandler> {
       : testing::TestPeer<SessionHandler>(handler) {}
 
   PEER_VARIABLE(key_map_manager_);
+  PEER_VARIABLE(session_map_);
 };
 
 namespace {
@@ -564,6 +565,99 @@ TEST_F(SessionHandlerTest, UpdateComposition) {
   }
 }
 
+// Exercise the complete configuration lifecycle against an already-created
+// Session.  The fixture isolates ConfigHandler storage in a temporary profile.
+// Changing CUSTOM table content (without changing SessionKeymap::CUSTOM) must
+// replace the manager owned by that same Session, including after RELOAD.
+TEST_F(SessionHandlerTest, CustomLiveConversionTableUpdatesExistingSession) {
+  SessionHandler handler(CreateMockDataEngine());
+  uint64_t session_id = 0;
+  ASSERT_TRUE(CreateSession(handler, &session_id));
+
+  KeyMapManagerAccessorTestPeer peer(handler);
+  auto* existing_session = peer.session_map_()->MutableLookup(session_id);
+  ASSERT_NE(existing_session, nullptr);
+  ASSERT_NE(existing_session->get(), nullptr);
+  const session::Session* const original_session = existing_session->get();
+
+  const auto make_custom_config = [](const std::string& live_action) {
+    config::Config config = config::ConfigHandler::GetCopiedConfig();
+    config.set_session_keymap(config::Config::CUSTOM);
+    config.set_use_live_conversion(true);
+    config.set_custom_keymap_table(
+        "status\tkey\tcommand\n"
+        "Conversion\tSpace\tConvertNext\n"
+        "LiveConversion\tSpace\t" + live_action + "\n"
+        "ZenzConversion\tSpace\tRevertZenzToMozc\n");
+    return config;
+  };
+
+  const auto send_config = [&](const config::Config& config) {
+    commands::Command command;
+    command.mutable_input()->set_type(commands::Input::SET_CONFIG);
+    *command.mutable_input()->mutable_config() = config;
+    ASSERT_TRUE(handler.EvalCommand(&command));
+    EXPECT_EQ(command.output().error_code(),
+              commands::Output::SESSION_SUCCESS);
+  };
+
+  commands::KeyEvent space;
+  space.set_special_key(commands::KeyEvent::SPACE);
+  const auto verify_existing_session = [&](const std::string& live_action) {
+    auto* slot = peer.session_map_()->MutableLookup(session_id);
+    ASSERT_NE(slot, nullptr);
+    ASSERT_NE(slot->get(), nullptr);
+    EXPECT_EQ(slot->get(), original_session);
+
+    const keymap::KeyMapManager& active =
+        (*slot)->context().GetKeyMapManager();
+    EXPECT_EQ(&active, peer.key_map_manager_().get());
+    EXPECT_EQ((*slot)->context().GetConfig().session_keymap(),
+              config::Config::CUSTOM);
+
+    keymap::CommandSequence sequence;
+    ASSERT_TRUE(active.GetCommandSequenceConversion(space, &sequence));
+    EXPECT_EQ(sequence, (keymap::CommandSequence{"ConvertNext"}));
+    ASSERT_TRUE(active.GetCommandSequenceLiveConversion(space, &sequence));
+    EXPECT_EQ(sequence, (keymap::CommandSequence{live_action}));
+    bool specialized_override = false;
+    ASSERT_TRUE(active.GetCommandSequenceZenzLiveConversion(
+        space, &sequence, &specialized_override));
+    EXPECT_TRUE(specialized_override);
+    EXPECT_EQ(sequence, (keymap::CommandSequence{"RevertZenzToMozc"}));
+  };
+
+  // GUI-equivalent IPC SET_CONFIG of the first CUSTOM table.
+  send_config(make_custom_config("Commit"));
+  const std::shared_ptr<keymap::KeyMapManager> first_manager =
+      peer.key_map_manager_();
+  verify_existing_session("Commit");
+
+  // Changing only the table must rebuild the manager and update the existing
+  // Session; do not rely on the enum changing from CUSTOM to another keymap.
+  send_config(make_custom_config("Cancel"));
+  const std::shared_ptr<keymap::KeyMapManager> second_manager =
+      peer.key_map_manager_();
+  EXPECT_NE(first_manager.get(), second_manager.get());
+  verify_existing_session("Cancel");
+
+  // Re-sending exactly the current config should not rebuild the manager.
+  send_config(config::ConfigHandler::GetCopiedConfig());
+  EXPECT_EQ(peer.key_map_manager_().get(), second_manager.get());
+  verify_existing_session("Cancel");
+
+  // A config change made outside of this handler must be seen on RELOAD and
+  // propagated to the same Session, without creating a new Session object.
+  config::ConfigHandler::SetConfig(make_custom_config("Commit"));
+  commands::Command reload;
+  reload.mutable_input()->set_type(commands::Input::RELOAD);
+  ASSERT_TRUE(handler.EvalCommand(&reload));
+  EXPECT_EQ(reload.output().error_code(),
+            commands::Output::SESSION_SUCCESS);
+  EXPECT_NE(peer.key_map_manager_().get(), second_manager.get());
+  verify_existing_session("Commit");
+}
+
 TEST_F(SessionHandlerTest, KeyMapTest) {
   const keymap::KeyMapManager* msime_keymap;
 
@@ -799,6 +893,67 @@ TEST_F(SessionHandlerTest, ReloadFromMinimalEngine) {
   uint64_t id = 0;
   ASSERT_TRUE(CreateSession(handler, &id));
   EXPECT_EQ(handler.GetDataVersion(), mock_version_);
+}
+
+TEST_F(SessionHandlerTest, AddUserHistoryRespectsPrivacySettings) {
+  auto engine = std::make_unique<MockEngine>();
+  // The normal configuration permits the command; disabled modes must not
+  // reach the engine even when explicitly requested by the client.
+  EXPECT_CALL(*engine, AddUserHistory("とうきょう", "東京"))
+      .Times(2)
+      .WillRepeatedly(Return(true));
+  EXPECT_CALL(*engine, Reload()).WillRepeatedly(Return(true));
+  SessionHandler handler(std::move(engine));
+
+  commands::Command add_command;
+  add_command.mutable_input()->set_type(commands::Input::ADD_USER_HISTORY);
+  add_command.mutable_input()->mutable_user_history_data()->set_key(
+      "とうきょう");
+  add_command.mutable_input()->mutable_user_history_data()->set_value("東京");
+
+  auto add_history = [&]() {
+    add_command.mutable_output()->Clear();
+    EXPECT_TRUE(handler.EvalCommand(&add_command));
+    return add_command.output().error_code();
+  };
+  auto update_config = [&](const config::Config& new_config) {
+    commands::Command command;
+    command.mutable_input()->set_type(commands::Input::SET_CONFIG);
+    *command.mutable_input()->mutable_config() = new_config;
+    EXPECT_TRUE(handler.EvalCommand(&command));
+    EXPECT_EQ(command.output().error_code(),
+              commands::Output::SESSION_SUCCESS);
+  };
+
+  config::Config config;
+  config::ConfigHandler::GetDefaultConfig(&config);
+  config.set_incognito_mode(false);
+  config.set_history_learning_level(config::Config::DEFAULT_HISTORY);
+  config.set_use_history_suggest(true);
+  update_config(config);
+  EXPECT_EQ(add_history(), commands::Output::SESSION_SUCCESS);
+
+  // Incognito suppresses explicit user-history additions.
+  config.set_incognito_mode(true);
+  update_config(config);
+  EXPECT_EQ(add_history(), commands::Output::SESSION_FAILURE);
+
+  // Disabling learning suppresses explicit user-history additions.
+  config.set_incognito_mode(false);
+  config.set_history_learning_level(config::Config::NO_HISTORY);
+  update_config(config);
+  EXPECT_EQ(add_history(), commands::Output::SESSION_FAILURE);
+
+  // User history suggestions disabled: no explicit history additions.
+  config.set_history_learning_level(config::Config::DEFAULT_HISTORY);
+  config.set_use_history_suggest(false);
+  update_config(config);
+  EXPECT_EQ(add_history(), commands::Output::SESSION_FAILURE);
+
+  // Re-enabling all three settings restores the normal behavior.
+  config.set_use_history_suggest(true);
+  update_config(config);
+  EXPECT_EQ(add_history(), commands::Output::SESSION_SUCCESS);
 }
 
 }  // namespace mozc

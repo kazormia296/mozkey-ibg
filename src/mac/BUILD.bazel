@@ -30,6 +30,8 @@
 load(
     "//:build_defs.bzl",
     "MOZC_TAGS",
+    "mozc_cc_library",
+    "mozc_cc_test",
     "mozc_macos_application",
     "mozc_macos_bundle",
     "mozc_objc_library",
@@ -51,6 +53,7 @@ load(
     "MACOS_KEYCHAIN_INSTALLER_TESTING",
     "MOZKEY_IBG_PRODUCT_PREFIX",
 )
+load("//:version.bzl", "MOZKEY_MACOS_INSTALL_VERSION")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -98,8 +101,19 @@ mozc_macos_application(
             "//gui/error_message_dialog:error_message_dialog_macos": "Resources",
             "//gui/tool:mozc_prelauncher_macos": "Resources",
             "//gui/word_register_dialog:word_register_dialog_macos": "Resources",
+            "//mac/installer/zenz_runtime:apache_license": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:build_contract": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:cpp_httplib_license": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:llama_cpp_license": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:llama_server": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:model": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:nlohmann_json_license": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:third_party_notices": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:zenz_model_notice": "Resources/ZenzRuntime",
             "//renderer:mozc_renderer_macos": "Resources",
             "//server:mozc_server_macos": "Resources",
+            "//mac/installer/zenz_runtime:mozc_zenz_guard_runtime": "Resources/ZenzRuntime",
+            "//mac/installer/zenz_runtime:mozc_zenz_scorer_runtime": "Resources/ZenzRuntime",
         },
     ),
     app_icons = ["//data/images/mac:product_icon.icns"],
@@ -117,6 +131,8 @@ mozc_macos_application(
         "//data/images/mac:half_ascii.tiff",
         "//data/images/mac:half_katakana.tiff",
         "//data/images/mac:hiragana.tiff",
+        "//data/installer:DICTIONARY_NOTICES.md",
+        "//data/installer:SudachiDict-LEGAL.txt",
         "//data/installer:credits_en.html",
     ],
     strings = [
@@ -158,6 +174,23 @@ mozc_objc_library(
     ],
 )
 
+mozc_cc_library(
+    name = "zenz_context_acquisition",
+    srcs = ["zenz_context_acquisition.cc"],
+    hdrs = ["zenz_context_acquisition.h"],
+    deps = ["//base:util"],
+)
+
+mozc_cc_test(
+    name = "zenz_context_acquisition_test",
+    size = "small",
+    srcs = ["zenz_context_acquisition_test.cc"],
+    deps = [
+        ":zenz_context_acquisition",
+        "//testing:gunit_main",
+    ],
+)
+
 mozc_objc_library(
     name = "mozc_imk_input_controller",
     srcs = ["mozc_imk_input_controller.mm"],
@@ -176,6 +209,7 @@ mozc_objc_library(
         ":common",
         ":keycode_map",
         ":renderer_receiver",
+        ":zenz_context_acquisition",
         "//base:const",
         "//base:process",
         "//base:util",
@@ -415,11 +449,41 @@ mozc_macos_application(
     deps = ["uninstaller_main_lib"],
 )
 
+# Mozkey IbG coexists with upstream Mozkey (/Library/Input Methods/Mozc.app,
+# org.mozc.*).  The generated OSS installer scripts must only ever name Mozkey
+# IbG paths and identifiers, so fail the build closed if an upstream Mozkey
+# identifier survives in a generated script.
+MOZKEY_IBG_INSTALLER_SCRIPT_IDENTITY_GUARD = (
+    " && if /usr/bin/grep -E -q -e 'org[.]mozc[.]' -e '/Mozc[.]app'" +
+    " -e '/Applications/Mozc' -e 'UninstallMozc' -e 'killall Mozc' $@;" +
+    " then echo 'ERROR: generated Mozkey IbG installer script names an" +
+    " upstream Mozkey identifier' >&2; exit 1; fi"
+)
+
+# The regular OSS package remains non-installable.  An installable package is
+# generated only with BOTH --config=oss_macos and --define=MOZKEY_INSTALLABLE=1.
+# Never make the release preflight the default for local development builds.
+config_setting(
+    name = "mozkey_macos_installable",
+    define_values = {
+        "TARGET": "oss_macos",
+        "MOZKEY_INSTALLABLE": "1",
+    },
+)
+
+filegroup(
+    name = "mozkey_macos_preflight_source",
+    srcs = select({
+        ":mozkey_macos_installable": ["preflight_mozkey_release.sh"],
+        "//conditions:default": ["preflight_mozkey_stage1.sh"],
+    }),
+)
+
 genrule(
     name = "tweak_preflight",
     srcs = mozc_select(
         default = ["//mac/installer:preflight_template.sh"],
-        oss = ["//mac/installer:preflight_template.sh"],
+        oss = [":mozkey_macos_preflight_source"],
     ),
     outs = ["preflight.sh"],
     cmd = " ".join([
@@ -428,17 +492,24 @@ genrule(
         " --output $@",
         " --input $<",
         " --build_type ",
-    ]) + BUILD_TYPE_SELECT,  # "dev" or "stable".
+    ]) + BUILD_TYPE_SELECT + (
+        " && /usr/bin/sed -e 's|@@@MOZKEY_INSTALL_VERSION@@@|" +
+        MOZKEY_MACOS_INSTALL_VERSION +
+        "|g' $@ > $@.versioned && /bin/mv $@.versioned $@"
+    ) + mozc_select(
+        default = "",
+        oss = MOZKEY_IBG_INSTALLER_SCRIPT_IDENTITY_GUARD,
+    ),
     tools = ["//build_tools:tweak_macinstaller_script"],
 )
 
 genrule(
-    name = "tweak_postflight",
+    name = "tweak_postflight_common",
     srcs = mozc_select(
         default = ["//mac/installer:postflight_template.sh"],
         oss = ["//mac/installer:postflight_template.sh"],
     ),
-    outs = ["postflight.sh"],
+    outs = ["postflight_base.sh"],
     cmd = " ".join([
         "$(location" +
         " //build_tools:tweak_macinstaller_script)",
@@ -455,6 +526,37 @@ genrule(
         "//base:mozc_version_txt",
         "//build_tools:tweak_macinstaller_script",
     ],
+)
+
+# Keep the shared postflight template unchanged. Only the OSS generation
+# path removes the one known unsafe generic llama-server killall, fail-closed.
+# Default/proprietary builds retain their original unmodified postflight.
+mozc_py_binary(
+    name = "filter_postflight_mozkey_oss",
+    srcs = ["postflight_mozkey_oss_filter.py"],
+    test_lib = False,
+)
+
+genrule(
+    name = "tweak_postflight",
+    srcs = [":tweak_postflight_common"] + mozc_select(
+        default = [],
+        oss = ["postflight_mozkey_oss_cleanup.sh"],
+    ),
+    outs = ["postflight.sh"],
+    cmd = mozc_select(
+        default = "/bin/cat $(location :tweak_postflight_common) > $@",
+        oss = "$(location :filter_postflight_mozkey_oss)" +
+              " --input $(location :tweak_postflight_common)" +
+              " --tail $(location postflight_mozkey_oss_cleanup.sh)" +
+              " --output $@" +
+              MOZKEY_IBG_INSTALLER_SCRIPT_IDENTITY_GUARD,
+    ),
+    tags = MOZC_TAGS.MAC_ONLY,
+    tools = mozc_select(
+        default = [],
+        oss = [":filter_postflight_mozkey_oss"],
+    ),
 )
 
 mozc_py_binary(
@@ -559,12 +661,17 @@ mozc_py_binary(
     name = "build_package",
     srcs = ["build_package.py"],
     test_lib = False,
-    deps = ["//build_tools:util"],
+    deps = [
+        "//build_tools:mozc_version_lib",
+        "//build_tools:util",
+    ],
 )
 
 genrule(
     name = "package",
-    srcs = [":package_files"],
+    srcs = [":package_files"] + mozc_select(
+        oss = ["//base:mozc_version_txt"],
+    ),
     outs = ["MozkeyIbG.pkg"],
     cmd = "$(location :build_package) --input $(location :package_files)" +
           " --output $@" +
@@ -572,7 +679,7 @@ genrule(
           ' --keychain "' + KEYCHAIN_INSTALLER_SELECT + '"' +
           mozc_select(
               default = "",
-              oss = " --oss",
+              oss = " --oss --version_file $(location //base:mozc_version_txt)",
               prod = "",
           ),
     exec_compatible_with = ["@platforms//os:macos"],

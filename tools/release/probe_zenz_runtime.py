@@ -331,7 +331,13 @@ def _inspect_llama_argv(
     expected_model: Path,
     expected_backend_device: str | None = None,
 ) -> tuple[int, str]:
-    if len(argv) not in {15, 17}:
+    # Exact launch contract of src/zenz_scorer/main.cc (upstream Mozkey v1.0.0
+    # execution contract): one server slot and no global RAM prompt cache.
+    #   0 server  1 -m <model>  3 -c <ctx>  5 -t <threads>
+    #   7 --parallel 1  9 --cache-ram 0
+    #   11 --host 127.0.0.1  13 --port <port>  15 --api-key <key>
+    #   17 --flash-attn <mode>  [19 --device <device>]
+    if len(argv) not in {19, 21}:
         raise ProbeFailure("llama_arguments_invalid")
     if argv[0] != str(expected_link):
         raise ProbeFailure("llama_arguments_invalid")
@@ -339,15 +345,17 @@ def _inspect_llama_argv(
         raise ProbeFailure("llama_arguments_invalid")
     if argv[2] != str(expected_model) or argv[5] != "-t":
         raise ProbeFailure("llama_arguments_invalid")
-    if argv[7:12:2] != ["--host", "--port", "--api-key"]:
+    if argv[7:11] != ["--parallel", "1", "--cache-ram", "0"]:
         raise ProbeFailure("llama_arguments_invalid")
-    if argv[13] != "--flash-attn" or argv[14] not in {"auto", "on", "off"}:
+    if argv[11:16:2] != ["--host", "--port", "--api-key"]:
+        raise ProbeFailure("llama_arguments_invalid")
+    if argv[17] != "--flash-attn" or argv[18] not in {"auto", "on", "off"}:
         raise ProbeFailure("llama_arguments_invalid")
     backend_device = ""
-    if len(argv) == 17:
-        backend_device = argv[16]
+    if len(argv) == 21:
+        backend_device = argv[20]
         if (
-            argv[15] != "--device"
+            argv[19] != "--device"
             or not backend_device
             or len(backend_device) > 128
             or any(
@@ -364,13 +372,13 @@ def _inspect_llama_argv(
         and backend_device != expected_backend_device
     ):
         raise ProbeFailure("llama_device_invalid")
-    if argv[8] != "127.0.0.1":
+    if argv[12] != "127.0.0.1":
         raise ProbeFailure("llama_host_invalid")
 
     try:
         context = int(argv[4], 10)
         threads = int(argv[6], 10)
-        port = int(argv[10], 10)
+        port = int(argv[14], 10)
     except ValueError as error:
         raise ProbeFailure("llama_arguments_invalid") from error
     if not 64 <= context <= 1024 or not 1 <= threads <= 16:
@@ -378,7 +386,7 @@ def _inspect_llama_argv(
     if not 49152 <= port <= 65535:
         raise ProbeFailure("llama_port_invalid")
 
-    api_key = argv[12]
+    api_key = argv[16]
     if len(api_key) != 64 or any(character not in "0123456789abcdef" for character in api_key):
         raise ProbeFailure("llama_api_key_invalid")
     return port, api_key

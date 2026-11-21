@@ -45,11 +45,13 @@
 #include "data_manager/testing/mock_data_manager.h"
 #include "prediction/result.h"
 #include "request/conversion_request.h"
+#include "request/options.h"
 #include "testing/gmock.h"
 #include "testing/gunit.h"
 
 namespace mozc::prediction {
 
+using ::mozc::converter::Attribute;
 using ::testing::_;
 using ::testing::DoAll;
 using ::testing::Return;
@@ -63,10 +65,10 @@ class MockImmutableConverter : public ImmutableConverterInterface {
   ~MockImmutableConverter() override = default;
 
   MOCK_METHOD(bool, Convert,
-              (const ConversionRequest& request, Segments* segments),
+              (const ConversionOptions& options, Segments* segments),
               (const, override));
 
-  static bool ConvertImpl(const ConversionRequest& request,
+  static bool ConvertImpl(const ConversionOptions& options,
                           Segments* segments) {
     if (!segments || segments->conversion_segments_size() != 1 ||
         segments->conversion_segment(0).key().empty()) {
@@ -162,11 +164,11 @@ TEST(RealtimeDecoderTest, Decode) {
 
     std::vector<Result> results = decoder.Decode(convreq);
     ASSERT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0].types, REALTIME);
+    EXPECT_EQ(results[0].GetPredictionTypesForTesting(),
+              Attribute::REALTIME_CONVERSION);
     EXPECT_EQ(results[0].key, kKey);
     EXPECT_EQ(results[0].inner_segment_boundary.size(), 3);
-    EXPECT_TRUE(results[0].candidate_attributes &
-                converter::Attribute::NO_VARIANTS_EXPANSION);
+    EXPECT_TRUE(results[0].attributes & Attribute::NO_VARIANTS_EXPANSION);
   }
 
   // A test case with use_actual_converter_for_realtime_conversion being
@@ -195,17 +197,42 @@ TEST(RealtimeDecoderTest, Decode) {
     ASSERT_EQ(2, results.size());
     bool realtime_top_found = false;
     for (size_t i = 0; i < results.size(); ++i) {
-      EXPECT_TRUE(results[i].types & REALTIME);
-      EXPECT_TRUE(results[i].candidate_attributes &
-                  converter::Attribute::NO_VARIANTS_EXPANSION);
+      EXPECT_TRUE(results[i].attributes & Attribute::REALTIME_CONVERSION);
+      EXPECT_TRUE(results[i].attributes & Attribute::NO_VARIANTS_EXPANSION);
       if (results[i].key == kKey &&
           results[i].value == "WatashinoNamaehaNakanodesu" &&
           results[i].inner_segment_boundary.size() == 3) {
-        EXPECT_TRUE(results[i].types & REALTIME_TOP);
+        EXPECT_TRUE(results[i].attributes & Attribute::REALTIME_TOP);
         realtime_top_found = true;
       }
     }
     EXPECT_TRUE(realtime_top_found);
+  }
+
+  // Test case when suppress_realtime_conversion_with_converter flag is true.
+  {
+    ConversionRequest::Options options;
+    options.max_conversion_candidates_size = 10;
+    options.use_actual_converter_for_realtime_conversion = true;
+    options.request_type = ConversionRequest::PREDICTION;
+
+    commands::Request request;
+    request.mutable_decoder_experiment_params()
+        ->set_suppress_realtime_conversion_with_converter(true);
+
+    const ConversionRequest convreq = ConversionRequestBuilder()
+                                          .SetRequestView(request)
+                                          .SetOptions(std::move(options))
+                                          .Build();
+
+    std::vector<Result> results = decoder.Decode(convreq);
+
+    // Converter call is suppressed, so only 1 result from ImmutableConverter
+    // is returned (no REALTIME_TOP).
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(results[0].GetPredictionTypesForTesting(),
+              Attribute::REALTIME_CONVERSION);
+    EXPECT_EQ(results[0].key, kKey);
   }
 }
 

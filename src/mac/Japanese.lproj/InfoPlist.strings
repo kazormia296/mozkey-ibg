@@ -1,6 +1,7 @@
 /* Localized versions of Info.plist keys */
 
 CFBundleName = "${CF_BUNDLE_NAME_JA}";
+CFBundleDisplayName = "${CF_BUNDLE_NAME_JA}";
 NSHumanReadableCopyright = "${NS_HUMAN_READABLE_COPYRIGHT}";
 com.apple.inputmethod.Japanese = "ひらがな (${INPUT_MODE_ANNOTATION})";
 com.apple.inputmethod.Japanese.Katakana = "カタカナ (${INPUT_MODE_ANNOTATION})";

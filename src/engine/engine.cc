@@ -30,6 +30,7 @@
 #include "engine/engine.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -96,8 +97,15 @@ std::unique_ptr<Engine> Engine::CreateEngine() {
 Engine::Engine() : minimal_converter_(CreateMinimalConverter()) {}
 
 absl::Status Engine::ReloadModules(std::unique_ptr<engine::Modules> modules) {
+  absl::Status status = Init(std::move(modules));
+  if (!status.ok()) {
+    return status;
+  }
+  // Reloads the new converter after `Init()` destroys the old converter (which
+  // flushes any pending user history to disk) so the new converter picks up the
+  // latest on-disk state.
   ReloadAndWait();
-  return Init(std::move(modules));
+  return absl::OkStatus();
 }
 
 absl::Status Engine::Init(std::unique_ptr<engine::Modules> modules) {
@@ -145,6 +153,11 @@ absl::Status Engine::Init(std::unique_ptr<engine::Modules> modules) {
   }
 
   converter_ = std::move(converter);
+  if (pending_supplemental_model_request_.has_value()) {
+    converter_->modules().GetSupplementalModel().LoadAsync(
+        *pending_supplemental_model_request_);
+    pending_supplemental_model_request_.reset();
+  }
 
 #if defined(MOZC_BUILD) && \
     (defined(__linux__) || defined(__APPLE__) || defined(_WIN32))
@@ -237,6 +250,8 @@ bool Engine::SendSupplementalModelReloadRequest(
     const EngineReloadRequest& request) {
   if (converter_) {
     converter_->modules().GetSupplementalModel().LoadAsync(request);
+  } else {
+    pending_supplemental_model_request_ = request;
   }
   return true;
 }

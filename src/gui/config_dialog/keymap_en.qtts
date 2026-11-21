@@ -4,6 +4,14 @@
 <context>
     <name>mozc::gui::KeyMapEditorDialog</name>
     <message>
+        <source>LiveConversion</source>
+        <translation>Live converting</translation>
+    </message>
+    <message>
+        <source>ZenzConversion</source>
+        <translation>Zenz correction</translation>
+    </message>
+    <message>
         <source>Conversion</source>
         <translation>Conversion</translation>
     </message>
@@ -261,7 +269,43 @@
     </message>
     <message>
         <source>DeleteSelectedCandidate</source>
-        <translation>Remove selected candidate from history</translation>
+        <translation>Remove selected candidate from history / hide candidate</translation>
+    </message>
+    <message>
+        <source>RevertZenzToMozc</source>
+        <translation>Return to ordinary Mozc conversion</translation>
+    </message>
+    <message>
+        <source>Return to Mozc conversion must be used alone.</source>
+        <translation>Return to Mozc conversion must be used alone.</translation>
+    </message>
+    <message>
+        <source>ForceZenzLiveCorrection</source>
+        <translation>Run Zenz correction on uncommitted text</translation>
+    </message>
+    <message>
+        <source>ForceZenzLiveCorrectionWithoutFeedback</source>
+        <translation>Run Zenz correction on uncommitted text (ignore feedback learning)</translation>
+    </message>
+    <message>
+        <source>Delay</source>
+        <translation>Delay</translation>
+    </message>
+    <message>
+        <source>Delay %1 ms</source>
+        <translation>Delay %1 ms</translation>
+    </message>
+    <message>
+        <source>Delay (ms)</source>
+        <translation>Delay (ms)</translation>
+    </message>
+    <message>
+        <source>Invalid command sequence</source>
+        <translation>Invalid command sequence</translation>
+    </message>
+    <message>
+        <source>Delay cannot be first; manual Zenz correction must be last.</source>
+        <translation>Delay cannot be first; manual Zenz correction must be last.</translation>
     </message>
 </context>
 </TS>

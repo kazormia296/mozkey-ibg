@@ -30,6 +30,7 @@
 #include "dictionary/user_dictionary.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -228,11 +229,11 @@ class UserDictionaryTest : public testing::TestWithTempUserProfile {
    public:
     ResultType OnToken(absl::string_view,  // key
                        absl::string_view,  // actual_key
-                       const Token& token) override {
+                       Token token) override {
       // Collect only user dictionary entries.
       if (token.attributes & Token::USER_DICTIONARY) {
-        entries_.push_back(Entry({.key = token.key,
-                                  .value = token.value,
+        entries_.push_back(Entry({.key = std::move(token.key),
+                                  .value = std::move(token.value),
                                   .lid = static_cast<uint16_t>(token.lid),
                                   .rid = static_cast<uint16_t>(token.rid)}));
       }
@@ -306,6 +307,79 @@ class UserDictionaryTest : public testing::TestWithTempUserProfile {
  private:
   const testing::MockDataManager mock_data_manager_;
 };
+
+TEST_F(UserDictionaryTest, EmoticonPosPreservesSemanticProvenance) {
+  std::unique_ptr<UserDictionary> dic(CreateDictionary());
+  dic->WaitForReloader();
+
+  UserPos::Token emoticon;
+  emoticon.key = "えがお";
+  emoticon.value = "(^_^)";
+  emoticon.id = 100;
+  emoticon.set_pos_type(user_dictionary::UserDictionary::EMOTICON);
+
+  Token emoticon_token;
+  dic->PopulateTokenFromUserPosToken(emoticon, UserDictionary::EXACT,
+                                     &emoticon_token);
+  EXPECT_NE(emoticon_token.attributes & Token::USER_DICTIONARY, 0);
+  EXPECT_NE(emoticon_token.attributes & Token::EMOTICON, 0);
+
+  UserPos::Token symbol = emoticon;
+  symbol.set_pos_type(user_dictionary::UserDictionary::SYMBOL);
+
+  Token symbol_token;
+  dic->PopulateTokenFromUserPosToken(symbol, UserDictionary::EXACT,
+                                     &symbol_token);
+  EXPECT_NE(symbol_token.attributes & Token::USER_DICTIONARY, 0);
+  EXPECT_EQ(symbol_token.attributes & Token::EMOTICON, 0);
+}
+
+TEST_F(UserDictionaryTest,
+       EmoticonAndSymbolSameSurfacePreserveDistinctLookupProvenance) {
+  std::unique_ptr<UserDictionary> dic(CreateDictionary());
+  dic->WaitForReloader();
+
+  UserDictionaryStorage storage("");
+  EXPECT_OK(storage.CreateDictionary("semantic provenance"));
+  UserDictionaryStorage::UserDictionary* storage_dic =
+      storage.GetProto().mutable_dictionaries(0);
+
+  auto* emoticon_entry = storage_dic->add_entries();
+  emoticon_entry->set_key("えがお");
+  emoticon_entry->set_value("(^^)");
+  emoticon_entry->set_pos(user_dictionary::UserDictionary::EMOTICON);
+
+  auto* symbol_entry = storage_dic->add_entries();
+  symbol_entry->set_key("えがお");
+  symbol_entry->set_value("(^^)");
+  symbol_entry->set_pos(user_dictionary::UserDictionary::SYMBOL);
+
+  ASSERT_TRUE(dic->Load(storage.GetProto()));
+
+  int matching_tokens = 0;
+  int emoticon_tokens = 0;
+  int unconstrained_tokens = 0;
+  InlineCallback callback;
+  callback.OnToken(
+      [&](absl::string_view, absl::string_view, Token token) {
+        if (token.value != "(^^)") {
+          return DictionaryInterface::Callback::TRAVERSE_CONTINUE;
+        }
+        ++matching_tokens;
+        if (token.attributes & Token::EMOTICON) {
+          ++emoticon_tokens;
+        } else {
+          ++unconstrained_tokens;
+        }
+        return DictionaryInterface::Callback::TRAVERSE_CONTINUE;
+      });
+
+  dic->LookupExact("えがお", &callback);
+
+  EXPECT_EQ(matching_tokens, 2);
+  EXPECT_EQ(emoticon_tokens, 1);
+  EXPECT_EQ(unconstrained_tokens, 1);
+}
 
 TEST_F(UserDictionaryTest, TestLookupPredictiveCallback) {
   std::unique_ptr<UserDictionary> dic(CreateDictionaryWithMockPos());
@@ -688,6 +762,18 @@ TEST_F(UserDictionaryTest, TestKeyNormalization) {
     entry->set_value("Gboard");
     entry->set_pos(user_dictionary::UserDictionary::NO_POS);
 
+    // Readings with combining and spacing voiced marks must be stored under
+    // their canonical hiragana keys, without changing the registered values.
+    entry = dic->add_entries();
+    entry->set_key("ｻ\u3099ｶﾅ");
+    entry->set_value("青青");
+    entry->set_pos(user_dictionary::UserDictionary::NO_POS);
+
+    entry = dic->add_entries();
+    entry->set_key("サ゛カナ");
+    entry->set_value("魚");
+    entry->set_pos(user_dictionary::UserDictionary::NO_POS);
+
     user_dic->Load(storage.GetProto());
   }
 
@@ -704,6 +790,10 @@ TEST_F(UserDictionaryTest, TestKeyNormalization) {
 
   EXPECT_EQ(LookupExact("じーぼーど", *user_dic).size(), 1);
   EXPECT_EQ(LookupExact("ジーボード", *user_dic).size(), 0);
+
+  EXPECT_EQ(LookupExact("ざかな", *user_dic).size(), 2);
+  EXPECT_EQ(LookupExact("ｻ\u3099ｶﾅ", *user_dic).size(), 0);
+  EXPECT_EQ(LookupExact("サ゛カナ", *user_dic).size(), 0);
 }
 
 TEST_F(UserDictionaryTest, AsyncLoadTest) {
@@ -756,6 +846,86 @@ TEST_F(UserDictionaryTest, AsyncLoadTest) {
   {
     std::unique_ptr<UserDictionary> dic(CreateDictionaryWithFilename(filename));
     dic->Reload();
+  }
+}
+
+TEST_F(UserDictionaryTest, AddSuppressionEntryPersistsInDedicatedDictionary) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string filename =
+      FileUtil::JoinPath(temp_dir.path(), "add_suppression_test.db");
+
+  std::unique_ptr<UserDictionary> user_dic(
+      CreateDictionaryWithFilename(filename));
+  user_dic->WaitForReloader();
+
+  EXPECT_TRUE(user_dic->AddSuppressionEntry("グーグル", "グーグル"));
+  EXPECT_TRUE(user_dic->IsSuppressedEntry("ぐーぐる", "グーグル"));
+
+  {
+    UserDictionaryStorage storage(filename);
+    EXPECT_OK(storage.Load());
+    const auto id = storage.GetUserDictionaryId("非表示候補");
+    ASSERT_OK(id);
+    const UserDictionaryStorage::UserDictionary* dictionary =
+        storage.GetUserDictionary(*id);
+    ASSERT_NE(dictionary, nullptr);
+    ASSERT_EQ(dictionary->entries_size(), 1);
+    EXPECT_EQ(dictionary->entries(0).key(), "ぐーぐる");
+    EXPECT_EQ(dictionary->entries(0).value(), "グーグル");
+    EXPECT_EQ(dictionary->entries(0).pos(),
+              user_dictionary::UserDictionary::SUPPRESSION_WORD);
+  }
+
+  EXPECT_TRUE(user_dic->AddSuppressionEntry("ぐーぐる", "グーグル"));
+  {
+    UserDictionaryStorage storage(filename);
+    EXPECT_OK(storage.Load());
+    const auto id = storage.GetUserDictionaryId("非表示候補");
+    ASSERT_OK(id);
+    const UserDictionaryStorage::UserDictionary* dictionary =
+        storage.GetUserDictionary(*id);
+    ASSERT_NE(dictionary, nullptr);
+    EXPECT_EQ(dictionary->entries_size(), 1);
+  }
+}
+
+TEST_F(UserDictionaryTest, ConsecutiveReloadTest) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string filename =
+      FileUtil::JoinPath(temp_dir.path(), "consecutive_reload_test.db");
+
+  std::unique_ptr<UserDictionary> dic(CreateDictionaryWithFilename(filename));
+  dic->WaitForReloader();
+
+  constexpr int kNumUpdates = 10;
+  for (int i = 0; i < kNumUpdates; ++i) {
+    UserDictionaryStorage storage(filename);
+    if (i > 0) {
+      EXPECT_OK(storage.Load());
+    }
+    EXPECT_TRUE(storage.Lock());
+    EXPECT_OK(storage.CreateDictionary(absl::StrCat("dic_", i)));
+    UserDictionaryStorage::UserDictionary* user_dic =
+        storage.GetProto().mutable_dictionaries(i);
+    for (int j = 0; j < 500; ++j) {
+      UserDictionaryStorage::UserDictionaryEntry* entry =
+          user_dic->add_entries();
+      entry->set_key(absl::StrFormat("key_%d_%d", i, j));
+      entry->set_value(absl::StrFormat("value_%d_%d", i, j));
+      entry->set_pos(user_dictionary::UserDictionary::NOUN);
+    }
+    EXPECT_OK(storage.Save());
+    EXPECT_TRUE(storage.UnLock());
+
+    // Trigger Reload() immediately without waiting for the previous reload to
+    // finish.
+    EXPECT_TRUE(dic->Reload());
+  }
+
+  dic->WaitForReloader();
+
+  for (int i = 0; i < kNumUpdates; ++i) {
+    EXPECT_FALSE(LookupExact(absl::StrFormat("key_%d_0", i), *dic).empty());
   }
 }
 
@@ -991,6 +1161,37 @@ TEST_F(UserDictionaryTest, TestPopulateTokenFromUserPosToken) {
   dic->PopulateTokenFromUserPosToken(user_token, UserDictionary::PREFIX,
                                      &token);
   EXPECT_EQ(token.cost, expected_cost);
+}
+
+TEST_F(UserDictionaryTest, TestPopulateTokenFromUserPosTokenWithEntryPenalty) {
+  std::unique_ptr<UserDictionary> dic(CreateDictionaryWithMockPos());
+  user_dictionary::UserDictionaryStorage storage;
+  user_dictionary::UserDictionary* user_dic = storage.add_dictionaries();
+  for (int i = 0; i < 10; ++i) {
+    user_dictionary::UserDictionary::Entry* entry = user_dic->add_entries();
+    entry->set_key(absl::StrCat("key", i));
+    entry->set_value(absl::StrCat("value", i));
+    entry->set_pos(user_dictionary::UserDictionary::NOUN);
+  }
+  dic->Load(storage);
+
+  UserPos::Token user_token{.key = "key0", .value = "value0", .id = 10};
+  user_token.set_pos_type(user_dictionary::UserDictionary::NOUN);
+
+  Token token;
+  dic->PopulateTokenFromUserPosToken(user_token, UserDictionary::PREFIX,
+                                     &token);
+  const int base_cost = UserPos::GetCostFromPosType(user_token.pos_type());
+  const int expected_penalty =
+      static_cast<int>(500.0 * std::log(11.0));  // N = 10
+  EXPECT_EQ(token.cost, base_cost + expected_penalty);
+
+  // POS type with cost 0 in user_pos.def (e.g. WA_GROUP1_VERB) uses default
+  // cost (5000) without penalty.
+  user_token.set_pos_type(user_dictionary::UserDictionary::WA_GROUP1_VERB);
+  dic->PopulateTokenFromUserPosToken(user_token, UserDictionary::PREFIX,
+                                     &token);
+  EXPECT_EQ(token.cost, 5000);
 }
 
 TEST_F(UserDictionaryTest, AsyncImportTest) {

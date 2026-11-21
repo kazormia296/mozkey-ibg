@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -45,6 +46,7 @@
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "base/strings/japanese.h"
 #include "base/text_normalizer.h"
 #include "base/util.h"
 #include "base/vlog.h"
@@ -212,6 +214,92 @@ std::vector<SegmentSizes> BuildSegmentationCandidates(
   }
 
   return candidates;
+}
+
+bool IsAsciiDigit(char c) { return c >= '0' && c <= '9'; }
+
+bool IsStandalonePostalCode(absl::string_view key) {
+  if (key.size() == 7) {
+    return std::all_of(key.begin(), key.end(), IsAsciiDigit);
+  }
+  if (key.size() != 8 || key[3] != '-') {
+    return false;
+  }
+  for (size_t i = 0; i < key.size(); ++i) {
+    if (i != 3 && !IsAsciiDigit(key[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// This runs after all converter and contextual reranking. Keep a literal
+// numeral top-ranked within each postal-code segment, including in sentences.
+// Never manufacture a candidate using an address candidate's POS IDs.
+void PreferStandalonePostalLiteral(const composer::Composer& composer,
+                                   Segments* segments) {
+  const std::string full_query = composer.GetQueryForConversion();
+  for (Segment& segment : segments->conversion_segments()) {
+    const std::string key(segment.key());
+    if (!IsStandalonePostalCode(key) || segment.candidates_size() == 0) {
+      continue;
+    }
+    const bool whole_input =
+        segments->conversion_segments_size() == 1 && key == full_query;
+    const std::string preedit = whole_input ? composer.GetStringForPreedit()
+                                           : std::string();
+    const std::string fullwidth =
+        japanese::HalfWidthAsciiToFullWidthAscii(key);
+    bool promoted = false;
+    for (const std::string& value : {preedit, key, fullwidth}) {
+      if (value.empty()) {
+        continue;
+      }
+      for (int i = 0; i < segment.candidates_size(); ++i) {
+        if (segment.candidate(i).value == value) {
+          segment.move_candidate(i, 0);
+          promoted = true;
+          break;
+        }
+      }
+      if (promoted) {
+        break;
+      }
+      for (size_t i = 0; i < segment.meta_candidates_size(); ++i) {
+        if (segment.meta_candidate(i).value == value) {
+          segment.move_candidate(-static_cast<int>(i) - 1, 0);
+          promoted = true;
+          break;
+        }
+      }
+      if (promoted) {
+        break;
+      }
+    }
+  }
+}
+
+bool IsSuppressibleCandidate(const Segment& segment, int candidate_index) {
+  // Desktop conversion requires at least one regular candidate per segment.
+  // Hiding the last regular candidate would make the next conversion invalid.
+  if (candidate_index < 0 || !segment.is_valid_index(candidate_index) ||
+      segment.candidates_size() <= 1) {
+    return false;
+  }
+  const converter::Candidate& candidate = segment.candidate(candidate_index);
+  if (candidate.key.empty() || candidate.value.empty()) {
+    return false;
+  }
+  if (candidate.attributes & converter::Attribute::COMMAND_CANDIDATE) {
+    return false;
+  }
+  // Mozkey IbG: session-scoped project dictionary terms must never be written
+  // to the global user dictionary, which is where suppression entries live.
+  if (candidate.ranking_constraints &
+      converter::RankingConstraint::PROJECT_DICTIONARY) {
+    return false;
+  }
+  return true;
 }
 
 #if defined(_WIN32) && defined(MOZC_LEFT_CONTEXT_DEBUG)
@@ -408,14 +496,11 @@ const ConversionPreferences& EngineConverter::conversion_preferences() const {
   return conversion_preferences_;
 }
 
-bool EngineConverter::Convert(const composer::Composer& composer) {
-  return ConvertWithPreferences(composer, conversion_preferences_);
-}
-
-bool EngineConverter::ConvertWithPreferences(
-    const composer::Composer& composer,
-    const ConversionPreferences& preferences) {
+bool EngineConverter::Convert(const composer::Composer& composer,
+                              const commands::Context& context,
+                              const ConversionPreferences& preferences) {
   DCHECK(CheckState(COMPOSITION | SUGGESTION | CONVERSION));
+  focused_suggestion_for_learning_ = false;
 
   ResetSegmentationCycle();
 
@@ -424,11 +509,21 @@ bool EngineConverter::ConvertWithPreferences(
   ConversionRequest::Options options;
   options.enable_user_history_for_conversion = preferences.use_history;
   SetRequestType(ConversionRequest::CONVERSION, options);
+  // Keep this override request-local. Do not mutate the shared config or
+  // disable native Mozc user history while bypassing Zenz feedback.
+  config::Config request_config;
+  const config::Config* effective_config = config_.get();
+  if (preferences.ignore_zenz_feedback) {
+    request_config = *config_;
+    request_config.set_use_zenz_feedback_reuse(false);
+    effective_config = &request_config;
+  }
   const ConversionRequest conversion_request =
       ConversionRequestBuilder()
           .SetComposer(composer)
           .SetRequestView(*request_)
-          .SetConfigView(*config_)
+          .SetContextView(context)
+          .SetConfigView(*effective_config)
           .SetOptions(std::move(options))
           .SetProjectDictionary(PinnedProjectDictionary())
           .Build();
@@ -475,6 +570,12 @@ bool EngineConverter::ConvertWithPreferences(
 
   ContextualCandidateReranker contextual_candidate_reranker;
   contextual_candidate_reranker.Rerank(&segments_);
+  // The numeric TOP1 override belongs to the ZIP feature. When that feature
+  // is disabled, retain the converter's original ranking even in live mode.
+  if (preferences.prefer_zipcode_literal_top &&
+      conversion_request.options().use_zip_code_conversion) {
+    PreferStandalonePostalLiteral(composer, &segments_);
+  }
 
 #if defined(_WIN32) && defined(MOZC_LEFT_CONTEXT_DEBUG)
   MozcLeftContextDebugOutput(absl::StrCat(
@@ -842,6 +943,7 @@ bool EngineConverter::SwitchKanaType(const composer::Composer& composer) {
               .SetComposer(composer)
               .SetRequestView(*request_)
               .SetConfigView(*config_)
+              .SetRequestType(ConversionRequest::CONVERSION)
               .SetProjectDictionary(PinnedProjectDictionary())
               .Build();
       if (!converter_->ResizeSegments(&segments_, conversion_request, 0,
@@ -877,13 +979,8 @@ bool EngineConverter::SwitchKanaType(const composer::Composer& composer) {
 }
 
 bool EngineConverter::Suggest(const composer::Composer& composer,
-                              const commands::Context& context) {
-  return SuggestWithPreferences(composer, context, conversion_preferences_);
-}
-
-bool EngineConverter::SuggestWithPreferences(
-    const composer::Composer& composer, const commands::Context& context,
-    const ConversionPreferences& preferences) {
+                              const commands::Context& context,
+                              const ConversionPreferences& preferences) {
   DCHECK(CheckState(COMPOSITION | SUGGESTION));
   candidate_list_visible_ = false;
 
@@ -1038,23 +1135,22 @@ bool EngineConverter::SuggestWithPreferences(
   return true;
 }
 
-bool EngineConverter::Predict(const composer::Composer& composer) {
-  return PredictWithPreferences(composer, conversion_preferences_);
-}
-
 bool EngineConverter::IsEmptySegment(const Segment& segment) const {
   return ((segment.candidates_size() == 0) &&
           (segment.meta_candidates_size() == 0));
 }
 
-bool EngineConverter::PredictWithPreferences(
-    const composer::Composer& composer,
-    const ConversionPreferences& preferences) {
+bool EngineConverter::Predict(const composer::Composer& composer,
+                              const commands::Context& context,
+                              const ConversionPreferences& preferences) {
   // TODO(komatsu): DCHECK should be
   // DCHECK(CheckState(COMPOSITION | SUGGESTION | PREDICTION));
   DCHECK(CheckState(COMPOSITION | SUGGESTION | CONVERSION | PREDICTION));
   ResetResult();
 
+  // Keep the focused suggestion's provenance until a replacement candidate
+  // list has actually been built. A failed expansion must not turn the held
+  // suggestion into an unrelated prediction.
   // Initialize the segments and conversion_request for prediction
   ConversionRequest::Options options;
   options.enable_user_history_for_conversion = preferences.use_history;
@@ -1066,6 +1162,7 @@ bool EngineConverter::PredictWithPreferences(
       ConversionRequestBuilder()
           .SetComposer(composer)
           .SetRequestView(*request_)
+          .SetContextView(context)
           .SetConfigView(*config_)
           .SetOptions(std::move(options))
           .SetProjectDictionary(PinnedProjectDictionary())
@@ -1078,8 +1175,6 @@ bool EngineConverter::PredictWithPreferences(
       (CheckState(PREDICTION) && !IsEmptySegment(previous_suggestions_) &&
        candidate_list_.size() > 0 && candidate_list_.focused() &&
        candidate_list_.focused_index() == candidate_list_.last_index());
-
-  segments_.clear_conversion_segments();
 
   std::vector<typing_correction::WholeSequenceConversion>
       shadow_predictions;
@@ -1117,23 +1212,38 @@ bool EngineConverter::PredictWithPreferences(
     }
   }
 
-  if (predict_expand || predict_first) {
-    const bool result = converter_->StartPredictionWithPreviousSuggestion(
-        conversion_request, previous_suggestions_, &segments_);
-    if (!result && predict_first) {
-      // Returns false if we failed at the first prediction.
-      // If predict_expand is true, it means we have prevous_suggestions_.
-      // So we can use it as the result of this prediction.
-      ResetState();
+  if (predict_expand) {
+    // Expansion is speculative: preserve the held suggestion and its focused
+    // candidate if the predictor fails or produces no usable candidates.
+    // In particular, never rebuild CandidateList from an empty Segments.
+    Segments expanded = segments_;
+    expanded.clear_conversion_segments();
+    if (!converter_->StartPredictionWithPreviousSuggestion(
+            conversion_request, previous_suggestions_, &expanded) ||
+        expanded.conversion_segments_size() != 1 ||
+        expanded.conversion_segment(0).candidates_size() == 0) {
       return false;
     }
+    segments_ = std::move(expanded);
   } else {
-    converter_->PrependCandidates(conversion_request, previous_suggestions_,
-                                  &segments_);
+    segments_.clear_conversion_segments();
+    if (predict_first) {
+      if (!converter_->StartPredictionWithPreviousSuggestion(
+              conversion_request, previous_suggestions_, &segments_)) {
+        ResetState();
+        return false;
+      }
+    } else {
+      converter_->PrependCandidates(conversion_request, previous_suggestions_,
+                                    &segments_);
+    }
   }
 
   AppendTypingCorrectionCandidates(std::move(shadow_predictions));
 
+  // This marker refers to the old displayed suggestion IDs. It must only be
+  // invalidated after successfully replacing that list.
+  focused_suggestion_for_learning_ = false;
   segment_index_ = 0;
   state_ = PREDICTION;
   UpdateCandidateList();
@@ -1152,17 +1262,60 @@ void EngineConverter::MaybeExpandPrediction(
       candidate_list_.focused_index() != candidate_list_.last_index()) {
     return;
   }
+  // A displayed suggestion can be held while a trailing romaji is pending.
+  // Do not merge that stale list into a prediction for a different key.
+  // On a matching key the original end-of-list expansion remains available.
+  if (focused_suggestion_for_learning_ &&
+      previous_suggestions_.key() != composer.GetQueryForPrediction()) {
+    return;
+  }
 
   DCHECK(CheckState(PREDICTION));
   ResetResult();
 
-  const size_t previous_index = candidate_list_.focused_index();
-  if (!PredictWithPreferences(composer, conversion_preferences_)) {
+  // Candidate indices and integer IDs are local to one prediction result.
+  // Preserve the focused candidate by its reading and surface, rather than
+  // interpreting an old index as a candidate in a newly generated list.
+  if (segments_.conversion_segments_size() != 1) {
+    return;
+  }
+  const Segment& previous_segment = segments_.conversion_segment(0);
+  const int previous_id = candidate_list_.focused_id();
+  if (!previous_segment.is_valid_index(previous_id)) {
+    return;
+  }
+  const converter::Candidate& previous_candidate =
+      previous_segment.candidate(previous_id);
+  const std::string previous_key = previous_candidate.key;
+  const std::string previous_value = previous_candidate.value;
+  if (!Predict(composer, conversion_preferences_)) {
     return;
   }
 
-  DCHECK_LT(previous_index, candidate_list_.size());
-  candidate_list_.MoveToId(candidate_list_.candidate(previous_index).id());
+  // Successful expansion always has a nonempty regular candidate list (the
+  // speculative Predict path rejects empty results). The old candidate may
+  // have moved, disappeared, or received a different numeric candidate ID.
+  const Segment& expanded_segment = segments_.conversion_segment(0);
+  bool restored = false;
+  for (size_t i = 0; i < candidate_list_.size(); ++i) {
+    const Candidate& item = candidate_list_.candidate(i);
+    if (item.HasSubcandidateList() ||
+        !expanded_segment.is_valid_index(item.id())) {
+      continue;
+    }
+    const converter::Candidate& candidate =
+        expanded_segment.candidate(item.id());
+    if (candidate.key == previous_key && candidate.value == previous_value) {
+      restored = candidate_list_.MoveToId(item.id());
+      break;
+    }
+  }
+  if (!restored) {
+    // No equivalent candidate survived: do not select an unrelated result at
+    // the old integer index. CandidateNext() will wrap from here to the new
+    // first candidate. This also works when the expanded list shrinks.
+    candidate_list_.MoveLast();
+  }
   UpdateSelectedCandidateIndex();
 }
 
@@ -1236,20 +1389,31 @@ void EngineConverter::Commit(const composer::Composer& composer,
     return;
   }
 
-  for (size_t i = 0; i < segments_.conversion_segments_size(); ++i) {
-    if (!converter_->CommitSegmentValue(&segments_, i,
-                                        GetCandidateIndexForConverter(i))) {
+  for (size_t i = 0; i < segments_.conversion_segments_size();
+       i += GetSegmentSpan(i)) {
+    const int cand_idx = GetCandidateIndexForConverter(i);
+    if (!converter_->CommitSegmentValue(&segments_, i, cand_idx)) {
       LOG(WARNING) << "Failed to commit segment " << i;
     }
   }
   CommitSegmentsSize(state_, context);
   DCHECK(request_);
   DCHECK(config_);
+  // A suggestion promoted to a focused prediction still represents the
+  // original explicitly selected suggestion.  Do not lose that provenance
+  // when Session switches to CONVERSION and uses the ordinary Commit path.
+  // This marker is set only by successful suggestion-list focus and cleared
+  // on a fresh conversion, prediction, cancellation, or completed commit.
+  ConversionRequest::Options options;
+  options.enable_verified_suggestion_segment_learning =
+      focused_suggestion_for_learning_ && !request_->mixed_conversion() &&
+      !request_->zero_query_suggestion() && conversion_preferences_.use_history;
   const ConversionRequest conversion_request = ConversionRequestBuilder()
                                                    .SetComposer(composer)
                                                    .SetRequestView(*request_)
                                                    .SetContextView(context)
                                                    .SetConfigView(*config_)
+                                                   .SetOptions(options)
                                                    .SetProjectDictionary(
                                                        PinnedProjectDictionary())
                                                    .Build();
@@ -1333,7 +1497,7 @@ bool EngineConverter::LearnExternalConversionSegments(
   options.request_type = ConversionRequest::CONVERSION;
   options.enable_user_history_for_conversion = true;
 
-  // Learn one externally committed multi-segment result.  The segment list is
+  // Learn one externally committed segmented result.  The segment list is
   // already projected by session code and represents a virtual normal
   // conversion commit, not segment-local Zenz feedback-store records.
   const ConversionRequest conversion_request =
@@ -1348,6 +1512,230 @@ bool EngineConverter::LearnExternalConversionSegments(
 
   return converter_->LearnExternalConversionSegments(
       conversion_request, segments);
+}
+
+uint64_t EngineConverter::LearnExternalConversionResultReversibly(
+    absl::string_view key,
+    absl::string_view value,
+    const commands::Context& context) {
+  if (key.empty() || value.empty() ||
+      external_learning_revert_segments_.size() >=
+          kMaxExternalLearningRevertEntries) {
+    return 0;
+  }
+
+  DCHECK(request_);
+  DCHECK(config_);
+  if (!conversion_preferences_.use_history) {
+    return 0;
+  }
+
+  ConversionRequest::Options options;
+  options.request_type = ConversionRequest::CONVERSION;
+  options.enable_user_history_for_conversion = true;
+  options.reversible_external_learning = true;
+  const ConversionRequest conversion_request =
+      ConversionRequestBuilder()
+          .SetRequestView(*request_)
+          .SetContextView(context)
+          .SetConfigView(*config_)
+          .SetOptions(std::move(options))
+          .SetProjectDictionary(PinnedProjectDictionary())
+          .SetKey(key)
+          .Build();
+
+  Segments revert_segments;
+  if (!converter_->LearnExternalConversionResultReversibly(
+          conversion_request, key, value, &revert_segments)) {
+    return 0;
+  }
+  const uint64_t revert_id = revert_segments.revert_id();
+  if (revert_id == 0) {
+    LOG(ERROR) << "Reversible external learning returned no revert_id";
+    return 0;
+  }
+  external_learning_revert_segments_.push_back(revert_segments);
+  return revert_id;
+}
+
+uint64_t EngineConverter::LearnExternalConversionSegmentsReversibly(
+    absl::Span<const ExternalConversionSegment> segments,
+    const commands::Context& context) {
+  if (segments.empty() ||
+      external_learning_revert_segments_.size() >=
+          kMaxExternalLearningRevertEntries) {
+    return 0;
+  }
+
+  DCHECK(request_);
+  DCHECK(config_);
+  if (!conversion_preferences_.use_history) {
+    return 0;
+  }
+
+  std::string full_key;
+  for (const ExternalConversionSegment& segment : segments) {
+    if (segment.key.empty() || segment.value.empty()) {
+      return 0;
+    }
+    absl::StrAppend(&full_key, segment.key);
+  }
+
+  ConversionRequest::Options options;
+  options.request_type = ConversionRequest::CONVERSION;
+  options.enable_user_history_for_conversion = true;
+  options.reversible_external_learning = true;
+  const ConversionRequest conversion_request =
+      ConversionRequestBuilder()
+          .SetRequestView(*request_)
+          .SetContextView(context)
+          .SetConfigView(*config_)
+          .SetOptions(std::move(options))
+          .SetProjectDictionary(PinnedProjectDictionary())
+          .SetKey(full_key)
+          .Build();
+
+  Segments revert_segments;
+  if (!converter_->LearnExternalConversionSegmentsReversibly(
+          conversion_request, segments, &revert_segments)) {
+    return 0;
+  }
+  const uint64_t revert_id = revert_segments.revert_id();
+  if (revert_id == 0) {
+    LOG(ERROR) << "Reversible external segment learning returned no revert_id";
+    return 0;
+  }
+  external_learning_revert_segments_.push_back(revert_segments);
+  return revert_id;
+}
+
+bool EngineConverter::RevertExternalConversionLearning(uint64_t revert_id) {
+  const auto it = std::find_if(
+      external_learning_revert_segments_.begin(),
+      external_learning_revert_segments_.end(),
+      [revert_id](const Segments& segments) {
+        return segments.revert_id() == revert_id;
+      });
+  if (it == external_learning_revert_segments_.end()) {
+    return false;
+  }
+
+  converter_->RevertConversion(&*it);
+  external_learning_revert_segments_.erase(it);
+  return true;
+}
+
+bool EngineConverter::ConfirmExternalConversionLearning(uint64_t revert_id) {
+  const auto it = std::find_if(
+      external_learning_revert_segments_.begin(),
+      external_learning_revert_segments_.end(),
+      [revert_id](const Segments& segments) {
+        return segments.revert_id() == revert_id;
+      });
+  if (it == external_learning_revert_segments_.end()) {
+    return false;
+  }
+
+  converter_->DiscardConversionRevertState(&*it);
+  external_learning_revert_segments_.erase(it);
+  return true;
+}
+
+// The successful successor and the old owner share the same backing
+// converter. Move opaque rollback tokens exactly once; Clone() must
+// continue to drop ownership in ordinary snapshots/Undo contexts.
+bool EngineConverter::TransferExternalConversionLearningOwnershipTo(
+    EngineConverterInterface* successor) {
+  if (successor == nullptr || successor == this) {
+    return false;
+  }
+  return successor->ReceiveExternalConversionLearningOwnership(
+      converter_.get(), &external_learning_revert_segments_);
+}
+
+bool EngineConverter::ReceiveExternalConversionLearningOwnership(
+    const ConverterInterface* source_backend,
+    std::vector<Segments>* handles) {
+  if (source_backend == nullptr || source_backend != converter_.get() ||
+      handles == nullptr || !external_learning_revert_segments_.empty()) {
+    return false;
+  }
+  external_learning_revert_segments_ = std::move(*handles);
+  return true;
+}
+
+bool EngineConverter::ResolveExternalConversionSegments(
+    absl::string_view key, absl::string_view value,
+    const commands::Context& context,
+    std::vector<ExternalConversionSegment>* segments) {
+  if (segments == nullptr) {
+    return false;
+  }
+  segments->clear();
+  if (key.empty() || value.empty()) {
+    return false;
+  }
+
+  DCHECK(request_);
+  DCHECK(config_);
+
+  ConversionRequest::Options options;
+  options.request_type = ConversionRequest::CONVERSION;
+  options.enable_user_history_for_conversion = false;
+
+  const ConversionRequest conversion_request =
+      ConversionRequestBuilder()
+          .SetRequestView(*request_)
+          .SetContextView(context)
+          .SetConfigView(*config_)
+          .SetOptions(std::move(options))
+          .SetProjectDictionary(PinnedProjectDictionary())
+          .SetKey(key)
+          .Build();
+
+  return converter_->ResolveExternalConversionSegments(
+      conversion_request, key, value, segments);
+}
+
+bool EngineConverter::EvaluateExternalConversionSegments(
+    absl::Span<const ExternalConversionSegment> segments,
+    const commands::Context& context,
+    std::vector<ExternalConversionSegment>* evaluated_segments) {
+  if (evaluated_segments == nullptr) {
+    return false;
+  }
+  evaluated_segments->clear();
+  if (segments.empty()) {
+    return false;
+  }
+
+  DCHECK(request_);
+  DCHECK(config_);
+
+  std::string full_key;
+  for (const ExternalConversionSegment& segment : segments) {
+    if (segment.key.empty() || segment.value.empty()) {
+      return false;
+    }
+    absl::StrAppend(&full_key, segment.key);
+  }
+
+  ConversionRequest::Options options;
+  options.request_type = ConversionRequest::CONVERSION;
+  options.enable_user_history_for_conversion = false;
+
+  const ConversionRequest conversion_request =
+      ConversionRequestBuilder()
+          .SetRequestView(*request_)
+          .SetContextView(context)
+          .SetConfigView(*config_)
+          .SetOptions(std::move(options))
+          .SetProjectDictionary(PinnedProjectDictionary())
+          .SetKey(full_key)
+          .Build();
+
+  return converter_->EvaluateExternalConversionSegments(
+      conversion_request, segments, evaluated_segments);
 }
 
 void EngineConverter::LookupUserDictionaryPrefixEntries(
@@ -1424,11 +1812,19 @@ bool EngineConverter::CommitSuggestionInternal(
     }
     CommitSegmentsSize(EngineConverterInterface::SUGGESTION, context);
     DCHECK(config_);
+    // Only a complete desktop suggestion commit may request a separate
+    // learning view. The ordinary commit, output, and undo ownership stay
+    // unchanged; mobile/mixed and zero-query commits retain their old path.
+    ConversionRequest::Options options;
+    options.enable_verified_suggestion_segment_learning =
+        !request_->mixed_conversion() && !request_->zero_query_suggestion() &&
+        conversion_preferences_.use_history;
     const ConversionRequest conversion_request = ConversionRequestBuilder()
                                                      .SetComposer(composer)
                                                      .SetRequestView(*request_)
                                                      .SetContextView(context)
                                                      .SetConfigView(*config_)
+                                                     .SetOptions(options)
                                                      .SetProjectDictionary(
                                                          PinnedProjectDictionary())
                                                      .Build();
@@ -1471,14 +1867,16 @@ bool EngineConverter::CommitSuggestionById(const int id,
 void EngineConverter::CommitHeadToFocusedSegments(
     const composer::Composer& composer, const commands::Context& context,
     size_t* consumed_key_size) {
-  CommitSegmentsInternal(composer, context, segment_index_ + 1,
+  CommitSegmentsInternal(composer, context,
+                         segment_index_ + GetSegmentSpan(segment_index_),
                          consumed_key_size);
 }
 
 void EngineConverter::CommitFirstSegment(const composer::Composer& composer,
                                          const commands::Context& context,
                                          size_t* consumed_key_size) {
-  CommitSegmentsInternal(composer, context, 1, consumed_key_size);
+  CommitSegmentsInternal(composer, context, GetSegmentSpan(0),
+                         consumed_key_size);
 }
 
 void EngineConverter::CommitSegmentsInternal(const composer::Composer& composer,
@@ -1490,6 +1888,14 @@ void EngineConverter::CommitSegmentsInternal(const composer::Composer& composer,
   ResetResult();
   candidate_list_visible_ = false;
   *consumed_key_size = 0;
+
+  // If the selected candidate on the first segment covers all conversion
+  // segments (e.g. full-sentence candidate), commit the entire conversion
+  // rather than partially committing only the first segment.
+  if (IsFullSentenceCandidateSelected()) {
+    Commit(composer, context);
+    return;
+  }
 
   // If commit all segments, just call Commit.
   if (segments_.conversion_segments_size() <= segments_to_commit) {
@@ -1515,16 +1921,15 @@ void EngineConverter::CommitSegmentsInternal(const composer::Composer& composer,
     return;
   }
 
-  std::vector<size_t> candidate_ids;
   for (size_t i = 0; i < segments_to_commit; ++i) {
-    // Get the i-th (0 origin) conversion segment and the selected candidate.
-    const Segment& segment = segments_.conversion_segment(i);
+    // Accumulate the size of every covered raw segment's key so that the
+    // composer consumes the entire reading of multi-segment candidates.
+    *consumed_key_size += segments_.conversion_segment(i).key_len();
+  }
 
-    // Accumulate the size of i-th segment's key.
-    // The caller will remove corresponding characters from the composer.
-    *consumed_key_size += segment.key_len();
-
-    // Collect candidate's id for each segment.
+  std::vector<size_t> candidate_ids;
+  for (size_t i = 0; i < segments_to_commit; i += GetSegmentSpan(i)) {
+    // Select one candidate per logical segment, skipping covered segments.
     candidate_ids.push_back(GetCandidateIndexForConverter(i));
   }
   if (!converter_->CommitSegments(&segments_, candidate_ids)) {
@@ -1693,6 +2098,44 @@ bool EngineConverter::DeleteCandidateFromHistory(std::optional<int> id) {
       segments_, segments_.history_segments_size() + segment_index_, *id);
 }
 
+bool EngineConverter::DeleteOrSuppressCandidate(std::optional<int> id) {
+  if (segment_index_ >= segments_.conversion_segments_size()) {
+    return false;
+  }
+
+  if (id == std::nullopt) {
+    if (!candidate_list_.focused()) {
+      return false;
+    }
+    id = candidate_list_.focused_candidate().id();
+  }
+
+  const Segment& segment = segments_.conversion_segment(segment_index_);
+  if (!segment.is_valid_index(*id)) {
+    return false;
+  }
+
+  // Preserve the existing meaning first: if this exact candidate has any
+  // deletable predictor/segment history, Ctrl+Del removes that history only.
+  // Suppression is a fallback only when no history entry could be deleted.
+  if (converter_->DeleteCandidateFromHistory(
+          segments_, segments_.history_segments_size() + segment_index_, *id)) {
+    return true;
+  }
+
+  if (!IsSuppressibleCandidate(segment, *id)) {
+    return false;
+  }
+  // Mozkey IbG: a typing-correction alternative is keyed by the corrected
+  // reading of a scratch conversion.  Suppressing it would hide the correctly
+  // spelled word for its own reading, not the correction that was rejected.
+  if (FindTypingCorrectionAlternative(segment_index_, *id) != nullptr) {
+    return false;
+  }
+  const converter::Candidate& candidate = segment.candidate(*id);
+  return converter_->AddSuppressionEntry(candidate.key, candidate.value);
+}
+
 void EngineConverter::SegmentFocusInternal(size_t index) {
   DCHECK(CheckState(PREDICTION | CONVERSION));
   candidate_list_visible_ = false;
@@ -1712,12 +2155,15 @@ void EngineConverter::SegmentFocusInternal(size_t index) {
 }
 
 void EngineConverter::SegmentFocusRight() {
-  if (segment_index_ + 1 >= segments_.conversion_segments_size()) {
-    // If |segment_index_| is at the tail of the segments,
-    // focus on the head.
+  DCHECK_LT(segment_index_, segments_.conversion_segments_size());
+  const size_t span =
+      GetSelectedCandidate(segment_index_).effective_converted_segment_count();
+  if (segment_index_ + span >= segments_.conversion_segments_size()) {
+    // If the next segment position reaches or exceeds the tail of the
+    // segments, focus on the head.
     SegmentFocusLeftEdge();
   } else {
-    SegmentFocusInternal(segment_index_ + 1);
+    SegmentFocusInternal(segment_index_ + span);
   }
 }
 
@@ -1732,7 +2178,15 @@ void EngineConverter::SegmentFocusLeft() {
     // focus on the tail.
     SegmentFocusLast();
   } else {
-    SegmentFocusInternal(segment_index_ - 1);
+    // With multi-segment candidates, the previous segment's start index is not
+    // necessarily `segment_index_ - 1`. Traverse from the beginning using
+    // segment spans to find the start index of the segment immediately
+    // preceding `segment_index_`.
+    size_t prev = 0;
+    for (size_t i = 0; i < segment_index_; i += GetSegmentSpan(i)) {
+      prev = i;
+    }
+    SegmentFocusInternal(prev);
   }
 }
 
@@ -1750,15 +2204,42 @@ void EngineConverter::ResizeSegmentWidth(const composer::Composer& composer,
 
   DCHECK(request_);
   DCHECK(config_);
-  const ConversionRequest conversion_request = ConversionRequestBuilder()
-                                                   .SetComposer(composer)
-                                                   .SetRequestView(*request_)
-                                                   .SetConfigView(*config_)
-                                                   .SetProjectDictionary(
-                                                       PinnedProjectDictionary())
-                                                   .Build();
+  const ConversionRequest conversion_request =
+      ConversionRequestBuilder()
+          .SetComposer(composer)
+          .SetRequestView(*request_)
+          .SetConfigView(*config_)
+          .SetRequestType(ConversionRequest::CONVERSION)
+          .SetProjectDictionary(PinnedProjectDictionary())
+          .Build();
+  const Segment& segment = segments_.conversion_segment(segment_index_);
+  const converter::Candidate& candidate = GetSelectedCandidate(segment_index_);
+
+  // For multi-segment candidates with step resize (+/-1), resize based on
+  // the full candidate key length.
+  // e.g. For 2-segment candidate "私の名前は" (key: "わたしのなまえは", 8
+  // chars) when segment(0).key_len() is 4, delta=+1 should target 9 chars
+  // (offset = 9 - 4 = +5) rather than 5 chars (4 + 1).
+  const size_t current_len =
+      (std::abs(delta) == 1 &&
+       candidate.effective_converted_segment_count() > 1 &&
+       !candidate.key.empty())
+          ? Util::CharsLen(candidate.key)
+          : segment.key_len();
+
+  // target_len: The desired absolute key length after resizing (+/- delta).
+  const int target_len = static_cast<int>(current_len) + delta;
+  // offset_length: The relative offset from segment.key_len() passed to
+  // ResizeSegment.
+  const int offset_length = target_len - static_cast<int>(segment.key_len());
+
+  if (target_len <= 0 || target_len > std::numeric_limits<uint8_t>::max() ||
+      offset_length == 0) {
+    return;
+  }
+
   if (!converter_->ResizeSegment(&segments_, conversion_request, segment_index_,
-                                 delta)) {
+                                 offset_length)) {
     return;
   }
 
@@ -1833,6 +2314,40 @@ bool EngineConverter::CycleSegmentation(const composer::Composer& composer) {
   return false;
 }
 
+bool EngineConverter::FocusSuggestionCandidateWithoutPrediction(const int id) {
+  if (!CheckState(SUGGESTION) ||
+      segments_.conversion_segments_size() == 0) {
+    return false;
+  }
+
+  ResetResult();
+  if (!candidate_list_.MoveToId(id)) {
+    return false;
+  }
+
+  // Keep the exact displayed suggestion segments/candidate IDs.  Transition
+  // only the state needed for focused candidate navigation.
+  focused_suggestion_for_learning_ = true;
+  state_ = PREDICTION;
+  request_type_ = ConversionRequest::PREDICTION;
+  segment_index_ = 0;
+
+  // MoveToId() changes only the candidate index.  SUGGESTION deliberately
+  // keeps CandidateList::focused_ false, so explicitly mark this exact held
+  // list as focused when promoting it to PREDICTION.
+  candidate_list_.set_focused(true);
+  candidate_list_visible_ = true;
+
+  // Keep the displayed suggestion snapshot for normal end-of-list
+  // expansion. MaybeExpandPrediction refuses stale composer keys; an actual
+  // Predict() resets focused_suggestion_for_learning_ because the list
+  // changes and the original suggestion provenance no longer applies.
+
+  UpdateSelectedCandidateIndex();
+  SegmentFocus();
+  return true;
+}
+
 void EngineConverter::CandidateNext(const composer::Composer& composer) {
   DCHECK(CheckState(PREDICTION | CONVERSION));
   ResetResult();
@@ -1880,11 +2395,12 @@ void EngineConverter::CandidateMoveToId(const int id,
   ResetResult();
 
   if (CheckState(SUGGESTION)) {
-    // This method makes a candidate focused but SUGGESTION state cannot
-    // have focused candidate.
-    // To solve this conflict we call Predict() method to transit to
-    // PREDICTION state, on which existence of focused candidate is acceptable.
-    Predict(composer);
+    // The candidate ID belongs to the displayed suggestion list, not to a
+    // regenerated prediction list. Preserve the exact selected candidate and
+    // its provenance across Session's later CONVERSION-state commit.
+    // Invalid/stale IDs fail closed instead of being reinterpreted.
+    (void)FocusSuggestionCandidateWithoutPrediction(id);
+    return;
   }
   DCHECK(CheckState(PREDICTION | CONVERSION));
 
@@ -2046,7 +2562,12 @@ void EngineConverter::FillOutput(const composer::Composer& composer,
   // All candidate words
   if (CheckState(SUGGESTION | PREDICTION | CONVERSION)) {
     FillAllCandidateWords(output->mutable_all_candidate_words());
-    if (request_->fill_incognito_candidate_words()) {
+    // The bounds check must happen before mutable_incognito_candidate_words()
+    // so that the field is not materialized (and hence
+    // has_incognito_candidate_words() stays false) when the incognito
+    // prediction produced no segments.
+    if (request_->fill_incognito_candidate_words() &&
+        segment_index_ < incognito_segments_.conversion_segments_size()) {
       FillIncognitoCandidateWords(output->mutable_incognito_candidate_words());
     }
   }
@@ -2075,6 +2596,10 @@ EngineConverter* EngineConverter::Clone() const {
       new EngineConverter(converter_, request_, config_,
                           project_dictionary_provider_);
   *engine_converter = *this;
+
+  // Reversible external-learning handles are transaction ownership tokens, not
+  // ordinary converter state. Snapshot clones must never duplicate ownership.
+  engine_converter->external_learning_revert_segments_.clear();
 
   if (engine_converter->CheckState(SUGGESTION | PREDICTION | CONVERSION)) {
     // UpdateCandidateList() is not simple setter and it uses some members.
@@ -2179,6 +2704,7 @@ EngineConverter::PinnedProjectDictionary() const {
 }
 
 void EngineConverter::ResetState() {
+  focused_suggestion_for_learning_ = false;
   state_ = COMPOSITION;
   segment_index_ = 0;
   typing_correction_alternatives_.clear();
@@ -2222,6 +2748,7 @@ bool EngineConverter::ApplySegmentation(
           .SetComposer(composer)
           .SetRequestView(*request_)
           .SetConfigView(*config_)
+          .SetRequestType(ConversionRequest::CONVERSION)
           .SetProjectDictionary(PinnedProjectDictionary())
           .Build();
 
@@ -2287,6 +2814,12 @@ void EngineConverter::SegmentFix() {
           &segments_, segment_index_,
           GetCandidateIndexForConverter(segment_index_))) {
     LOG(WARNING) << "CommitSegmentValue failed";
+    return;
+  }
+  // CommitSegmentValue moves the selected candidate to candidate(0),
+  // so reset the selected index for this segment to 0.
+  if (segment_index_ < selected_candidate_indices_.size()) {
+    selected_candidate_indices_[segment_index_] = 0;
   }
 }
 
@@ -2304,16 +2837,25 @@ void EngineConverter::GetPreedit(const size_t index, const size_t size,
     *preedit = alternative->hypothesis.corrected_reading;
     return;
   }
-  for (size_t i = index; i < size; ++i) {
-    if (CheckState(CONVERSION)) {
-      // In conversion mode, all the key of candidates is same.
-      preedit->append(segments_.conversion_segment(i).key());
-    } else {
-      DCHECK(CheckState(SUGGESTION | PREDICTION));
-      // In suggestion or prediction modes, each key may have
-      // different keys, so content_key is used although it is
-      // possibly dropped the conjugational word (ex. the content_key
-      // of "はしる" is "はし").
+  if (CheckState(CONVERSION)) {
+    const size_t end = index + size;
+    for (size_t i = index; i < end; i += GetSegmentSpan(i)) {
+      const Segment& segment = segments_.conversion_segment(i);
+      const converter::Candidate& candidate = GetSelectedCandidate(i);
+      if (candidate.effective_converted_segment_count() > 1 &&
+          !candidate.key.empty()) {
+        preedit->append(candidate.key);
+      } else {
+        preedit->append(segment.key());
+      }
+    }
+  } else {
+    DCHECK(CheckState(SUGGESTION | PREDICTION));
+    // In suggestion or prediction modes, each key may have
+    // different keys, so content_key is used although it is
+    // possibly dropped the conjugational word (ex. the content_key
+    // of "はしる" is "はし").
+    for (size_t i = index; i < size; ++i) {
       preedit->append(GetSelectedCandidate(i).content_key);
     }
   }
@@ -2333,7 +2875,8 @@ void EngineConverter::GetConversion(const size_t index, const size_t size,
     *conversion = alternative->candidate.value;
     return;
   }
-  for (size_t i = index; i < size; ++i) {
+  const size_t end = index + size;
+  for (size_t i = index; i < end; i += GetSegmentSpan(i)) {
     conversion->append(GetSelectedCandidateValue(i));
   }
 }
@@ -2374,7 +2917,8 @@ void EngineConverter::UpdateResultTokens(const size_t index,
     return;
   }
 
-  for (size_t i = index; i < size; ++i) {
+  const size_t end = index + size;
+  for (size_t i = index; i < end; i += GetSegmentSpan(i)) {
     const int cand_idx = GetCandidateIndexForConverter(i);
     const converter::Candidate& candidate =
         segments_.conversion_segment(i).candidate(cand_idx);
@@ -2416,6 +2960,11 @@ size_t EngineConverter::GetConsumedPreeditSize(const size_t index,
   }
 
   DCHECK(CheckState(CONVERSION));
+  // If the selected candidate on the first segment covers all conversion
+  // segments, all characters are considered consumed.
+  if (IsFullSentenceCandidateSelected()) {
+    return kConsumedAllCharacters;
+  }
   size_t result = 0;
   for (size_t i = index; i < size; ++i) {
     const int id = GetCandidateIndexForConverter(i);
@@ -2601,6 +3150,24 @@ const converter::Candidate& EngineConverter::GetSelectedCandidate(
   return segments_.conversion_segment(segment_index).candidate(id);
 }
 
+size_t EngineConverter::GetSegmentSpan(const size_t segment_index) const {
+  const converter::Candidate& candidate = GetSelectedCandidate(segment_index);
+  const size_t count = candidate.effective_converted_segment_count();
+  if (segment_index < segment_index_ &&
+      segment_index + count > segment_index_) {
+    return segment_index_ - segment_index;
+  }
+  return count;
+}
+
+bool EngineConverter::IsFullSentenceCandidateSelected() const {
+  if (segment_index_ != 0) {
+    return false;
+  }
+  return GetSelectedCandidate(0).effective_converted_segment_count() >=
+         segments_.conversion_segments_size();
+}
+
 void EngineConverter::FillConversion(commands::Preedit* preedit) const {
   DCHECK(CheckState(PREDICTION | CONVERSION));
   if (const typing_correction::WholeSequenceConversion* alternative =
@@ -2637,7 +3204,7 @@ void EngineConverter::FillCandidateWindow(
   // The position to display the candidate window.
   size_t position = 0;
   std::string conversion;
-  for (size_t i = 0; i < segment_index_; ++i) {
+  for (size_t i = 0; i < segment_index_; i += GetSegmentSpan(i)) {
     position += Util::CharsLen(GetSelectedCandidate(i).value);
   }
 
@@ -2750,6 +3317,11 @@ void EngineConverter::FillAllCandidateWords(
 
 void EngineConverter::FillIncognitoCandidateWords(
     commands::CandidateList* candidates) const {
+  // |incognito_segments_| can be empty when the incognito prediction failed
+  // to produce suggestions (e.g. no user history in incognito mode).  The
+  // caller (FillOutput) checks the size before materializing the output field,
+  // so this precondition is guaranteed to hold here.
+  DCHECK_LT(segment_index_, incognito_segments_.conversion_segments_size());
   const Segment& segment =
       incognito_segments_.conversion_segment(segment_index_);
   for (size_t i = 0; i < segment.candidates_size(); ++i) {

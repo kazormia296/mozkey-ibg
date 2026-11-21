@@ -165,22 +165,316 @@ TEST_F(WindowUtilTest, MainWindow) {
                                                       49, 0, "On the top edge");
 
   VerifyMainWindowWithTargetPointAndPreeditVertical(
-      50, 55, 50, 50, 20, 5, 70, 55, "Preedit is in the middle of the window");
-  VerifyMainWindowWithTargetPointAndPreeditVertical(50, 198, 50, 198, 5, 20, 55,
-                                                    80, "On the bottom edge");
-  VerifyMainWindowWithTargetPointAndPreeditVertical(-50, 50, -50, 50, 5, 20, 0,
-                                                    50, "On the left edge");
+      50, 55, 50, 50, 20, 5, 40, 57,
+      "Prefer the left side in the middle of the window");
   VerifyMainWindowWithTargetPointAndPreeditVertical(
-      50, 55, 50, 0, 20, 100, 70, 55,
+      50, 198, 50, 198, 5, 20, 40, 80, "Clamp on the bottom edge");
+  VerifyMainWindowWithTargetPointAndPreeditVertical(
+      -50, 50, -50, 50, 5, 20, 0, 52, "Clamp beyond the left edge");
+  VerifyMainWindowWithTargetPointAndPreeditVertical(
+      50, 55, 50, 0, 20, 100, 40, 57,
       "Preedit height is the same to client area");
-  // If the candidate window across the right edge, it appears in the left of
-  // the preedit.
   VerifyMainWindowWithTargetPointAndPreeditVertical(
-      192, 50, 192, 50, 5, 20, 182, 50, "On the right edge");
+      192, 50, 192, 50, 5, 20, 182, 52,
+      "Keep the preferred left side near the right edge");
   VerifyMainWindowWithTargetPointAndPreeditVertical(
-      215, 50, 210, 50, 5, 20, 190, 50, "Under the right edge");
-  VerifyMainWindowWithTargetPointAndPreeditVertical(-5, 50, -10, 50, 5, 20, 0,
-                                                    50, "On the left edge");
+      215, 50, 210, 50, 5, 20, 190, 52,
+      "Clamp when both sides are beyond the right edge");
+  VerifyMainWindowWithTargetPointAndPreeditVertical(
+      -5, 50, -10, 50, 5, 20, 0, 52,
+      "Clamp when both sides are beyond the left edge");
+}
+
+TEST_F(WindowUtilTest, VerticalMainWindowFallsBackToRight) {
+  const Point target_point(5, 50);
+  const Rect preedit_rect(5, 50, 5, 20);
+  const Size window_size(10, 20);
+  const Point zero_point_offset(1, -2);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForMainWindowFromTargetPointAndPreedit(
+          target_point, preedit_rect, window_size, zero_point_offset,
+          working_area, true);
+
+  EXPECT_EQ(result.Left(), 10);
+  EXPECT_EQ(result.Top(), 52);
+}
+
+TEST_F(WindowUtilTest, VerticalMainWindowAlignsCandidateTextTop) {
+  const Point target_point(50, 60);
+  const Rect preedit_rect(50, 60, 5, 20);
+  const Size window_size(10, 20);
+  const Point zero_point_offset(123, 7);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForMainWindowFromTargetPointAndPreedit(
+          target_point, preedit_rect, window_size, zero_point_offset,
+          working_area, true);
+
+  // The x-component does not affect side placement.  The y-component marks
+  // the first candidate text position inside the candidate window.
+  EXPECT_EQ(result.Left(), 40);
+  EXPECT_EQ(result.Top(), 53);
+}
+
+TEST_F(WindowUtilTest, VerticalMainWindowWithoutWorkingAreaKeepsLeftPreference) {
+  const Point target_point(50, 50);
+  const Rect preedit_rect(50, 50, 5, 20);
+  const Size window_size(10, 20);
+  const Point zero_point_offset(1, -2);
+  const Rect unknown_working_area(0, 0, 0, 0);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForMainWindowFromTargetPointAndPreedit(
+          target_point, preedit_rect, window_size, zero_point_offset,
+          unknown_working_area, true);
+
+  EXPECT_EQ(result.Left(), 40);
+  EXPECT_EQ(result.Top(), 52);
+}
+
+TEST_F(WindowUtilTest, IndicatorKeepsLegacyPlacementWhenItFits) {
+  const Rect target_rect(50, 40, 1, 20);
+  const Size indicator_size(40, 30);
+  const Point top_anchor_offset(20, 5);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetIndicatorWindowRect(
+      target_rect, indicator_size, top_anchor_offset, 18, 7, working_area);
+
+  EXPECT_EQ(result.Left(), 30);
+  EXPECT_EQ(result.Top(), 55);
+  EXPECT_LE(result.Bottom() + 7, working_area.Bottom());
+}
+
+TEST_F(WindowUtilTest, IndicatorFlipsAboveBeforeFadeCrossesBottomEdge) {
+  const Rect target_rect(50, 40, 1, 29);
+  const Size indicator_size(40, 30);
+  const Point top_anchor_offset(20, 5);
+  const int body_height = 18;
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetIndicatorWindowRect(
+      target_rect, indicator_size, top_anchor_offset, body_height, 7,
+      working_area);
+
+  // Legacy placement starts at y=64: the opaque bitmap still ends at 94, but
+  // the final 7 px fade slide would cross the 100 px working-area bottom.
+  // The bitmap has 7 px below its visible body. Ignore that trailing margin
+  // for visual alignment while still reserving the 7 px fade travel.
+  EXPECT_EQ(result.Left(), 30);
+  EXPECT_EQ(result.Top(), 10);
+  EXPECT_EQ(result.Top() + top_anchor_offset.y + body_height + 7,
+            target_rect.Top());
+}
+
+TEST_F(WindowUtilTest, IndicatorClampsHorizontalEdges) {
+  const Size indicator_size(40, 30);
+  const Point top_anchor_offset(20, 5);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect left_result = WindowUtil::GetIndicatorWindowRect(
+      Rect(5, 40, 1, 20), indicator_size, top_anchor_offset, 18, 7,
+      working_area);
+  EXPECT_EQ(left_result.Left(), 0);
+
+  const Rect right_result = WindowUtil::GetIndicatorWindowRect(
+      Rect(195, 40, 1, 20), indicator_size, top_anchor_offset, 18, 7,
+      working_area);
+  EXPECT_EQ(right_result.Left(), 160);
+}
+
+TEST_F(WindowUtilTest, IndicatorSupportsNegativeMonitorCoordinates) {
+  const Rect target_rect(-5, 40, 1, 20);
+  const Size indicator_size(40, 30);
+  const Point top_anchor_offset(20, 5);
+  const Rect working_area(-200, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetIndicatorWindowRect(
+      target_rect, indicator_size, top_anchor_offset, 18, 7, working_area);
+
+  EXPECT_EQ(result.Left(), -40);
+  EXPECT_EQ(result.Top(), 55);
+}
+
+TEST_F(WindowUtilTest, IndicatorWithoutWorkingAreaPreservesLegacyCoordinates) {
+  const Rect target_rect(50, 90, 1, 20);
+  const Size indicator_size(40, 30);
+  const Point top_anchor_offset(20, 5);
+  const Rect unknown_working_area(0, 0, 0, 0);
+
+  const Rect result = WindowUtil::GetIndicatorWindowRect(
+      target_rect, indicator_size, top_anchor_offset, 18, 7,
+      unknown_working_area);
+
+  EXPECT_EQ(result.Left(), 30);
+  EXPECT_EQ(result.Top(), 105);
+}
+
+TEST_F(WindowUtilTest, IndicatorFallsBackToWorkingAreaWhenNeitherSideFits) {
+  const Rect target_rect(50, 45, 1, 10);
+  const Size indicator_size(40, 90);
+  const Point top_anchor_offset(20, 5);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetIndicatorWindowRect(
+      target_rect, indicator_size, top_anchor_offset, 40, 7, working_area);
+
+  EXPECT_EQ(result.Left(), 30);
+  EXPECT_EQ(result.Top(), 0);
+  EXPECT_LE(result.Bottom() + 7, working_area.Bottom());
+}
+
+TEST_F(WindowUtilTest, IndicatorInvalidBodyHeightUsesConservativeBitmapEdge) {
+  const Rect target_rect(50, 40, 1, 29);
+  const Size indicator_size(40, 30);
+  const Point top_anchor_offset(20, 5);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetIndicatorWindowRect(
+      target_rect, indicator_size, top_anchor_offset, 0, 7, working_area);
+
+  EXPECT_EQ(result.Top(), 3);
+}
+
+TEST_F(WindowUtilTest, VerticalCandidatePlacementKeepsWideHostLine) {
+  const Rect preedit_rect(100, 200, 72, 1);
+
+  const Rect result =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRect(preedit_rect, 36);
+
+  EXPECT_EQ(result.Left(), 100);
+  EXPECT_EQ(result.Top(), 200);
+  EXPECT_EQ(result.Width(), 72);
+  EXPECT_EQ(result.Height(), 1);
+}
+
+TEST_F(WindowUtilTest, VerticalCandidatePlacementExpandsNarrowEvenHostLine) {
+  const Rect preedit_rect(100, 200, 50, 1);
+
+  const Rect result =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRect(preedit_rect, 36);
+
+  EXPECT_EQ(result.Left(), 89);
+  EXPECT_EQ(result.Top(), 200);
+  EXPECT_EQ(result.Width(), 72);
+  EXPECT_EQ(result.Height(), 1);
+}
+
+TEST_F(WindowUtilTest, VerticalCandidatePlacementExpandsNarrowOddHostLine) {
+  const Rect preedit_rect(100, 200, 51, 1);
+
+  const Rect result =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRect(preedit_rect, 36);
+
+  EXPECT_EQ(result.Left(), 89);
+  EXPECT_EQ(result.Top(), 200);
+  EXPECT_EQ(result.Width(), 73);
+  EXPECT_EQ(result.Height(), 1);
+}
+
+TEST_F(WindowUtilTest, VerticalCandidatePlacementKeepsNonPositiveMinimum) {
+  const Rect preedit_rect(100, 200, 50, 1);
+
+  const Rect result =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRect(preedit_rect, 0);
+
+  EXPECT_EQ(result.Left(), 100);
+  EXPECT_EQ(result.Top(), 200);
+  EXPECT_EQ(result.Width(), 50);
+  EXPECT_EQ(result.Height(), 1);
+}
+
+TEST_F(WindowUtilTest, VerticalCandidatePlacementMarginExpandsBothSides) {
+  const Rect preedit_rect(100, 200, 7, 20);
+
+  const Rect result =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRectWithMargin(
+          preedit_rect, 10);
+
+  EXPECT_EQ(result.Left(), 90);
+  EXPECT_EQ(result.Right(), 117);
+  EXPECT_EQ(result.Top(), 200);
+  EXPECT_EQ(result.Height(), 20);
+}
+
+TEST_F(WindowUtilTest, VerticalCandidatePlacementMarginKeepsNonPositiveMargin) {
+  const Rect preedit_rect(100, 200, 7, 20);
+
+  const Rect zero_margin =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRectWithMargin(
+          preedit_rect, 0);
+  EXPECT_EQ(zero_margin.Left(), preedit_rect.Left());
+  EXPECT_EQ(zero_margin.Top(), preedit_rect.Top());
+  EXPECT_EQ(zero_margin.Width(), preedit_rect.Width());
+  EXPECT_EQ(zero_margin.Height(), preedit_rect.Height());
+
+  const Rect negative_margin =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRectWithMargin(
+          preedit_rect, -5);
+  EXPECT_EQ(negative_margin.Left(), preedit_rect.Left());
+  EXPECT_EQ(negative_margin.Top(), preedit_rect.Top());
+  EXPECT_EQ(negative_margin.Width(), preedit_rect.Width());
+  EXPECT_EQ(negative_margin.Height(), preedit_rect.Height());
+}
+
+TEST_F(WindowUtilTest, VerticalMainWindowKeepsTenPixelLeftClearance) {
+  const Point target_point(50, 50);
+  const Rect host_preedit_rect(50, 50, 5, 20);
+  const Rect placement_preedit_rect =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRectWithMargin(
+          host_preedit_rect, 10);
+  const Size window_size(10, 20);
+  const Point zero_point_offset(0, 0);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForMainWindowFromTargetPointAndPreedit(
+          target_point, placement_preedit_rect, window_size,
+          zero_point_offset, working_area, true);
+
+  EXPECT_EQ(result.Right(), host_preedit_rect.Left() - 10);
+  EXPECT_EQ(result.Top(), target_point.y);
+}
+
+TEST_F(WindowUtilTest, VerticalMainWindowKeepsTenPixelRightFallbackClearance) {
+  const Point target_point(5, 50);
+  const Rect host_preedit_rect(5, 50, 5, 20);
+  const Rect placement_preedit_rect =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRectWithMargin(
+          host_preedit_rect, 10);
+  const Size window_size(30, 20);
+  const Point zero_point_offset(0, 0);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForMainWindowFromTargetPointAndPreedit(
+          target_point, placement_preedit_rect, window_size,
+          zero_point_offset, working_area, true);
+
+  EXPECT_EQ(result.Left(), host_preedit_rect.Right() + 10);
+  EXPECT_EQ(result.Top(), target_point.y);
+}
+
+TEST_F(WindowUtilTest, VerticalCandidatePlacementClearanceSurvivesRightFallback) {
+  const Point target_point(5, 50);
+  const Rect host_preedit_rect(5, 50, 50, 1);
+  const Rect placement_preedit_rect =
+      WindowUtil::GetVerticalCandidatePlacementPreeditRect(host_preedit_rect,
+                                                           36);
+  const Size window_size(10, 20);
+  const Point zero_point_offset(0, 0);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForMainWindowFromTargetPointAndPreedit(
+          target_point, placement_preedit_rect, window_size, zero_point_offset,
+          working_area, true);
+
+  EXPECT_EQ(result.Left(), 66);
+  EXPECT_EQ(result.Top(), 50);
 }
 
 TEST_F(WindowUtilTest, CascadingWindow) {
@@ -194,12 +488,147 @@ TEST_F(WindowUtilTest, CascadingWindow) {
   VerifyCascadingWindow(50, -20, 20, 5, 69, 0, "On the top edge");
 }
 
+TEST_F(WindowUtilTest, VerticalCascadingWindowPrefersOutsideLeft) {
+  const Rect selected_candidate(70, 20, 20, 40);
+  const Rect candidate_rect(50, 10, 40, 70);
+  const Rect preedit_rect(90, 10, 10, 70);
+  const Size cascading_size(30, 20);
+  const Point zero_point_offset(0, 0);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForCascadingWindowForVerticalWriting(
+          selected_candidate, candidate_rect, cascading_size,
+          zero_point_offset, preedit_rect, working_area);
+
+  EXPECT_EQ(result.Left(), 20);
+  EXPECT_EQ(result.Right(), candidate_rect.Left());
+  EXPECT_EQ(result.Top(), selected_candidate.Top());
+}
+
+TEST_F(WindowUtilTest,
+       VerticalCascadingWindowDoesNotCoverLeftSiblingColumns) {
+  // The focused candidate is an interior column.  Placement must be outside
+  // the complete main candidate window, not immediately left of this column.
+  const Rect selected_candidate(90, 20, 20, 40);
+  const Rect candidate_rect(40, 10, 80, 70);
+  const Rect preedit_rect(120, 10, 10, 70);
+  const Size cascading_size(30, 20);
+  const Point zero_point_offset(0, 0);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForCascadingWindowForVerticalWriting(
+          selected_candidate, candidate_rect, cascading_size,
+          zero_point_offset, preedit_rect, working_area);
+
+  EXPECT_EQ(result.Right(), candidate_rect.Left());
+  EXPECT_LT(result.Right(), selected_candidate.Left());
+}
+
+TEST_F(WindowUtilTest, VerticalCascadingWindowFallsBackBeyondPreedit) {
+  const Rect selected_candidate(25, 20, 20, 40);
+  const Rect candidate_rect(5, 10, 40, 70);
+  const Rect preedit_rect(45, 10, 10, 70);
+  const Size cascading_size(30, 20);
+  const Point zero_point_offset(0, 0);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForCascadingWindowForVerticalWriting(
+          selected_candidate, candidate_rect, cascading_size,
+          zero_point_offset, preedit_rect, working_area);
+
+  EXPECT_EQ(result.Left(), preedit_rect.Right());
+  EXPECT_GT(result.Left(), candidate_rect.Right());
+  EXPECT_EQ(result.Top(), selected_candidate.Top());
+}
+
+TEST_F(WindowUtilTest,
+       VerticalCascadingWindowPreservesZeroPointAndClampsVerticalPosition) {
+  const Rect selected_candidate(70, 95, 20, 40);
+  const Rect candidate_rect(50, 10, 40, 90);
+  const Rect preedit_rect(90, 10, 10, 90);
+  const Size cascading_size(30, 20);
+  const Point zero_point_offset(2, 3);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForCascadingWindowForVerticalWriting(
+          selected_candidate, candidate_rect, cascading_size,
+          zero_point_offset, preedit_rect, working_area);
+
+  EXPECT_EQ(result.Left(), 22);
+  EXPECT_EQ(result.Top(), 80);
+  EXPECT_EQ(result.Bottom(), working_area.Bottom());
+}
+
+TEST_F(WindowUtilTest,
+       VerticalCascadingWindowWithoutWorkingAreaKeepsLeftPreference) {
+  const Rect selected_candidate(70, 20, 20, 40);
+  const Rect candidate_rect(50, 10, 40, 70);
+  const Rect preedit_rect(90, 10, 10, 70);
+  const Size cascading_size(30, 20);
+  const Point zero_point_offset(2, 3);
+  const Rect unknown_working_area(0, 0, 0, 0);
+
+  const Rect result =
+      WindowUtil::GetWindowRectForCascadingWindowForVerticalWriting(
+          selected_candidate, candidate_rect, cascading_size,
+          zero_point_offset, preedit_rect, unknown_working_area);
+
+  EXPECT_EQ(result.Left(), 22);
+  EXPECT_EQ(result.Top(), 17);
+}
+
 TEST_F(WindowUtilTest, InfolistWindow) {
   VerifyInfolistWindow(10, 20, 20, 30, 11, 12, 31, 30,
                        "Right of the candidate window");
   VerifyInfolistWindow(10, 10, 160, 30, 40, 12, 150, 30,
                        "Left of the candidate window");
   VerifyInfolistWindow(10, 20, 20, 85, 11, 12, 31, 80, "On the bottom edge");
+}
+
+TEST_F(WindowUtilTest, VerticalInfolistPrefersOutsideOfPreedit) {
+  const Size infolist_size(30, 20);
+  const Rect candidate_rect(60, 20, 20, 40);
+  const Rect preedit_rect(80, 20, 10, 40);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetWindowRectForInfolistWindowAvoidingRect(
+      infolist_size, candidate_rect, preedit_rect, working_area);
+
+  EXPECT_EQ(result.Left(), 30);
+  EXPECT_EQ(result.Top(), 20);
+  EXPECT_EQ(result.Right(), candidate_rect.Left());
+}
+
+TEST_F(WindowUtilTest, VerticalInfolistFallsBackBeyondPreedit) {
+  const Size infolist_size(30, 20);
+  const Rect candidate_rect(5, 20, 20, 40);
+  const Rect preedit_rect(25, 20, 10, 40);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetWindowRectForInfolistWindowAvoidingRect(
+      infolist_size, candidate_rect, preedit_rect, working_area);
+
+  EXPECT_EQ(result.Left(), 35);
+  EXPECT_EQ(result.Top(), 20);
+  EXPECT_EQ(result.Left(), preedit_rect.Right());
+}
+
+TEST_F(WindowUtilTest, VerticalInfolistUsesVerticalFallbackWhenSidesAreTight) {
+  const Size infolist_size(60, 20);
+  const Rect candidate_rect(50, 40, 40, 20);
+  const Rect preedit_rect(90, 40, 60, 20);
+  const Rect working_area(0, 0, 200, 100);
+
+  const Rect result = WindowUtil::GetWindowRectForInfolistWindowAvoidingRect(
+      infolist_size, candidate_rect, preedit_rect, working_area);
+
+  EXPECT_EQ(result.Left(), 50);
+  EXPECT_EQ(result.Top(), 20);
+  EXPECT_EQ(result.Bottom(), candidate_rect.Top());
 }
 
 TEST_F(WindowUtilTest, MonitorErrors) {
@@ -236,5 +665,127 @@ TEST_F(WindowUtilTest, MonitorErrors) {
   EXPECT_EQ(result.Top(), 32);
 }
 
+TEST_F(WindowUtilTest, RubyWindowPrefersAbovePreedit) {
+  const Rect preedit_rect(100, 200, 20, 20);
+  const Size ruby_size(100, 30);
+  const Rect working_area(0, 0, 1000, 800);
+
+  Rect result;
+  ASSERT_TRUE(WindowUtil::GetRubyWindowRect(
+      preedit_rect, ruby_size, 4, working_area, nullptr, &result));
+
+  EXPECT_EQ(result.Left(), 100);
+  EXPECT_EQ(result.Top(), 166);
+  EXPECT_EQ(result.Width(), 100);
+  EXPECT_EQ(result.Height(), 30);
+}
+
+TEST_F(WindowUtilTest, RubyWindowMovesBelowAvoidRectangle) {
+  const Rect preedit_rect(100, 200, 20, 20);
+  const Size ruby_size(100, 30);
+  const Rect working_area(0, 0, 1000, 800);
+  const Rect avoid_rect(90, 150, 160, 60);
+
+  Rect result;
+  ASSERT_TRUE(WindowUtil::GetRubyWindowRect(
+      preedit_rect, ruby_size, 4, working_area, &avoid_rect, &result));
+
+  EXPECT_EQ(result.Left(), 100);
+  EXPECT_EQ(result.Top(), 224);
+  EXPECT_EQ(result.Width(), 100);
+  EXPECT_EQ(result.Height(), 30);
+}
+
+TEST_F(WindowUtilTest, RubyWindowReturnsFalseWhenBothSidesAreBlocked) {
+  const Rect preedit_rect(100, 200, 20, 20);
+  const Size ruby_size(100, 30);
+  const Rect working_area(0, 0, 1000, 800);
+  const Rect avoid_rect(80, 140, 200, 140);
+
+  Rect result;
+  EXPECT_FALSE(WindowUtil::GetRubyWindowRect(
+      preedit_rect, ruby_size, 4, working_area, &avoid_rect, &result));
+}
+
+TEST_F(WindowUtilTest, VerticalRubyPrefersRightOfComposition) {
+  const Rect composition_span(100, 200, 20, 1);
+  const Size ruby_size(30, 100);
+  const Rect working_area(0, 0, 1000, 800);
+
+  Rect result;
+  ASSERT_TRUE(WindowUtil::GetRubyWindowRectForVerticalWriting(
+      composition_span, ruby_size, 8, 4, working_area, nullptr, &result));
+
+  EXPECT_EQ(result.Left(), 124);
+  EXPECT_EQ(result.Top(), 192);
+}
+
+TEST_F(WindowUtilTest, VerticalRubyUsesOuterRightAcrossWrappedColumns) {
+  // The active wrapped column could currently end at x=70, while an earlier
+  // column in the same vertical composition reached x=120. The ruby must stay
+  // outside the outermost observed right edge, not move over the earlier text.
+  const Rect composition_span(60, 200, 60, 1);
+  const Size ruby_size(30, 100);
+  const Rect working_area(0, 0, 1000, 800);
+
+  Rect result;
+  ASSERT_TRUE(WindowUtil::GetRubyWindowRectForVerticalWriting(
+      composition_span, ruby_size, 8, 4, working_area, nullptr, &result));
+
+  EXPECT_EQ(composition_span.Right(), 120);
+  EXPECT_EQ(result.Left(), 124);
+}
+
+TEST_F(WindowUtilTest, VerticalRubyFallsBackOutsideLeftSpanAtRightEdge) {
+  const Rect composition_span(960, 200, 20, 1);
+  const Size ruby_size(50, 100);
+  const Rect working_area(0, 0, 1000, 800);
+
+  Rect result;
+  ASSERT_TRUE(WindowUtil::GetRubyWindowRectForVerticalWriting(
+      composition_span, ruby_size, 8, 4, working_area, nullptr, &result));
+
+  EXPECT_EQ(result.Left(), 906);
+  EXPECT_EQ(result.Right(), 956);
+  EXPECT_LT(result.Right(), composition_span.Left());
+}
+
+TEST_F(WindowUtilTest, VerticalRubyAvoidsSuggestionOnPreferredRight) {
+  const Rect composition_span(100, 200, 20, 1);
+  const Size ruby_size(30, 100);
+  const Rect working_area(0, 0, 1000, 800);
+  const Rect avoid_rect(120, 180, 100, 180);
+
+  Rect result;
+  ASSERT_TRUE(WindowUtil::GetRubyWindowRectForVerticalWriting(
+      composition_span, ruby_size, 8, 4, working_area, &avoid_rect, &result));
+
+  EXPECT_EQ(result.Right(), 96);
+  EXPECT_EQ(result.Left(), 66);
+}
+
+TEST_F(WindowUtilTest, VerticalRubyReturnsFalseWhenBothSidesAreBlocked) {
+  const Rect composition_span(100, 200, 20, 1);
+  const Size ruby_size(30, 100);
+  const Rect working_area(0, 0, 1000, 800);
+  const Rect avoid_rect(50, 180, 220, 180);
+
+  Rect result;
+  EXPECT_FALSE(WindowUtil::GetRubyWindowRectForVerticalWriting(
+      composition_span, ruby_size, 8, 4, working_area, &avoid_rect, &result));
+}
+
+TEST_F(WindowUtilTest, VerticalRubyClampsTopInsideWorkingArea) {
+  const Rect composition_span(100, 760, 20, 1);
+  const Size ruby_size(30, 100);
+  const Rect working_area(0, 0, 1000, 800);
+
+  Rect result;
+  ASSERT_TRUE(WindowUtil::GetRubyWindowRectForVerticalWriting(
+      composition_span, ruby_size, 8, 4, working_area, nullptr, &result));
+
+  EXPECT_EQ(result.Top(), 700);
+  EXPECT_EQ(result.Bottom(), 800);
+}
 }  // namespace renderer
 }  // namespace mozc

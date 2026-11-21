@@ -60,8 +60,11 @@ class WindowUtil {
       const Point& zero_point_offset, const Rect& working_area);
 
   // Returns the appropriate candidate window position in the screen
-  // coordinate.  |zero_point_offset| is the point in the candidate
-  // window which should be aligned to the preedit.
+  // coordinate.  For horizontal writing, |zero_point_offset| is aligned to
+  // |target_point| as before.  For vertical writing, its y-coordinate aligns
+  // the first candidate text with |target_point.y| while horizontal placement
+  // is adjacent to |preedit_rect|: the left side is preferred and the right
+  // side is the fallback.
   // |working_area| is the available area in the current monitor.  If
   // caller fails to obtain |working_area|, set its width or height as
   // 0.  Then it doesn't care the monitor.
@@ -69,6 +72,35 @@ class WindowUtil {
       const Point& target_point, const Rect& preedit_rect,
       const Size& window_size, const Point& zero_point_offset,
       const Rect& working_area, bool vertical);
+
+  // Returns the input-mode indicator rectangle. The preferred placement keeps
+  // |top_anchor_offset| aligned to the bottom-left of |target_rect|, preserving
+  // the legacy position. If that placement would cross the bottom of the
+  // working area during the downward fade animation, the visible indicator
+  // body is placed above |target_rect| while transparent/shadow bitmap margins
+  // may extend closer to the target. This avoids an unnecessarily large visual
+  // gap without allowing the body itself to overlap the target during fading.
+  // Horizontal placement and the final fallback are clamped to |working_area|.
+  // If the working area is unavailable, the legacy preferred position is
+  // returned unchanged.
+  static Rect GetIndicatorWindowRect(
+      const Rect& target_rect, const Size& window_size,
+      const Point& top_anchor_offset, int body_height,
+      int downward_animation_offset, const Rect& working_area);
+
+  // Returns the preedit rectangle to use only for vertical candidate
+  // placement. Hosts may report a vertical line box narrower than the visual
+  // clearance needed around the line center. Preserve wider host geometry,
+  // but symmetrically expand narrow rectangles to at least
+  // |minimum_half_width| on each side of that center.
+  static Rect GetVerticalCandidatePlacementPreeditRect(
+      const Rect& preedit_rect, int minimum_half_width);
+
+  // Returns the vertical candidate-placement obstacle expanded by |margin| on
+  // both horizontal sides. This gives left-preferred placement and right-side
+  // fallback the same composition clearance.
+  static Rect GetVerticalCandidatePlacementPreeditRectWithMargin(
+      const Rect& preedit_rect, int margin);
 
   // Returns the appropriate cascading window position in the screen
   // coordinate.  |zero_point_offset| is the point in the cascading
@@ -82,6 +114,39 @@ class WindowUtil {
                                               const Point& zero_point_offset,
                                               const Rect& working_area);
 
+  // Returns a cascading-window rectangle for vertical writing.  The selected
+  // candidate controls only the vertical anchor.  Horizontally, the cascading
+  // window is kept outside the union of the main candidate window and the
+  // active preedit, so it cannot open over sibling candidate columns or back
+  // across the composition.  The left side is preferred because Japanese
+  // vertical candidate order proceeds right-to-left; the right side is the
+  // fallback.
+  static Rect GetWindowRectForCascadingWindowForVerticalWriting(
+      const Rect& selected_candidate, const Rect& candidate_rect,
+      const Size& window_size, const Point& zero_point_offset,
+      const Rect& avoid_rect, const Rect& working_area);
+
+  // Returns a ruby-window rectangle that stays inside |working_area| and
+  // does not intersect |avoid_rect|. Placement above the preedit is preferred;
+  // below is used as the fallback. Returns false if neither side is usable.
+  static bool GetRubyWindowRect(const Rect& preedit_rect,
+                                const Size& window_size, int gap,
+                                const Rect& working_area,
+                                const Rect* avoid_rect,
+                                Rect* window_rect);
+
+  // Returns a vertical-writing ruby rectangle around the horizontally occupied
+  // span of the active composition. |composition_span.Left()/Right()| are the
+  // outermost observed composition-column edges and |composition_span.Top()|
+  // is the current text anchor. |text_top_offset| is the vertical inset from
+  // the ruby window edge to its first text glyph. Japanese vertical ruby is
+  // placed outside the right edge first and outside the left edge as fallback.
+  // This keeps ruby outside a composition that wraps into columns to the left.
+  static bool GetRubyWindowRectForVerticalWriting(
+      const Rect& composition_span, const Size& window_size,
+      int text_top_offset, int gap, const Rect& working_area,
+      const Rect* avoid_rect, Rect* window_rect);
+
   // Returns the appropriate infolist window position in the screen
   // coordinate.  |window_size| is the size of the infolist window.
   // |candidate_rect| is the rect of the candidate window.
@@ -91,6 +156,15 @@ class WindowUtil {
   static Rect GetWindowRectForInfolistWindow(const Size& window_size,
                                              const Rect& candidate_rect,
                                              const Rect& working_area);
+
+  // Returns an infolist rectangle that avoids both |candidate_rect| and
+  // |avoid_rect| whenever the working area allows it.  The side opposite
+  // |avoid_rect| is preferred, so a vertical candidate window placed left of
+  // the preedit also puts its infolist farther left.  The other horizontal
+  // side and then above/below are used as fallbacks.
+  static Rect GetWindowRectForInfolistWindowAvoidingRect(
+      const Size& window_size, const Rect& candidate_rect,
+      const Rect& avoid_rect, const Rect& working_area);
 };
 }  // namespace renderer
 }  // namespace mozc

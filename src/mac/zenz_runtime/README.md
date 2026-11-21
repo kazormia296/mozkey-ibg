@@ -1,4 +1,14 @@
-# macOS Zenz runtime
+# macOS Zenz runtime (superseded)
+
+> **Superseded by the sync to upstream Mozkey v1.0.0.** `//mac:package` now
+> packages upstream Mozkey's Universal runtime from
+> `src/mac/installer/zenz_runtime` (`Resources/ZenzRuntime`, built by
+> `build_universal_runtime.zsh`). Nothing consumes this package or the
+> `generated/` tree any more; it is kept only until it is removed from the
+> repository. `tools/release/prepare_macos_zenz_runtime.py` remains the shared
+> llama.cpp pin module for the Linux and Windows runtime tooling.
+
+The remainder of this file describes the previous, fork-specific arm64 runtime.
 
 `tools/release/prepare_macos_zenz_runtime.py` creates the ignored `generated/`
 tree consumed by the macOS package target. The preparation gate:

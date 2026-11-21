@@ -84,22 +84,28 @@ def main():
   version = mozc_version.MozcVersion(options.version_file)
 
   copyright_message = u'© %d Google Inc.' % _COPYRIGHT_YEAR
-  long_version = version.GetVersionString()
-  short_version = version.GetVersionInFormat('@MAJOR@.@MINOR@.@BUILD@')
 
   if options.branding == 'GoogleJapaneseInput':
+    # Do not alter Google's existing metadata.
+    long_version = version.GetVersionString()
+    short_version = version.GetVersionInFormat('@MAJOR@.@MINOR@.@BUILD@')
     domain_prefix = 'com.google'
     product_name = 'Google Japanese Input'
   else:
+    long_version = version.GetMozkeyInstallerVersion()
+    short_version = version.GetMozkeyReleaseVersionString()
     domain_prefix = 'io.github.kazormia296.mozkey-ibg'
     product_name = 'Mozkey IbG'
+
+  finder_version = (long_version if options.branding == 'GoogleJapaneseInput'
+                    else short_version)
 
   variables = {
       'GOOGLE_VERSIONINFO_LONG': long_version,
       'GOOGLE_VERSIONINFO_SHORT': short_version,
       'GOOGLE_VERSIONINFO_ABOUT': copyright_message,
       'GOOGLE_VERSIONINFO_FINDER':
-          '%s %s, %s' % (product_name, long_version, copyright_message),
+          '%s %s, %s' % (product_name, finder_version, copyright_message),
       'BRANDING':
           options.branding,
       'DOMAIN_PREFIX':

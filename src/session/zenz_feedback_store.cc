@@ -17,14 +17,13 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-
+#include "base/file_stream.h"
+#include "base/file_util.h"
 #include "base/system_util.h"
 
 #if defined(_WIN32)
 #include <windows.h>
 #else
-#include <cerrno>
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -34,6 +33,21 @@ namespace session {
 namespace {
 
 constexpr int kAcceptThreshold = 1;
+
+// Count Unicode scalar values, not UTF-8 bytes or Roman keystrokes.
+// Persisted feedback keys are UTF-8 validated by the store.
+bool ExcludesAutomaticFeedback(absl::string_view key,
+                               const ZenzFeedbackReusePolicy& policy) {
+  if (!policy.minimum_key_length_enabled ||
+      policy.minimum_key_length <= 1) {
+    return false;
+  }
+  const size_t char_count = std::count_if(
+      key.begin(), key.end(), [](unsigned char c) {
+        return (c & 0xC0) != 0x80;
+      });
+  return char_count < policy.minimum_key_length;
+}
 
 // Stored records are full-sequence observations for one Zenz request/response
 // pair.  Do not add segment-local or lexical-unit records here; those should be
@@ -260,95 +274,10 @@ bool EnsureDirectoryExists(const std::wstring& dir) {
 
 #else  // !defined(_WIN32)
 
+// Mozkey IbG persists Zenz feedback on every POSIX platform (macOS and
+// Linux), sharing upstream's macOS implementation below.
 void StoreDebugOutput(absl::string_view message) {
   LOG(INFO) << "[zenz-feedback-store] " << message;
-}
-
-bool EnsureDirectoryExists(const std::string& path);
-bool IsWritableDirectory(const std::string& dir);
-
-std::string GetFeedbackDir() {
-  std::string dir = SystemUtil::GetUserProfileDirectory();
-  if (dir.empty()) {
-    StoreDebugOutput("GetUserProfileDirectory returned empty");
-    return "";
-  }
-
-  if (!EnsureDirectoryExists(dir)) {
-    StoreDebugOutput("directory cannot be created or is not a directory");
-    return "";
-  }
-
-  if (!IsWritableDirectory(dir)) {
-    StoreDebugOutput("directory not writable");
-    return "";
-  }
-
-  return dir;
-}
-
-std::string GetFeedbackPathFromDir(const std::string& dir) {
-  if (dir.empty()) {
-    return "";
-  }
-  return dir + "/zenz_feedback.tsv";
-}
-
-std::string GetFeedbackPath() {
-  return GetFeedbackPathFromDir(GetFeedbackDir());
-}
-
-bool EnsureDirectoryExists(const std::string& path) {
-  if (path.empty()) {
-    StoreDebugOutput("directory path is empty");
-    return false;
-  }
-
-  struct stat st;
-  if (stat(path.c_str(), &st) == 0) {
-    if (S_ISDIR(st.st_mode)) {
-      return true;
-    }
-    StoreDebugOutput("path exists but is not a directory");
-    return false;
-  }
-
-  if (mkdir(path.c_str(), 0700) == 0) {
-    return true;
-  }
-
-  if (errno == EEXIST) {
-    return true;
-  }
-
-  StoreDebugOutput("mkdir failed");
-  return false;
-}
-
-bool IsWritableDirectory(const std::string& dir) {
-  if (dir.empty()) {
-    return false;
-  }
-
-  struct stat st;
-  if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-    StoreDebugOutput("writable probe failed: not a directory");
-    return false;
-  }
-
-  const std::string probe_path =
-      dir + "/.mozkey-ibg_zenz_feedback_probe_" + std::to_string(getpid()) +
-      ".tmp";
-
-  int fd = open(probe_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
-  if (fd < 0) {
-    StoreDebugOutput("writable probe failed: cannot create probe file");
-    return false;
-  }
-  close(fd);
-  unlink(probe_path.c_str());
-
-  return true;
 }
 
 std::string WideToUtf8(const std::wstring& w) {
@@ -376,6 +305,27 @@ std::string WideToUtf8(const std::wstring& w) {
     }
   }
   return out;
+}
+
+std::string GetFeedbackDir() {
+  const std::string dir = SystemUtil::GetUserProfileDirectory();
+  if (dir.empty()) {
+    return "";
+  }
+  if (!FileUtil::DirectoryExists(dir).ok() &&
+      !FileUtil::CreateDirectory(dir).ok() &&
+      !FileUtil::DirectoryExists(dir).ok()) {
+    return "";
+  }
+  return dir;
+}
+
+std::string GetFeedbackPath() {
+  const std::string dir = GetFeedbackDir();
+  if (dir.empty()) {
+    return "";
+  }
+  return FileUtil::JoinPath(dir, "zenz_feedback.tsv");
 }
 
 #endif  // !defined(_WIN32)
@@ -531,7 +481,9 @@ struct ParsedFeedbackRecord {
 };
 
 bool IsSafeFeedbackRecord(const ParsedFeedbackRecord& record) {
-  if (record.action != "accepted" && record.action != "rejected") {
+  if (record.action != "accepted" &&
+      record.action != "accepted_rollback" &&
+      record.action != "rejected") {
     return false;
   }
 
@@ -576,7 +528,8 @@ bool ParseFeedbackRecord(const std::vector<std::string>& fields,
   }
 
   // v2:
-  //   v2  accepted|rejected  key  context_class  value  reason
+  //   v2  accepted|accepted_rollback|rejected
+  //       key  context_class  value  reason
   //
   // The key/value fields are full-sequence reading/correction pairs.  The TSV
   // intentionally has no columns for segment-local evidence or raw left
@@ -649,13 +602,15 @@ int RejectWeightForReason(absl::string_view reason) {
   if (IsHardRejectReason(reason)) {
     return kHardRejectWeight;
   }
-  if (reason == "space_revert_zenz_to_mozc") {
+  if (reason == "space_revert_zenz_to_mozc" ||
+      reason == "auto_block_shadow_compare") {
     return kSpaceRevertRejectWeight;
   }
   if (reason == "predict_after_zenz") {
     return kPredictAfterZenzRejectWeight;
   }
-  if (reason == "explicit_conversion_after_zenz") {
+  if (reason == "explicit_conversion_after_zenz" ||
+      reason == "cancel_visible_zenz_to_composition") {
     return kExplicitConversionRejectWeight;
   }
   return kLegacyRejectWeight;
@@ -664,6 +619,15 @@ int RejectWeightForReason(absl::string_view reason) {
 void AddAccepted(Counts* c) {
   ++c->accepted;
   c->positive_score += kAcceptedFeedbackWeight;
+}
+
+void RollbackAccepted(Counts* c) {
+  if (c->accepted <= 0) {
+    return;
+  }
+  --c->accepted;
+  c->positive_score =
+      std::max(0, c->positive_score - kAcceptedFeedbackWeight);
 }
 
 void AddRejected(absl::string_view reason, Counts* c) {
@@ -686,10 +650,23 @@ void MergeCounts(const Counts& src, Counts* dest) {
 
 ZenzFeedbackAutoBlockPolicy NormalizeAutoBlockPolicy(
     ZenzFeedbackAutoBlockPolicy policy) {
-  if (!policy.enabled || policy.reject_threshold <= 0) {
+  if (!policy.enabled || policy.minimum_reject_count <= 0 ||
+      policy.minimum_reject_percentage <= 0) {
     return ZenzFeedbackAutoBlockPolicy();
   }
+  policy.minimum_reject_percentage =
+      std::min(policy.minimum_reject_percentage, 100);
   return policy;
+}
+
+int AutoBlockRejectPercentage(const Counts& c) {
+  const int64_t accepted = c.accepted;
+  const int64_t rejected = c.auto_block_rejected;
+  const int64_t observations = accepted + rejected;
+  if (observations <= 0) {
+    return 0;
+  }
+  return static_cast<int>((rejected * 100) / observations);
 }
 
 bool IsAutoBlockedByPolicy(
@@ -697,8 +674,18 @@ bool IsAutoBlockedByPolicy(
     const ZenzFeedbackAutoBlockPolicy& auto_block_policy) {
   const ZenzFeedbackAutoBlockPolicy policy =
       NormalizeAutoBlockPolicy(auto_block_policy);
-  return policy.enabled &&
-         c.auto_block_rejected >= policy.reject_threshold;
+  if (!policy.enabled ||
+      c.auto_block_rejected < policy.minimum_reject_count) {
+    return false;
+  }
+
+  const int64_t accepted = c.accepted;
+  const int64_t rejected = c.auto_block_rejected;
+  const int64_t observations = accepted + rejected;
+  return observations > 0 &&
+         rejected * 100 >=
+             static_cast<int64_t>(policy.minimum_reject_percentage) *
+                 observations;
 }
 
 bool IsRejectCountDominant(const Counts& c) {
@@ -796,7 +783,59 @@ void InvalidateFeedbackRecordsCache() {
   g_feedback_records_cache = FeedbackRecordsCache();
 }
 #else
-void InvalidateFeedbackRecordsCache() {}
+struct FeedbackFileStamp {
+  bool exists = false;
+  time_t last_write_seconds = 0;
+  long last_write_nanoseconds = 0;
+  uint64_t file_size = 0;
+};
+
+struct FeedbackRecordsCache {
+  bool valid = false;
+  std::string path;
+  FeedbackFileStamp stamp;
+  std::vector<ParsedFeedbackRecord> records;
+};
+
+std::mutex g_feedback_records_cache_mutex;
+FeedbackRecordsCache g_feedback_records_cache;
+
+bool SameFeedbackFileStamp(const FeedbackFileStamp& lhs,
+                           const FeedbackFileStamp& rhs) {
+  return lhs.exists == rhs.exists &&
+         lhs.file_size == rhs.file_size &&
+         lhs.last_write_seconds == rhs.last_write_seconds &&
+         lhs.last_write_nanoseconds == rhs.last_write_nanoseconds;
+}
+
+FeedbackFileStamp GetFeedbackFileStamp(absl::string_view path) {
+  FeedbackFileStamp stamp;
+  if (path.empty()) {
+    return stamp;
+  }
+
+  const std::string path_string(path);
+  struct stat info = {};
+  if (::stat(path_string.c_str(), &info) != 0) {
+    return stamp;
+  }
+
+  stamp.exists = true;
+#if defined(__APPLE__)
+  stamp.last_write_seconds = info.st_mtimespec.tv_sec;
+  stamp.last_write_nanoseconds = info.st_mtimespec.tv_nsec;
+#else
+  stamp.last_write_seconds = info.st_mtim.tv_sec;
+  stamp.last_write_nanoseconds = info.st_mtim.tv_nsec;
+#endif
+  stamp.file_size = static_cast<uint64_t>(info.st_size);
+  return stamp;
+}
+
+void InvalidateFeedbackRecordsCache() {
+  std::lock_guard<std::mutex> lock(g_feedback_records_cache_mutex);
+  g_feedback_records_cache = FeedbackRecordsCache();
+}
 #endif
 
 bool IsSensitiveFeedbackContextClass(absl::string_view context_class) {
@@ -1012,26 +1051,45 @@ std::vector<ParsedFeedbackRecord> LoadFeedbackRecords() {
   return records;
 #else
   const std::string path = GetFeedbackPath();
-  if (path.empty()) {
-    StoreDebugOutput("load skipped: empty path");
-    return {};
-  }
+  const FeedbackFileStamp stamp = GetFeedbackFileStamp(path);
 
-  struct stat st;
-  if (stat(path.c_str(), &st) != 0) {
-    StoreDebugOutput("load skipped: file not found");
-    return {};
-  }
+  std::lock_guard<std::mutex> lock(g_feedback_records_cache_mutex);
 
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    StoreDebugOutput("load skipped: open failed");
-    return {};
+  if (g_feedback_records_cache.valid &&
+      g_feedback_records_cache.path == path &&
+      SameFeedbackFileStamp(g_feedback_records_cache.stamp, stamp)) {
+    return g_feedback_records_cache.records;
   }
 
   std::vector<ParsedFeedbackRecord> records;
+
+  if (path.empty()) {
+    g_feedback_records_cache.valid = true;
+    g_feedback_records_cache.path = path;
+    g_feedback_records_cache.stamp = stamp;
+    g_feedback_records_cache.records.clear();
+    return records;
+  }
+
+  if (!stamp.exists) {
+    g_feedback_records_cache.valid = true;
+    g_feedback_records_cache.path = path;
+    g_feedback_records_cache.stamp = stamp;
+    g_feedback_records_cache.records.clear();
+    return records;
+  }
+
+  InputFileStream file(path, std::ios::in | std::ios::binary);
+  if (!file) {
+    return records;
+  }
+
   LoadRecordsFromStream(&file, false, &records);
 
+  g_feedback_records_cache.valid = true;
+  g_feedback_records_cache.path = path;
+  g_feedback_records_cache.stamp = stamp;
+  g_feedback_records_cache.records = records;
   return records;
 #endif
 }
@@ -1045,8 +1103,21 @@ std::map<FeedbackKey, Counts> LoadCounts() {
 
     if (record.action == "accepted") {
       AddAccepted(&c);
+    } else if (record.action == "accepted_rollback") {
+      RollbackAccepted(&c);
     } else if (record.action == "rejected") {
       AddRejected(record.reason, &c);
+    }
+  }
+
+  // A fully compensated accepted observation has no remaining learning signal.
+  // Drop the zero-count key so ListEntries() does not expose a ghost neutral
+  // entry while Decide() still behaves as if no record existed.
+  for (auto it = counts.begin(); it != counts.end();) {
+    if (it->second.accepted == 0 && it->second.rejected == 0) {
+      it = counts.erase(it);
+    } else {
+      ++it;
     }
   }
 
@@ -1131,55 +1202,52 @@ bool WriteFeedbackRecordsAtomically(
   return true;
 }
 #else
+bool WriteRecordsToPath(
+    absl::string_view path,
+    const std::vector<ParsedFeedbackRecord>& records) {
+  if (path.empty()) {
+    return false;
+  }
+  OutputFileStream file(
+      path, std::ios::out | std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return false;
+  }
+  return WriteRecordsToStream(records, &file);
+}
+
 bool WriteFeedbackRecordsAtomically(
     const std::vector<ParsedFeedbackRecord>& records) {
-  const std::string dir = GetFeedbackDir();
-  const std::string path = GetFeedbackPathFromDir(dir);
-
-  if (dir.empty() || path.empty()) {
-    StoreDebugOutput("atomic write failed: empty path");
+  const std::string path = GetFeedbackPath();
+  if (path.empty()) {
     return false;
   }
 
   if (records.empty()) {
-    if (unlink(path.c_str()) == 0) {
-      StoreDebugOutput("clear ok: file removed");
-      return true;
+    if (!FileUtil::UnlinkIfExists(path).ok()) {
+      return false;
     }
-
-    if (errno == ENOENT) {
-      StoreDebugOutput("clear ok: file already absent");
-      return true;
-    }
-
-    StoreDebugOutput("clear failed: unlink error");
-    return false;
+    InvalidateFeedbackRecordsCache();
+    return true;
   }
 
   const std::string tmp_path =
-      path + ".tmp." + std::to_string(getpid());
-
-  {
-    std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
-    if (!file || !WriteRecordsToStream(records, &file)) {
-      unlink(tmp_path.c_str());
-      StoreDebugOutput("atomic write failed: write to tmp file failed");
-      return false;
-    }
+      absl::StrCat(path, ".tmp.", static_cast<uint64_t>(::getpid()));
+  if (!WriteRecordsToPath(tmp_path, records)) {
+    FileUtil::UnlinkOrLogError(tmp_path);
+    return false;
   }
-
-  if (rename(tmp_path.c_str(), path.c_str()) != 0) {
-    StoreDebugOutput("atomic write failed: rename error");
-    unlink(tmp_path.c_str());
+  if (!FileUtil::AtomicRename(tmp_path, path).ok()) {
+    FileUtil::UnlinkOrLogError(tmp_path);
     return false;
   }
 
-  StoreDebugOutput("atomic write ok");
+  InvalidateFeedbackRecordsCache();
   return true;
 }
 #endif
 
-void AppendRecord(absl::string_view action,
+bool AppendRecord(absl::string_view action,
                   absl::string_view key,
                   absl::string_view context_class,
                   absl::string_view value,
@@ -1198,7 +1266,7 @@ void AppendRecord(absl::string_view action,
         " context_class=", record.context_class,
         " ", RedactedStats("value", value),
         " reason=", reason));
-    return;
+    return false;
   }
 
 #if defined(_WIN32)
@@ -1214,7 +1282,7 @@ void AppendRecord(absl::string_view action,
 
   if (dir_w.empty() || path_w.empty()) {
     StoreDebugOutput("append failed: empty path");
-    return;
+    return false;
   }
 
   const DWORD dir_attr = ::GetFileAttributesW(dir_w.c_str());
@@ -1223,30 +1291,18 @@ void AppendRecord(absl::string_view action,
     if (!EnsureDirectoryExists(dir_w)) {
       StoreDebugOutput(
           "append failed: directory does not exist and cannot be created");
-      return;
+      return false;
     }
   }
 
   std::ofstream file(path_w, std::ios::binary | std::ios::app);
 #else
-  const std::string dir = GetFeedbackDir();
-  const std::string path = GetFeedbackPathFromDir(dir);
-
-  if (dir.empty() || path.empty()) {
+  const std::string path = GetFeedbackPath();
+  if (path.empty()) {
     StoreDebugOutput("append failed: empty path");
-    return;
+    return false;
   }
-
-  struct stat st;
-  if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-    if (!EnsureDirectoryExists(dir)) {
-      StoreDebugOutput(
-          "append failed: directory does not exist and cannot be created");
-      return;
-    }
-  }
-
-  std::ofstream file(path, std::ios::binary | std::ios::app);
+  OutputFileStream file(path, std::ios::out | std::ios::binary | std::ios::app);
 #endif
 
   if (!file) {
@@ -1257,7 +1313,7 @@ void AppendRecord(absl::string_view action,
 #else
     StoreDebugOutput("append open failed");
 #endif
-    return;
+    return false;
   }
 
   WriteRecordToStream(record, &file);
@@ -1265,7 +1321,7 @@ void AppendRecord(absl::string_view action,
 
   if (!file) {
     StoreDebugOutput("append write/flush failed");
-    return;
+    return false;
   }
 
   InvalidateFeedbackRecordsCache();
@@ -1276,6 +1332,7 @@ void AppendRecord(absl::string_view action,
       " context_class=", record.context_class,
       " ", RedactedStats("value", value),
       " reason=", reason));
+  return true;
 }
 
 }  // namespace
@@ -1292,6 +1349,15 @@ ZenzFeedbackDecision ZenzFeedbackStore::Decide(
     absl::string_view context_class,
     absl::string_view value,
     const ZenzFeedbackAutoBlockPolicy& auto_block_policy) const {
+  ZenzFeedbackReusePolicy policy;
+  policy.auto_block_policy = auto_block_policy;
+  return Decide(key, context_class, value, policy);
+}
+
+ZenzFeedbackDecision ZenzFeedbackStore::Decide(
+    absl::string_view key, absl::string_view context_class,
+    absl::string_view value,
+    const ZenzFeedbackReusePolicy& reuse_policy) const {
   const std::map<FeedbackKey, Counts> counts = LoadCounts();
 
   const std::string normalized_key(key);
@@ -1327,9 +1393,39 @@ ZenzFeedbackDecision ZenzFeedbackStore::Decide(
   }
 
   ZenzFeedbackDecision decision = BuildDecisionFromCounts(aggregated);
+  if (ExcludesAutomaticFeedback(key, reuse_policy)) {
+    // Explicit manual hard blocks are intentionally exempt.
+    if (!decision.hard_rejected) {
+      decision.action = ZenzFeedbackAction::kNeutral;
+      decision.reason = "feedback_key_length_excluded";
+    }
+    return decision;
+  }
   ApplyRejectDominanceDecision(exact, &decision);
-  ApplyAutoBlockDecision(exact, auto_block_policy, &decision);
+  ApplyAutoBlockDecision(exact, reuse_policy.auto_block_policy, &decision);
   return decision;
+}
+
+bool ZenzFeedbackStore::IsManuallyBlocked(
+    absl::string_view key, absl::string_view context_class,
+    absl::string_view value) const {
+  const std::string normalized_key(key);
+  const std::string normalized_context_class =
+      NormalizeContextClass(context_class);
+  const std::string normalized_value(value);
+  const std::map<FeedbackKey, Counts> counts = LoadCounts();
+  for (const auto& item : counts) {
+    const FeedbackKey& feedback_key = item.first;
+    if (!item.second.hard_rejected || std::get<0>(feedback_key) != normalized_key ||
+        std::get<2>(feedback_key) != normalized_value) {
+      continue;
+    }
+    if (IsDecisionCompatibleContextClass(normalized_context_class,
+                                         std::get<1>(feedback_key))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::vector<ZenzFeedbackCandidate> ZenzFeedbackStore::GetRankedCandidates(
@@ -1343,6 +1439,17 @@ std::vector<ZenzFeedbackCandidate> ZenzFeedbackStore::GetRankedCandidates(
     absl::string_view key,
     absl::string_view context_class,
     const ZenzFeedbackAutoBlockPolicy& auto_block_policy) const {
+  ZenzFeedbackReusePolicy policy;
+  policy.auto_block_policy = auto_block_policy;
+  return GetRankedCandidates(key, context_class, policy);
+}
+
+std::vector<ZenzFeedbackCandidate> ZenzFeedbackStore::GetRankedCandidates(
+    absl::string_view key, absl::string_view context_class,
+    const ZenzFeedbackReusePolicy& reuse_policy) const {
+  if (ExcludesAutomaticFeedback(key, reuse_policy)) {
+    return {};
+  }
   const std::map<FeedbackKey, Counts> counts = LoadCounts();
 
   const std::string normalized_key(key);
@@ -1389,7 +1496,7 @@ std::vector<ZenzFeedbackCandidate> ZenzFeedbackStore::GetRankedCandidates(
         exact_it == exact_value_counts.end() ? Counts() : exact_it->second;
 
     if (c.hard_rejected ||
-        IsAutoBlockedByPolicy(exact_counts, auto_block_policy) ||
+        IsAutoBlockedByPolicy(exact_counts, reuse_policy.auto_block_policy) ||
         IsRejectCountDominant(exact_counts) ||
         c.accepted < kAcceptThreshold ||
         TotalScore(c) <= 0) {
@@ -1441,12 +1548,25 @@ std::vector<ZenzFeedbackCandidate> ZenzFeedbackStore::GetAcceptedCandidates(
   return GetRankedCandidates(key, context_class, auto_block_policy);
 }
 
+std::vector<ZenzFeedbackCandidate> ZenzFeedbackStore::GetAcceptedCandidates(
+    absl::string_view key, absl::string_view context_class,
+    const ZenzFeedbackReusePolicy& reuse_policy) const {
+  return GetRankedCandidates(key, context_class, reuse_policy);
+}
+
 std::vector<ZenzFeedbackEntry> ZenzFeedbackStore::ListEntries() const {
   return ListEntries(ZenzFeedbackAutoBlockPolicy());
 }
 
 std::vector<ZenzFeedbackEntry> ZenzFeedbackStore::ListEntries(
     const ZenzFeedbackAutoBlockPolicy& auto_block_policy) const {
+  ZenzFeedbackReusePolicy policy;
+  policy.auto_block_policy = auto_block_policy;
+  return ListEntries(policy);
+}
+
+std::vector<ZenzFeedbackEntry> ZenzFeedbackStore::ListEntries(
+    const ZenzFeedbackReusePolicy& reuse_policy) const {
   const std::map<FeedbackKey, Counts> counts = LoadCounts();
 
   std::vector<ZenzFeedbackEntry> entries;
@@ -1457,7 +1577,7 @@ std::vector<ZenzFeedbackEntry> ZenzFeedbackStore::ListEntries(
     const Counts& c = item.second;
     ZenzFeedbackDecision decision = BuildDecisionFromCounts(c);
     ApplyRejectDominanceDecision(c, &decision);
-    ApplyAutoBlockDecision(c, auto_block_policy, &decision);
+    ApplyAutoBlockDecision(c, reuse_policy.auto_block_policy, &decision);
 
     ZenzFeedbackEntry entry;
     entry.key = std::get<0>(feedback_key);
@@ -1466,8 +1586,11 @@ std::vector<ZenzFeedbackEntry> ZenzFeedbackStore::ListEntries(
     entry.accepted_count = c.accepted;
     entry.rejected_count = c.rejected;
     entry.auto_block_reject_count = c.auto_block_rejected;
+    entry.auto_block_reject_percentage = AutoBlockRejectPercentage(c);
     entry.hard_rejected = decision.hard_rejected;
     entry.auto_blocked = decision.auto_blocked;
+    entry.reuse_excluded = !decision.hard_rejected &&
+        ExcludesAutomaticFeedback(entry.key, reuse_policy);
     entry.reason = decision.reason;
     entries.push_back(std::move(entry));
   }
@@ -1487,25 +1610,56 @@ std::vector<ZenzFeedbackEntry> ZenzFeedbackStore::ListEntries(
   return entries;
 }
 
+bool ZenzFeedbackStore::ExportToFile(absl::string_view path) const {
+#if defined(_WIN32)
+  return ExportToFile(Utf8ToWide(path));
+#else
+  if (path.empty()) {
+    return false;
+  }
+  const std::vector<ParsedFeedbackRecord> records = LoadFeedbackRecords();
+  return WriteRecordsToPath(path, records);
+#endif
+}
+
+bool ZenzFeedbackStore::ImportFromFile(
+    absl::string_view path,
+    ZenzFeedbackImportMode mode) {
+#if defined(_WIN32)
+  return ImportFromFile(Utf8ToWide(path), mode);
+#else
+  if (path.empty()) {
+    return false;
+  }
+
+  InputFileStream file(path, std::ios::in | std::ios::binary);
+  if (!file) {
+    return false;
+  }
+
+  std::vector<ParsedFeedbackRecord> imported_records;
+  if (!LoadRecordsFromStream(&file, true, &imported_records)) {
+    return false;
+  }
+
+  std::vector<ParsedFeedbackRecord> new_records;
+  if (mode == ZenzFeedbackImportMode::kAppend) {
+    new_records = LoadFeedbackRecords();
+  }
+  new_records.insert(new_records.end(),
+                     imported_records.begin(),
+                     imported_records.end());
+  return WriteFeedbackRecordsAtomically(new_records);
+#endif
+}
+
 bool ZenzFeedbackStore::ExportToFile(const std::wstring& path) const {
 #if defined(_WIN32)
   const std::vector<ParsedFeedbackRecord> records = LoadFeedbackRecords();
   return WriteRecordsToPath(path, records);
 #else
-  const std::string utf8_path = WideToUtf8(path);
-  if (utf8_path.empty()) {
-    StoreDebugOutput("export failed: empty path");
-    return false;
-  }
-
-  const std::vector<ParsedFeedbackRecord> records = LoadFeedbackRecords();
-  std::ofstream file(utf8_path, std::ios::binary | std::ios::trunc);
-  if (!file) {
-    StoreDebugOutput("export failed: open failed");
-    return false;
-  }
-
-  return WriteRecordsToStream(records, &file);
+  // POSIX callers that still hold a wide path share the UTF-8 implementation.
+  return ExportToFile(absl::string_view(WideToUtf8(path)));
 #endif
 }
 
@@ -1544,34 +1698,8 @@ bool ZenzFeedbackStore::ImportFromFile(
 
   return WriteFeedbackRecordsAtomically(new_records);
 #else
-  const std::string utf8_path = WideToUtf8(path);
-  if (utf8_path.empty()) {
-    StoreDebugOutput("import failed: empty path");
-    return false;
-  }
-
-  std::ifstream file(utf8_path, std::ios::binary);
-  if (!file) {
-    StoreDebugOutput("import open failed");
-    return false;
-  }
-
-  std::vector<ParsedFeedbackRecord> imported_records;
-  if (!LoadRecordsFromStream(&file, true, &imported_records)) {
-    StoreDebugOutput("import parse failed");
-    return false;
-  }
-
-  std::vector<ParsedFeedbackRecord> new_records;
-  if (mode == ZenzFeedbackImportMode::kAppend) {
-    new_records = LoadFeedbackRecords();
-  }
-
-  new_records.insert(new_records.end(),
-                     imported_records.begin(),
-                     imported_records.end());
-
-  return WriteFeedbackRecordsAtomically(new_records);
+  // POSIX callers that still hold a wide path share the UTF-8 implementation.
+  return ImportFromFile(absl::string_view(WideToUtf8(path)), mode);
 #endif
 }
 
@@ -1605,13 +1733,23 @@ bool ZenzFeedbackStore::ClearAll() {
   return WriteFeedbackRecordsAtomically({});
 }
 
-void ZenzFeedbackStore::RecordAccepted(
+bool ZenzFeedbackStore::RecordAccepted(
     absl::string_view key,
     absl::string_view context_class,
     absl::string_view value) {
   // The caller is responsible for passing the complete Zenz reading/correction
   // pair.  This store must not synthesize or persist segment-local derivatives.
-  AppendRecord("accepted", key, context_class, value, "");
+  return AppendRecord("accepted", key, context_class, value, "");
+}
+
+void ZenzFeedbackStore::RecordAcceptedRollback(
+    absl::string_view key,
+    absl::string_view context_class,
+    absl::string_view value,
+    absl::string_view reason) {
+  // This cancels positive evidence only. It must never be interpreted as a
+  // rejected Zenz observation.
+  AppendRecord("accepted_rollback", key, context_class, value, reason);
 }
 
 void ZenzFeedbackStore::RecordRejected(

@@ -37,6 +37,11 @@ replay tool starts a fresh server, it restores that captured value by default;
 use `--flash-attn on`, `--flash-attn off`, or `--flash-attn auto` to override
 it.
 
+Since the sync to upstream Mozkey v1.0.0 the scorer also always launches
+`llama-server` with `--parallel 1 --cache-ram 0` (one server slot and no global
+RAM prompt cache). A fresh replay server is started with the same two options
+so that the whole context belongs to the single slot, as in the scorer.
+
 Replay the exact scorer request sequence against a running local server:
 
 ```text

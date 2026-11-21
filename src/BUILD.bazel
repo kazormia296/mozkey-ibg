@@ -41,8 +41,13 @@ load(
     "mozc_select_enable_supplemental_model",
     "mozc_select_enable_usage_rewriter",
 )
-load("//:config.bzl", "BAZEL_TOOLS_PREFIX")
-load("//:version.bzl", "DEFAULT_BUILD_LABEL_MACOS")
+load("//:config.bzl", "BAZEL_TOOLS_PREFIX", "BRANDING")
+load(
+    "//:version.bzl",
+    "DEFAULT_BUILD_LABEL_MACOS",
+    "MOZKEY_MACOS_INSTALL_VERSION",
+    "MOZKEY_RELEASE_VERSION",
+)
 load("//bazel:stubs.bzl", "bzl_library")
 
 package(default_visibility = ["//:__subpackages__"])
@@ -253,16 +258,32 @@ exports_files(
 # e.g. bazel build --embed_label="2.32.5994.101" package
 # The default version is specified by DEFAULT_BUILD_LABEL_MACOS in version.bzl.
 # LINT.IfChange
+# BUILD files do not allow statement-level if/else. Select the versioning
+# attributes using conditional expressions instead.
 apple_bundle_version(
     name = "version_macos",
-    build_label_pattern = "{version}.{revision}",  # e.g. 2.32.5994.101
-    build_version = "{version}.{revision}",  # e.g. 2.32.5994.101
-    capture_groups = {
-        "version": "\\d+\\.\\d+\\.\\d+",  # e.g. 2.32.5994
-        "revision": "\\d+",  # e.g. 101
-    },
-    fallback_build_label = DEFAULT_BUILD_LABEL_MACOS,  # e.g. 2.32.5994.101
-    short_version_string = "{version}",  # e.g. 2.32.5994
+    build_label_pattern = (
+        "{major}.{minor}.{patch}" if BRANDING == "Mozc" else "{version}.{revision}"
+    ),
+    build_version = (
+        "{major}.{minor}.{patch}" if BRANDING == "Mozc" else "{version}.{revision}"
+    ),
+    capture_groups = (
+        {
+            "major": "\\d+",
+            "minor": "\\d+",
+            "patch": "\\d+",
+        } if BRANDING == "Mozc" else {
+            "version": "\\d+\\.\\d+\\.\\d+",
+            "revision": "\\d+",
+        }
+    ),
+    fallback_build_label = (
+        MOZKEY_MACOS_INSTALL_VERSION if BRANDING == "Mozc" else DEFAULT_BUILD_LABEL_MACOS
+    ),
+    short_version_string = (
+        MOZKEY_RELEASE_VERSION if BRANDING == "Mozc" else "{version}"
+    ),
     visibility = ["//:__subpackages__"],
 )
 # LINT.ThenChange(//version.bzl)

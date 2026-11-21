@@ -458,6 +458,9 @@ constexpr MozcFirewallRule kMozcOfflineFirewallRules[] = {
     {L"Mozkey IbG Offline - Block mozc_broker outbound", "mozc_broker.exe"},
     {L"Mozkey IbG Offline - Block mozc_cache_service outbound",
      "mozc_cache_service.exe"},
+    {L"Mozkey IbG Offline - Block mozc_zenz_scorer outbound",
+     "mozc_zenz_scorer.exe"},
+    {L"Mozkey IbG Offline - Block llama-server outbound", "llama-server.exe"},
 };
 
 void DeleteFirewallRule(std::wstring_view rule_name) {

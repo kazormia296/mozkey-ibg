@@ -29,16 +29,23 @@
 
 #import "renderer/mac/CandidateView.h"
 
+#import <CoreText/CoreText.h>
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <optional>
 #include <set>
+#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/strings/str_format.h"
 #include "client/client_interface.h"
 #include "protocol/commands.pb.h"
 #include "protocol/renderer_style.pb.h"
+#include "renderer/mac/mac_candidate_interaction.h"
+#include "renderer/mac/mac_vertical_candidate_layout.h"
 #include "renderer/mac/mac_view_util.h"
 #include "renderer/renderer_style_handler.h"
 #include "renderer/table_layout.h"
@@ -55,7 +62,326 @@ using mozc::renderer::kColumnCandidate;
 using mozc::renderer::kColumnDescription;
 using mozc::renderer::kNumberOfColumns;
 using mozc::renderer::TableLayout;
+using mozc::renderer::mac::ContainsPassiveSuggestionCandidateIdentity;
+using mozc::renderer::mac::GetPassiveSuggestionCandidateIdentity;
+using mozc::renderer::mac::IsPassiveSuggestionCandidateWindow;
+using mozc::renderer::mac::MacVerticalCandidateLayout;
+using mozc::renderer::mac::PassiveSuggestionCandidateIdentity;
 using mozc::renderer::mac::MacViewUtil;
+using mozc::renderer::mac::WritingDirection;
+
+namespace {
+
+constexpr int kVerticalCrossAxisEdgePadding = 2;
+constexpr int kVerticalCandidateGap = 1;
+constexpr int kVerticalCardHorizontalPadding = 2;
+constexpr int kVerticalCardVerticalPadding = 7;
+constexpr int kVerticalShortcutBodyGap = 5;
+constexpr int kVerticalValueDescriptionGap = 12;
+
+constexpr int kVerticalSuggestionCrossAxisEdgePadding = 2;
+constexpr int kVerticalSuggestionCandidateGap = 1;
+constexpr int kVerticalSuggestionCardVerticalPadding = 4;
+constexpr int kVerticalSuggestionShortcutBodyGap = 3;
+constexpr int kVerticalSuggestionValueDescriptionGap = 7;
+
+constexpr int kVerticalCoreTextSafety = 4;
+constexpr int kVerticalInformationMarkerGap = 2;
+constexpr int kVerticalInformationMarkerWidth = 14;
+constexpr int kVerticalInformationMarkerHeight = 2;
+
+NSDictionary *VerticalFrameAttributes() {
+  return @{
+    (__bridge id)kCTFrameProgressionAttributeName :
+        @(kCTFrameProgressionRightToLeft)
+  };
+}
+
+bool ShouldRenderFooterText(const std::string &text) {
+  return text != "Tabキーで選択";
+}
+
+// Preserve the history-deletion wording, but render that long instruction
+// slightly smaller in the native vertical footer so it does not dominate the
+// candidate window's cross-axis width. Scale relative to the configured
+// footer size so renderer style preferences remain effective.
+bool IsHistoryDeletionFooterText(const std::string &text) {
+  return text == "control+fn+deleteで履歴から削除";
+}
+
+CGFloat VerticalHistoryFooterLabelIndexGap(
+    const mozc::renderer::RendererStyle::TextStyle &style) {
+  return std::max<CGFloat>(
+      0.0, static_cast<CGFloat>(style.right_padding()) * 2.0);
+}
+
+mozc::renderer::RendererStyle::TextStyle VerticalFooterTextStyle(
+    const std::string &text,
+    const mozc::renderer::RendererStyle::TextStyle &style) {
+  auto result = style;
+  if (IsHistoryDeletionFooterText(text) && result.has_font_size()) {
+    result.set_font_size(result.font_size() * 6.0 / 7.0);
+  }
+  return result;
+}
+
+NSAttributedString *MakeVerticalAttributedString(
+    const std::string &text,
+    const mozc::renderer::RendererStyle::TextStyle &style) {
+  NSAttributedString *base =
+      MacViewUtil::ToNSAttributedString(text, style);
+  NSMutableAttributedString *vertical =
+      [[NSMutableAttributedString alloc] initWithAttributedString:base];
+  if ([vertical length] == 0) {
+    return vertical;
+  }
+
+  const NSRange full_range = NSMakeRange(0, [vertical length]);
+  [vertical addAttribute:(__bridge id)kCTVerticalFormsAttributeName
+                   value:@YES
+                   range:full_range];
+
+  NSFont *font =
+      [base attribute:NSFontAttributeName atIndex:0 effectiveRange:nullptr];
+  if (font != nil) {
+    CTFontRef ct_font = CTFontCreateWithName(
+        (__bridge CFStringRef)[font fontName], [font pointSize], nullptr);
+    if (ct_font != nullptr) {
+      [vertical addAttribute:(__bridge id)kCTFontAttributeName
+                       value:(__bridge id)ct_font
+                       range:full_range];
+      CFRelease(ct_font);
+    }
+  }
+
+  NSColor *foreground = [base attribute:NSForegroundColorAttributeName
+                                atIndex:0
+                         effectiveRange:nullptr];
+  if (foreground != nil) {
+    NSColor *rgb = [foreground colorUsingColorSpace:
+        [NSColorSpace deviceRGBColorSpace]];
+    if (rgb != nil && [rgb CGColor] != nullptr) {
+      [vertical addAttribute:(__bridge id)kCTForegroundColorAttributeName
+                       value:(__bridge id)[rgb CGColor]
+                       range:full_range];
+    }
+  }
+
+  return vertical;
+}
+
+CFIndex VisibleVerticalStringLength(
+    CTFramesetterRef framesetter, CGFloat width, CGFloat height) {
+  if (framesetter == nullptr || width <= 0 || height <= 0) {
+    return 0;
+  }
+
+  const CGRect local_rect = CGRectMake(0, 0, width, height);
+  CGPathRef path = CGPathCreateWithRect(local_rect, nullptr);
+  if (path == nullptr) {
+    return 0;
+  }
+
+  CTFrameRef frame = CTFramesetterCreateFrame(
+      framesetter, CFRangeMake(0, 0), path,
+      (__bridge CFDictionaryRef)VerticalFrameAttributes());
+  CGPathRelease(path);
+  if (frame == nullptr) {
+    return 0;
+  }
+
+  const CFRange visible = CTFrameGetVisibleStringRange(frame);
+  CFRelease(frame);
+  return visible.length;
+}
+
+struct VerticalTextMeasurement {
+  mozc::Size layout_size;
+  int frame_width = 0;
+};
+
+VerticalTextMeasurement MeasureVerticalAttributedString(
+    const NSAttributedString *text) {
+  if (text == nil || [text length] == 0) {
+    return VerticalTextMeasurement();
+  }
+
+  CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString(
+      (__bridge CFAttributedStringRef)text);
+  if (framesetter == nullptr) {
+    return VerticalTextMeasurement();
+  }
+
+  CFRange fit_range = CFRangeMake(0, 0);
+  const CGSize suggested = CTFramesetterSuggestFrameSizeWithConstraints(
+      framesetter, CFRangeMake(0, 0),
+      (__bridge CFDictionaryRef)VerticalFrameAttributes(),
+      CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX), &fit_range);
+
+  NSFont *font =
+      [text attribute:NSFontAttributeName atIndex:0 effectiveRange:nullptr];
+  const CGFloat line_floor =
+      font != nil
+          ? std::ceil(std::max<CGFloat>(
+                1.0, [font ascender] - [font descender] + [font leading]))
+          : 1.0;
+  const CGFloat point_size =
+      font != nil ? std::max<CGFloat>(1.0, [font pointSize]) : 16.0;
+
+  // Core Text needs this technical frame width for reliable vertical
+  // full-fit. Keep it independent from the visible candidate-card width.
+  const CGFloat frame_width = std::ceil(std::max<CGFloat>(
+      line_floor, std::max<CGFloat>(1.0, suggested.width) + 1.0));
+
+  CGFloat low = 1.0;
+  CGFloat high = std::max({
+      std::ceil(std::max<CGFloat>(1.0, suggested.height)) + 4.0,
+      line_floor + 4.0,
+      point_size * std::max<NSUInteger>(1, [text length]) * 2.5 + 32.0,
+  });
+
+  const CFIndex total_length = static_cast<CFIndex>([text length]);
+  while (VisibleVerticalStringLength(framesetter, frame_width, high) <
+         total_length) {
+    high *= 2.0;
+    if (high > 20000.0) {
+      break;
+    }
+  }
+
+  for (int iteration = 0; iteration < 24; ++iteration) {
+    const CGFloat middle = (low + high) / 2.0;
+    if (VisibleVerticalStringLength(framesetter, frame_width, middle) >=
+        total_length) {
+      high = middle;
+    } else {
+      low = middle;
+    }
+  }
+
+  const CGFloat visible_fit_height = std::ceil(high + 1.0);
+  const CGFloat frame_height = std::ceil(std::max({
+      std::max<CGFloat>(1.0, suggested.height),
+      visible_fit_height,
+      line_floor,
+  }));
+
+  const CFIndex visible_length =
+      VisibleVerticalStringLength(framesetter, frame_width, frame_height);
+
+  // Keep the visible card width independent from Core Text's technical
+  // typographic cross-axis.  In vertical mode ASCII can report about twice the
+  // nominal CJK cross-axis even though its rasterized glyph ink is much
+  // narrower.  Use one normal line box as the floor and expand only when the
+  // actual glyph-path ink really exceeds it.  The full-fit technical frame
+  // width above remains unchanged.
+  CGFloat visual_width = line_floor;
+  CTLineRef line = CTLineCreateWithAttributedString(
+      (__bridge CFAttributedStringRef)text);
+  if (line != nullptr) {
+    const CGRect glyph_bounds =
+        CTLineGetBoundsWithOptions(line, kCTLineBoundsUseGlyphPathBounds);
+    if (std::isfinite(glyph_bounds.size.height)) {
+      visual_width = std::ceil(std::max<CGFloat>(
+          line_floor, std::max<CGFloat>(1.0, glyph_bounds.size.height)));
+    }
+    CFRelease(line);
+  }
+
+  CFRelease(framesetter);
+
+  if (fit_range.location != 0 ||
+      fit_range.length != total_length ||
+      visible_length != total_length) {
+    LOG(WARNING) << "Core Text vertical measurement mismatch: suggested="
+                 << fit_range.location << "+" << fit_range.length
+                 << " visible=" << visible_length
+                 << " total=" << total_length;
+  }
+
+  return VerticalTextMeasurement{
+      mozc::Size(
+          std::max(1, static_cast<int>(visual_width)),
+          std::max(1, static_cast<int>(frame_height))),
+      std::max(1, static_cast<int>(frame_width)),
+  };
+}
+
+void DrawVerticalAttributedString(const NSAttributedString *text,
+                                  const NSRect &rect,
+                                  CGFloat frame_width) {
+  if (text == nil || [text length] == 0 ||
+      rect.size.width <= 0 || rect.size.height <= 0) {
+    return;
+  }
+
+  CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString(
+      (__bridge CFAttributedStringRef)text);
+  if (framesetter == nullptr) {
+    return;
+  }
+
+  // Keep the proven full-fit Core Text frame width even when the visible
+  // layout/card is narrower. Center that technical frame over the visual rect,
+  // then apply the existing direct CTFrame line-origin correction.
+  const CGFloat draw_width =
+      std::max<CGFloat>(1.0, frame_width) + kVerticalCoreTextSafety;
+  const NSRect draw_rect = NSMakeRect(
+      NSMidX(rect) - draw_width / 2.0, rect.origin.y,
+      draw_width, rect.size.height);
+  const CGRect local_rect =
+      CGRectMake(0, 0, draw_rect.size.width, draw_rect.size.height);
+  CGPathRef path = CGPathCreateWithRect(local_rect, nullptr);
+  if (path == nullptr) {
+    CFRelease(framesetter);
+    return;
+  }
+  CTFrameRef frame = CTFramesetterCreateFrame(
+      framesetter, CFRangeMake(0, 0), path,
+      (__bridge CFDictionaryRef)VerticalFrameAttributes());
+
+  CGFloat correction_x = 0.0;
+  if (frame != nullptr) {
+    CFArrayRef lines = CTFrameGetLines(frame);
+    const CFIndex line_count =
+        lines != nullptr ? CFArrayGetCount(lines) : 0;
+    if (line_count > 0) {
+      std::vector<CGPoint> origins(static_cast<size_t>(line_count));
+      CTFrameGetLineOrigins(
+          frame, CFRangeMake(0, 0), origins.data());
+
+      // kCTFrameProgressionRightToLeft places the vertical line off the
+      // geometric center of the frame.  Center the actual CTFrame line origin
+      // directly; adding or subtracting half a glyph width over-corrects it.
+      correction_x = draw_rect.size.width / 2.0 - origins[0].x;
+    }
+    if (line_count != 1) {
+      LOG(WARNING) << "Unexpected vertical CTFrame line count: "
+                   << line_count;
+    }
+  }
+
+  CGContextRef context = [[NSGraphicsContext currentContext] CGContext];
+  if (context != nullptr && frame != nullptr) {
+    // CandidateView is flipped. Core Text draws in Quartz coordinates, so
+    // compensate locally rather than changing the NSView's global geometry.
+    CGContextSaveGState(context);
+    CGContextSetTextMatrix(context, CGAffineTransformIdentity);
+    CGContextTranslateCTM(
+        context, NSMinX(draw_rect) + correction_x, NSMaxY(draw_rect));
+    CGContextScaleCTM(context, 1.0, -1.0);
+    CTFrameDraw(frame, context);
+    CGContextRestoreGState(context);
+  }
+
+  if (frame != nullptr) {
+    CFRelease(frame);
+  }
+  CGPathRelease(path);
+  CFRelease(framesetter);
+}
+
+}  // namespace
 
 // Those constants and most rendering logic is as same as Windows
 // native candidate window.
@@ -64,6 +390,13 @@ using mozc::renderer::mac::MacViewUtil;
 // Private method declarations.
 @interface CandidateView ()
 - (void)initializeDefaultStyle;
+- (void)reloadStyleForCandidateWindow;
+- (void)updateStyleDependentResources;
+- (NSSize)updateVerticalLayout;
+- (NSSize)verticalFooterSizeForAvailableWidth:(CGFloat)availableWidth;
+- (void)drawVerticalRect:(NSRect)rect;
+- (void)drawVerticalCandidate:(int)row;
+- (void)drawVerticalFooter;
 
 // Draw the |row|-th row.
 - (void)drawRow:(int)row;
@@ -73,8 +406,17 @@ using mozc::renderer::mac::MacViewUtil;
 
 // Draw scroll bar
 - (void)drawVScrollBar;
+
+// Returns the candidate row under |localPos|, or -1 outside all rows.
+- (int)candidateRowAtPoint:(mozc::Point)localPos;
+
+// Updates the focused row and the passive-suggestion gesture state without
+// rebinding the gesture's renderer callback token.
 - (void)updateFocusedRowForEvent:(NSEvent *)event;
 - (BOOL)sendCandidateCommandForRow:(int)row
+                    mouseDownToken:(uint64_t)mouseDownToken;
+- (BOOL)sendCandidateCommandOfType:(SessionCommand::CommandType)type
+                       candidateId:(int32_t)candidateId
                     mouseDownToken:(uint64_t)mouseDownToken;
 @end
 
@@ -84,7 +426,11 @@ using mozc::renderer::mac::MacViewUtil;
 
   mozc::commands::CandidateWindow candidate_window_;
   mozc::renderer::TableLayout tableLayout_;
+  mozc::renderer::mac::MacVerticalCandidateLayout verticalLayout_;
   mozc::renderer::RendererStyle style_;
+  mozc::renderer::mac::WritingDirection writingDirection_;
+  CGFloat cornerRadius_;
+  bool verticalFooterLogoVisible_;
 
   // The row which has focused background.
   int focusedRow_;
@@ -92,9 +438,23 @@ using mozc::renderer::mac::MacViewUtil;
   // Cache of attributed strings which is allocated at updateLayout.
   NSArray *candidateStringsCache_;
 
+  // Core Text's technical vertical frame widths are intentionally wider than
+  // the visual card widths. Keep them per candidate so drawing can preserve
+  // full-fit while MacVerticalCandidateLayout stays purely visual.
+  std::vector<int> verticalValueFrameWidths_;
+  std::vector<int> verticalDescriptionFrameWidths_;
+
   // |command_sender_| holds a callback for mouse clicks.
   mozc::client::SendCommandInterface *command_sender_;
 
+  // Passive suggestions are generated from a cloned Session context. Keep the
+  // exact ID selected during the mouse gesture so an asynchronous renderer
+  // refresh cannot reinterpret mouse-up against an unrelated candidate list.
+  bool suggestionMouseGestureActive_;
+  std::optional<PassiveSuggestionCandidateIdentity>
+      pressedSuggestionCandidate_;
+
+  // Mouse callbacks are bound to the RendererCommand that populated this view.
   uint64_t rendererCallbackToken_;
   uint64_t mouseDownRendererCallbackToken_;
 }
@@ -106,6 +466,9 @@ using mozc::renderer::mac::MacViewUtil;
   if (self) {
     [self initializeDefaultStyle];
     focusedRow_ = -1;
+    verticalFooterLogoVisible_ = false;
+    writingDirection_ = WritingDirection::kHorizontal;
+    suggestionMouseGestureActive_ = false;
     rendererCallbackToken_ = 0;
     mouseDownRendererCallbackToken_ = 0;
   }
@@ -113,35 +476,78 @@ using mozc::renderer::mac::MacViewUtil;
 }
 
 - (void)initializeDefaultStyle {
-  RendererStyleHandler::GetRendererStyle(&style_);
-
-  const std::string &logo_file_name = style_.logo_file_name();
-  logoImage_ = [NSImage imageNamed:[NSString stringWithUTF8String:logo_file_name.c_str()]];
-  if (logoImage_) {
-    // Fix the image size.  Sometimes the size can be smaller than the
-    // actual size because of blank margin.
-    const NSArray *logoReps = [logoImage_ representations];
-    if (logoReps && [logoReps count] > 0) {
-      const NSImageRep *representation = [logoReps objectAtIndex:0];
-      [logoImage_ setSize:NSMakeSize([representation pixelsWide], [representation pixelsHigh])];
-    }
+  if (!RendererStyleHandler::GetRendererStyleForWindowType(
+          RendererStyleHandler::RendererStyleType::kCandidate, &style_)) {
+    RendererStyleHandler::GetDefaultRendererStyle(&style_);
   }
+  cornerRadius_ = static_cast<CGFloat>(
+      RendererStyleHandler::GetCandidateWindowCornerRadius(
+          RendererStyleHandler::RendererStyleType::kCandidate));
+  [self updateStyleDependentResources];
 
-  NSString *nsstr = [NSString stringWithUTF8String:style_.column_minimum_width_string().c_str()];
-  NSDictionary *attr = [NSDictionary dictionaryWithObject:[NSFont messageFontOfSize:14]
-                                                   forKey:NSFontAttributeName];
-  const NSAttributedString *defaultMessage = [[NSAttributedString alloc] initWithString:nsstr
-                                                                             attributes:attr];
-  columnMinimumWidth_ = [defaultMessage size].width;
-
-  // default line width is specified as 1.0 *pt*, but we want to draw
-  // it as 1.0 px.
+  // Default line width is specified as 1.0 pt, but the renderer expects
+  // a one-pixel logical border.
   [NSBezierPath setDefaultLineWidth:1.0];
   [NSBezierPath setDefaultLineJoinStyle:NSLineJoinStyleMiter];
 }
 
+- (void)reloadStyleForCandidateWindow {
+  const RendererStyleHandler::RendererStyleType style_type =
+      RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+          candidate_window_);
+
+  if (!RendererStyleHandler::GetRendererStyleForWindowType(style_type,
+                                                            &style_)) {
+    RendererStyleHandler::GetDefaultRendererStyle(&style_);
+  }
+  cornerRadius_ = static_cast<CGFloat>(
+      RendererStyleHandler::GetCandidateWindowCornerRadius(style_type));
+
+  [self updateStyleDependentResources];
+}
+
+- (void)updateStyleDependentResources {
+  const std::string &logo_file_name = style_.logo_file_name();
+  logoImage_ =
+      [NSImage imageNamed:[NSString stringWithUTF8String:logo_file_name.c_str()]];
+
+  if (logoImage_) {
+    // Fix the image size. Sometimes the logical size can be smaller than the
+    // underlying representation because of transparent margins.
+    const NSArray *logoReps = [logoImage_ representations];
+    if (logoReps && [logoReps count] > 0) {
+      const NSImageRep *representation = [logoReps objectAtIndex:0];
+      [logoImage_
+          setSize:NSMakeSize([representation pixelsWide],
+                             [representation pixelsHigh])];
+    }
+  }
+
+  const NSAttributedString *minimumWidthText =
+      MacViewUtil::ToNSAttributedString(
+          style_.column_minimum_width_string(), style_.candidate_style());
+  columnMinimumWidth_ =
+      std::max(1, static_cast<int>([minimumWidthText size].width));
+}
+
 - (void)setCandidateWindow:(const CandidateWindow *)candidate_window {
+  if (suggestionMouseGestureActive_ &&
+      pressedSuggestionCandidate_.has_value() &&
+      !ContainsPassiveSuggestionCandidateIdentity(
+          *candidate_window, *pressedSuggestionCandidate_)) {
+    pressedSuggestionCandidate_.reset();
+  }
+
   candidate_window_ = *candidate_window;
+  [self reloadStyleForCandidateWindow];
+}
+
+- (void)setWritingDirection:(WritingDirection)writing_direction {
+  if (writingDirection_ == writing_direction) {
+    return;
+  }
+  writingDirection_ = writing_direction;
+  candidateStringsCache_ = nil;
 }
 
 - (void)setSendCommandInterface:(SendCommandInterface *)command_sender {
@@ -165,10 +571,48 @@ using mozc::renderer::mac::MacViewUtil;
   return &tableLayout_;
 }
 
+- (mozc::Point)candidateAnchorOffset {
+  if (writingDirection_ == WritingDirection::kVertical) {
+    if (verticalLayout_.candidate_count() == 0) {
+      return mozc::Point();
+    }
+    const mozc::Rect value_rect = verticalLayout_.GetValueRect(0);
+    if (!value_rect.IsRectEmpty()) {
+      return mozc::Point(value_rect.Left(), value_rect.Top());
+    }
+    const mozc::Rect candidate_rect = verticalLayout_.GetCandidateRect(0);
+    return mozc::Point(candidate_rect.Left(), candidate_rect.Top());
+  }
+
+  return mozc::Point(
+      tableLayout_.GetColumnRect(kColumnCandidate).Left(), 0);
+}
+
+- (mozc::Rect)cascadingAnchorRectForRow:(size_t)row {
+  if (writingDirection_ == WritingDirection::kVertical) {
+    return verticalLayout_.GetCandidateRect(row);
+  }
+
+  if (row >= static_cast<size_t>(tableLayout_.number_of_rows())) {
+    return mozc::Rect();
+  }
+  mozc::Rect rect = tableLayout_.GetRowRect(static_cast<int>(row));
+  // Preserve CandidateController's historical behavior: cascading placement
+  // treats the scrollbar as part of the selected horizontal row.
+  rect.size.width += tableLayout_.GetVScrollBarRect().Width();
+  return rect;
+}
+
 #pragma mark drawing
 
 - (NSSize)updateLayout {
+  if (writingDirection_ == WritingDirection::kVertical) {
+    return [self updateVerticalLayout];
+  }
+
   candidateStringsCache_ = nil;
+  verticalValueFrameWidths_.clear();
+  verticalDescriptionFrameWidths_.clear();
   tableLayout_.Initialize(candidate_window_.candidate_size(), kNumberOfColumns);
   tableLayout_.SetWindowBorder(style_.window_border());
 
@@ -186,7 +630,7 @@ using mozc::renderer::mac::MacViewUtil;
 
     const mozc::commands::Footer &footer = candidate_window_.footer();
 
-    if (footer.has_label()) {
+    if (footer.has_label() && ShouldRenderFooterText(footer.label())) {
       const NSAttributedString *footerLabel =
           MacViewUtil::ToNSAttributedString(footer.label(), style_.footer_style());
       const NSSize footerLabelSize =
@@ -195,7 +639,8 @@ using mozc::renderer::mac::MacViewUtil;
       footerSize.height = std::max(footerSize.height, footerLabelSize.height);
     }
 
-    if (footer.has_sub_label()) {
+    if (footer.has_sub_label() &&
+        ShouldRenderFooterText(footer.sub_label())) {
       const NSAttributedString *footerSubLabel =
           MacViewUtil::ToNSAttributedString(footer.sub_label(), style_.footer_sub_label_style());
       const NSSize footerSubLabelSize =
@@ -223,8 +668,10 @@ using mozc::renderer::mac::MacViewUtil;
       footerSize.height = std::max(footerSize.height, footerIndexSize.height);
     }
 
-    footerSize.height += style_.footer_border_colors_size();
-    tableLayout_.EnsureFooterSize(MacViewUtil::ToSize(footerSize));
+    if (footerSize.height > 0) {
+      footerSize.height += style_.footer_border_colors_size();
+      tableLayout_.EnsureFooterSize(MacViewUtil::ToSize(footerSize));
+    }
   }
 
   tableLayout_.SetRowRectPadding(style_.row_rect_padding());
@@ -237,7 +684,7 @@ using mozc::renderer::mac::MacViewUtil;
   tableLayout_.EnsureCellSize(kColumnGap1, MacViewUtil::ToSize([gap1 size]));
 
   NSMutableArray *newCache = [[NSMutableArray array] init];
-  for (size_t i = 0; i < candidate_window_.candidate_size(); ++i) {
+  for (int i = 0; i < candidate_window_.candidate_size(); ++i) {
     const CandidateWindow::Candidate &candidate = candidate_window_.candidate(i);
     const NSAttributedString *shortcut = MacViewUtil::ToNSAttributedString(
         candidate.annotation().shortcut(), style_.shortcut_style());
@@ -283,11 +730,257 @@ using mozc::renderer::mac::MacViewUtil;
   return MacViewUtil::ToNSSize(tableLayout_.GetTotalSize());
 }
 
+- (NSSize)verticalFooterSizeForAvailableWidth:(CGFloat)availableWidth {
+  verticalFooterLogoVisible_ = false;
+
+  if (!candidate_window_.has_footer()) {
+    return NSZeroSize;
+  }
+
+  const mozc::commands::Footer &footer = candidate_window_.footer();
+
+  CGFloat textWidth = 0;
+  CGFloat rightWidth = 0;
+  CGFloat footerHeight = 0;
+  bool hasOperationalText = false;
+
+  if (footer.has_label() &&
+      ShouldRenderFooterText(footer.label())) {
+    const auto footerLabelStyle =
+        VerticalFooterTextStyle(footer.label(), style_.footer_style());
+    const NSAttributedString *footerLabel =
+        MacViewUtil::ToNSAttributedString(footer.label(), footerLabelStyle);
+    const NSSize labelSize = [footerLabel size];
+
+    textWidth = std::max<CGFloat>(
+        textWidth,
+        std::max<CGFloat>(0.0, footerLabelStyle.left_padding()) +
+            labelSize.width);
+    footerHeight = std::max(footerHeight, labelSize.height);
+    hasOperationalText = true;
+  }
+
+  if (footer.has_sub_label() &&
+      ShouldRenderFooterText(footer.sub_label())) {
+    const NSAttributedString *footerSubLabel =
+        MacViewUtil::ToNSAttributedString(footer.sub_label(),
+                                          style_.footer_sub_label_style());
+    const NSSize subLabelSize = [footerSubLabel size];
+
+    textWidth = std::max<CGFloat>(
+        textWidth,
+        std::max<CGFloat>(
+            0.0, style_.footer_sub_label_style().left_padding()) +
+            subLabelSize.width);
+    footerHeight = std::max(footerHeight, subLabelSize.height);
+    hasOperationalText = true;
+  }
+
+  if (footer.index_visible()) {
+    const NSString *footerIndex = [NSString
+        stringWithFormat:@"%d/%d", candidate_window_.focused_index() + 1,
+                         candidate_window_.size()];
+    const NSAttributedString *footerAttributedIndex =
+        MacViewUtil::ToNSAttributedString([footerIndex UTF8String],
+                                          style_.footer_style());
+    const NSSize indexSize = [footerAttributedIndex size];
+
+    rightWidth =
+        indexSize.width +
+        std::max<CGFloat>(0.0, style_.footer_style().right_padding());
+    footerHeight = std::max(footerHeight, indexSize.height);
+  }
+
+  CGFloat logoWidth = 0;
+  CGFloat logoHeight = 0;
+  if (footer.logo_visible() && logoImage_) {
+    const NSSize logoSize = [logoImage_ size];
+    logoWidth = logoSize.width;
+    logoHeight = logoSize.height;
+  }
+
+  // Match the actual one-line drawing footprint:
+  // [optional logo][label] ... [right-aligned index].
+  const CGFloat labelIndexGap =
+      footer.index_visible() && footer.has_label() &&
+              ShouldRenderFooterText(footer.label()) &&
+              IsHistoryDeletionFooterText(footer.label())
+          ? VerticalHistoryFooterLabelIndexGap(style_.footer_style())
+          : 0.0;
+  const CGFloat withoutLogoWidth = textWidth + labelIndexGap + rightWidth;
+  const CGFloat withLogoWidth = logoWidth + withoutLogoWidth;
+
+  if (logoWidth > 0) {
+    if (!hasOperationalText || availableWidth <= 0 ||
+        withLogoWidth <= availableWidth) {
+      verticalFooterLogoVisible_ = true;
+    } else {
+      // Operational text has priority over the decorative logo. If the logo
+      // alone would force the whole vertical window wider, reuse that slot for
+      // the label and keep the page index anchored at the right edge.
+      verticalFooterLogoVisible_ = false;
+    }
+  }
+
+  const CGFloat requiredWidth =
+      (verticalFooterLogoVisible_ ? logoWidth : 0) + withoutLogoWidth;
+
+  if (footerHeight > 0 && logoHeight > 0) {
+    footerHeight = std::max(footerHeight, logoHeight);
+  }
+  if (footerHeight > 0) {
+    footerHeight += style_.footer_border_colors_size();
+  }
+
+  return NSMakeSize(requiredWidth, footerHeight);
+}
+
+- (NSSize)updateVerticalLayout {
+  candidateStringsCache_ = nil;
+  verticalValueFrameWidths_.clear();
+  verticalDescriptionFrameWidths_.clear();
+  verticalValueFrameWidths_.reserve(candidate_window_.candidate_size());
+  verticalDescriptionFrameWidths_.reserve(candidate_window_.candidate_size());
+
+  if (candidate_window_.has_focused_index() &&
+      candidate_window_.candidate_size() > 0) {
+    const int focusedIndex = candidate_window_.focused_index();
+    focusedRow_ = focusedIndex - candidate_window_.candidate(0).index();
+  } else {
+    focusedRow_ = -1;
+  }
+
+  std::vector<MacVerticalCandidateLayout::CandidateMetrics> metrics;
+  metrics.reserve(candidate_window_.candidate_size());
+
+  NSMutableArray *newCache = [[NSMutableArray array] init];
+  const NSAttributedString *empty =
+      [[NSAttributedString alloc] initWithString:@""];
+
+  for (int i = 0; i < candidate_window_.candidate_size(); ++i) {
+    const CandidateWindow::Candidate &candidate = candidate_window_.candidate(i);
+
+    const NSAttributedString *shortcut = MacViewUtil::ToNSAttributedString(
+        candidate.annotation().shortcut(), style_.shortcut_style());
+
+    std::string value = candidate.value();
+    if (candidate.annotation().has_prefix()) {
+      value.insert(0, candidate.annotation().prefix());
+    }
+    if (candidate.annotation().has_suffix()) {
+      value.append(candidate.annotation().suffix());
+    }
+
+    const NSAttributedString *candidateValue = MakeVerticalAttributedString(
+        value, style_.candidate_style());
+    const NSAttributedString *description = MakeVerticalAttributedString(
+        candidate.annotation().description(), style_.description_style());
+
+    const NSSize shortcutSize = [shortcut length] > 0
+        ? MacViewUtil::applyTheme([shortcut size], style_.shortcut_style())
+        : NSZeroSize;
+    const VerticalTextMeasurement valueMeasurement =
+        MeasureVerticalAttributedString(candidateValue);
+    const VerticalTextMeasurement descriptionMeasurement =
+        MeasureVerticalAttributedString(description);
+    const mozc::Size informationMarkerSize =
+        candidate.has_information_id()
+            ? mozc::Size(kVerticalInformationMarkerWidth,
+                         kVerticalInformationMarkerHeight)
+            : mozc::Size();
+
+    metrics.push_back(MacVerticalCandidateLayout::CandidateMetrics{
+        MacViewUtil::ToSize(shortcutSize), valueMeasurement.layout_size,
+        descriptionMeasurement.layout_size, informationMarkerSize});
+    verticalValueFrameWidths_.push_back(valueMeasurement.frame_width);
+    verticalDescriptionFrameWidths_.push_back(
+        descriptionMeasurement.frame_width);
+
+    // Preserve the existing four-column cache indexing so horizontal and
+    // vertical drawing share the same semantic string slots. The gap entry is
+    // intentionally empty because the vertical layout owns spacing as geometry.
+    [newCache addObject:[NSArray arrayWithObjects:shortcut, empty, candidateValue,
+                                                   description, nil]];
+  }
+
+  const bool isPassiveSuggestion =
+      candidate_window_.category() == mozc::commands::SUGGESTION;
+
+  MacVerticalCandidateLayout::Parameters parameters;
+  parameters.window_border = style_.window_border();
+  parameters.cross_axis_edge_padding =
+      isPassiveSuggestion ? kVerticalSuggestionCrossAxisEdgePadding
+                          : kVerticalCrossAxisEdgePadding;
+  parameters.candidate_gap =
+      isPassiveSuggestion ? kVerticalSuggestionCandidateGap
+                          : kVerticalCandidateGap;
+  parameters.card_horizontal_padding = kVerticalCardHorizontalPadding;
+  parameters.card_vertical_padding =
+      isPassiveSuggestion ? kVerticalSuggestionCardVerticalPadding
+                          : kVerticalCardVerticalPadding;
+  parameters.shortcut_body_gap =
+      isPassiveSuggestion ? kVerticalSuggestionShortcutBodyGap
+                          : kVerticalShortcutBodyGap;
+  parameters.value_description_gap =
+      isPassiveSuggestion ? kVerticalSuggestionValueDescriptionGap
+                          : kVerticalValueDescriptionGap;
+  parameters.information_marker_gap = kVerticalInformationMarkerGap;
+
+  // Establish the candidate body's natural cross-axis width first. Footer
+  // content reuses that width before it is allowed to enlarge the window.
+  parameters.footer_size = mozc::Size();
+  verticalLayout_.Initialize(metrics, parameters);
+
+  const CGFloat naturalInnerWidth = std::max<CGFloat>(
+      0.0, verticalLayout_.GetTotalSize().width -
+               parameters.window_border * 2);
+
+  parameters.footer_size = MacViewUtil::ToSize(
+      [self verticalFooterSizeForAvailableWidth:naturalInnerWidth]);
+
+  verticalLayout_.Initialize(metrics, parameters);
+  candidateStringsCache_ = newCache;
+  return MacViewUtil::ToNSSize(verticalLayout_.GetTotalSize());
+}
+
 - (void)drawRect:(NSRect)rect {
   if (!Category_IsValid(candidate_window_.category())) {
-    LOG(WARNING) << "Unknown candidates category: " << candidate_window_.category();
+    LOG(WARNING) << "Unknown candidates category: "
+                 << candidate_window_.category();
     return;
   }
+
+  if (writingDirection_ == WritingDirection::kVertical) {
+    [self drawVerticalRect:rect];
+    return;
+  }
+
+  // The NSPanel is transparent so the rounded silhouette must explicitly
+  // clear stale pixels before drawing a new frame.
+  NSRectFillUsingOperation(self.bounds, NSCompositingOperationClear);
+
+  const NSRect pathBounds = NSInsetRect(self.bounds, 0.5, 0.5);
+  const CGFloat maximumRadius = std::max<CGFloat>(
+      0.0, std::min(NSWidth(pathBounds), NSHeight(pathBounds)) / 2.0);
+  const CGFloat effectiveRadius =
+      std::min(std::max<CGFloat>(cornerRadius_, 0.0), maximumRadius);
+  NSBezierPath *windowPath =
+      [NSBezierPath bezierPathWithRoundedRect:pathBounds
+                                     xRadius:effectiveRadius
+                                     yRadius:effectiveRadius];
+
+  [NSGraphicsContext saveGraphicsState];
+  [windowPath addClip];
+
+  // Paint the complete view before drawing individual cells. Otherwise,
+  // column gaps and unused layout regions would remain transparent.
+  if (style_.candidate_style().has_background_color()) {
+    [MacViewUtil::ToNSColor(
+        style_.candidate_style().background_color()) set];
+  } else {
+    [NSColor.windowBackgroundColor set];
+  }
+  [NSBezierPath fillRect:self.bounds];
 
   for (int i = 0; i < candidate_window_.candidate_size(); ++i) {
     [self drawRow:i];
@@ -298,10 +991,240 @@ using mozc::renderer::mac::MacViewUtil;
   }
   [self drawFooter];
 
-  // Draw the window border at last
-  [MacViewUtil::ToNSColor(style_.border_color()) set];
-  const mozc::Size windowSize = tableLayout_.GetTotalSize();
-  [NSBezierPath strokeRect:NSMakeRect(0.5, 0.5, windowSize.width - 1, windowSize.height - 1)];
+  [NSGraphicsContext restoreGraphicsState];
+
+  // Draw the rounded outer border last so it remains crisp at the clip edge.
+  [MacViewUtil::ToNSColor(style_.border_color()) setStroke];
+  [windowPath setLineWidth:1.0];
+  [windowPath stroke];
+}
+
+- (void)drawVerticalRect:(NSRect)rect {
+  (void)rect;
+  // The outer silhouette intentionally mirrors the proven horizontal path.
+  NSRectFillUsingOperation(self.bounds, NSCompositingOperationClear);
+
+  const NSRect pathBounds = NSInsetRect(self.bounds, 0.5, 0.5);
+  const CGFloat maximumRadius = std::max<CGFloat>(
+      0.0, std::min(NSWidth(pathBounds), NSHeight(pathBounds)) / 2.0);
+  const CGFloat effectiveRadius =
+      std::min(std::max<CGFloat>(cornerRadius_, 0.0), maximumRadius);
+  NSBezierPath *windowPath =
+      [NSBezierPath bezierPathWithRoundedRect:pathBounds
+                                     xRadius:effectiveRadius
+                                     yRadius:effectiveRadius];
+
+  [NSGraphicsContext saveGraphicsState];
+  [windowPath addClip];
+
+  if (style_.candidate_style().has_background_color()) {
+    [MacViewUtil::ToNSColor(
+        style_.candidate_style().background_color()) set];
+  } else {
+    [NSColor.windowBackgroundColor set];
+  }
+  [NSBezierPath fillRect:self.bounds];
+
+  for (int i = 0; i < candidate_window_.candidate_size(); ++i) {
+    [self drawVerticalCandidate:i];
+  }
+  [self drawVerticalFooter];
+
+  [NSGraphicsContext restoreGraphicsState];
+
+  [MacViewUtil::ToNSColor(style_.border_color()) setStroke];
+  [windowPath setLineWidth:1.0];
+  [windowPath stroke];
+}
+
+- (void)drawVerticalCandidate:(int)row {
+  if (row < 0 ||
+      static_cast<size_t>(row) >= verticalLayout_.candidate_count()) {
+    return;
+  }
+
+  NSRect candidateRect =
+      MacViewUtil::ToNSRect(verticalLayout_.GetCandidateRect(row));
+
+  if (row == focusedRow_) {
+    [MacViewUtil::ToNSColor(style_.focused_background_color()) set];
+    [NSBezierPath fillRect:candidateRect];
+    [MacViewUtil::ToNSColor(style_.focused_border_color()) set];
+    NSRect borderRect = candidateRect;
+    borderRect.origin.x += 0.5;
+    borderRect.origin.y += 0.5;
+    borderRect.size.width -= 1.0;
+    borderRect.size.height -= 1.0;
+    if (borderRect.size.width > 0 && borderRect.size.height > 0) {
+      [NSBezierPath strokeRect:borderRect];
+    }
+  } else {
+    auto drawBackground = [&](const mozc::Rect &logical_rect,
+                              const mozc::renderer::RendererStyle::TextStyle
+                                  &text_style) {
+      if (!logical_rect.IsRectEmpty() &&
+          text_style.has_background_color()) {
+        [MacViewUtil::ToNSColor(text_style.background_color()) set];
+        [NSBezierPath fillRect:MacViewUtil::ToNSRect(logical_rect)];
+      }
+    };
+    drawBackground(verticalLayout_.GetShortcutRect(row),
+                   style_.shortcut_style());
+    drawBackground(verticalLayout_.GetValueRect(row),
+                   style_.candidate_style());
+    drawBackground(verticalLayout_.GetDescriptionRect(row),
+                   style_.description_style());
+  }
+
+  NSArray<NSAttributedString *> *candidate =
+      [candidateStringsCache_ objectAtIndex:row];
+
+  const NSAttributedString *shortcut =
+      [candidate objectAtIndex:kColumnShortcut];
+  const NSRect shortcutRect =
+      MacViewUtil::ToNSRect(verticalLayout_.GetShortcutRect(row));
+  if ([shortcut length] > 0 && shortcutRect.size.width > 0 &&
+      shortcutRect.size.height > 0) {
+    NSPoint position = shortcutRect.origin;
+    position.x += style_.shortcut_style().left_padding();
+    position.y += (shortcutRect.size.height - [shortcut size].height) / 2;
+    [shortcut drawAtPoint:position];
+  }
+
+  const size_t verticalRow = static_cast<size_t>(row);
+  const CGFloat valueFrameWidth =
+      verticalRow < verticalValueFrameWidths_.size()
+          ? verticalValueFrameWidths_[verticalRow]
+          : verticalLayout_.GetValueRect(verticalRow).Width();
+  const CGFloat descriptionFrameWidth =
+      verticalRow < verticalDescriptionFrameWidths_.size()
+          ? verticalDescriptionFrameWidths_[verticalRow]
+          : verticalLayout_.GetDescriptionRect(verticalRow).Width();
+
+  DrawVerticalAttributedString(
+      [candidate objectAtIndex:kColumnCandidate],
+      MacViewUtil::ToNSRect(verticalLayout_.GetValueRect(verticalRow)),
+      valueFrameWidth);
+  DrawVerticalAttributedString(
+      [candidate objectAtIndex:kColumnDescription],
+      MacViewUtil::ToNSRect(verticalLayout_.GetDescriptionRect(verticalRow)),
+      descriptionFrameWidth);
+
+  const mozc::Rect informationRect =
+      verticalLayout_.GetInformationMarkerRect(row);
+  if (!informationRect.IsRectEmpty()) {
+    [MacViewUtil::ToNSColor(style_.focused_border_color()) set];
+    [NSBezierPath fillRect:MacViewUtil::ToNSRect(informationRect)];
+  }
+}
+
+- (void)drawVerticalFooter {
+  const mozc::Rect footerLogicalRect = verticalLayout_.GetFooterRect();
+  if (!candidate_window_.has_footer() || footerLogicalRect.IsRectEmpty()) {
+    return;
+  }
+  const mozc::commands::Footer &footer = candidate_window_.footer();
+  NSRect footerRect = MacViewUtil::ToNSRect(footerLogicalRect);
+
+  for (int i = 0; i < style_.footer_border_colors_size(); ++i) {
+    [MacViewUtil::ToNSColor(style_.footer_border_colors(i)) set];
+    const NSPoint fromPoint =
+        NSMakePoint(footerRect.origin.x, footerRect.origin.y + 0.5);
+    const NSPoint toPoint =
+        NSMakePoint(footerRect.origin.x + footerRect.size.width,
+                    footerRect.origin.y + 0.5);
+    [NSBezierPath strokeLineFromPoint:fromPoint toPoint:toPoint];
+    footerRect.origin.y += 1;
+  }
+
+  const NSGradient *footerBackground = [[NSGradient alloc]
+      initWithStartingColor:MacViewUtil::ToNSColor(style_.footer_top_color())
+                endingColor:MacViewUtil::ToNSColor(style_.footer_bottom_color())];
+  [footerBackground drawInRect:footerRect angle:90.0];
+
+  if (verticalFooterLogoVisible_ && logoImage_) {
+    const NSPoint logoPoint = footerRect.origin;
+    const NSSize logoSize = logoImage_.size;
+    const NSRect logoRect = NSMakeRect(
+        logoPoint.x, logoPoint.y, logoSize.width, logoSize.height);
+    [logoImage_ drawInRect:logoRect
+                  fromRect:NSZeroRect
+                 operation:NSCompositingOperationSourceOver
+                  fraction:1.0
+            respectFlipped:YES
+                     hints:nil];
+    footerRect.origin.x += logoSize.width;
+    footerRect.size.width -= logoSize.width;
+  }
+
+  if (footer.has_label() &&
+      ShouldRenderFooterText(footer.label())) {
+    const auto footerLabelStyle =
+        VerticalFooterTextStyle(footer.label(), style_.footer_style());
+    const NSAttributedString *footerLabel =
+        MacViewUtil::ToNSAttributedString(footer.label(), footerLabelStyle);
+    const NSSize labelSize = [footerLabel size];
+
+    if (IsHistoryDeletionFooterText(footer.label()) &&
+        footer.index_visible()) {
+      const std::string footerIndex =
+          absl::StrFormat("%d/%d", candidate_window_.focused_index() + 1,
+                          candidate_window_.size());
+      const NSAttributedString *footerAttributedIndex =
+          MacViewUtil::ToNSAttributedString(footerIndex, style_.footer_style());
+      const NSSize indexSize = [footerAttributedIndex size];
+
+      const CGFloat minimumLabelX =
+          footerRect.origin.x +
+          std::max<CGFloat>(0.0, footerLabelStyle.left_padding());
+      const CGFloat indexLeft =
+          footerRect.origin.x + footerRect.size.width - indexSize.width -
+          std::max<CGFloat>(0.0, style_.footer_style().right_padding());
+      const CGFloat preferredLabelX =
+          indexLeft -
+          VerticalHistoryFooterLabelIndexGap(style_.footer_style()) -
+          labelSize.width;
+
+      NSPoint labelPosition = footerRect.origin;
+      labelPosition.x = std::max(minimumLabelX, preferredLabelX);
+      labelPosition.y += (footerRect.size.height - labelSize.height) / 2;
+      [footerLabel drawAtPoint:labelPosition];
+    } else {
+      footerRect.origin.x += footerLabelStyle.left_padding();
+      const NSPoint labelPosition =
+          NSMakePoint(footerRect.origin.x,
+                      footerRect.origin.y +
+                          (footerRect.size.height - labelSize.height) / 2);
+      [footerLabel drawAtPoint:labelPosition];
+    }
+  }
+
+  if (footer.has_sub_label() &&
+      ShouldRenderFooterText(footer.sub_label())) {
+    const NSAttributedString *footerSubLabel =
+        MacViewUtil::ToNSAttributedString(footer.sub_label(),
+                                          style_.footer_sub_label_style());
+    footerRect.origin.x += style_.footer_sub_label_style().left_padding();
+    const NSSize subLabelSize = [footerSubLabel size];
+    NSPoint subLabelPosition = footerRect.origin;
+    subLabelPosition.y +=
+        (footerRect.size.height - subLabelSize.height) / 2;
+    [footerSubLabel drawAtPoint:subLabelPosition];
+  }
+
+  if (footer.index_visible()) {
+    const std::string footerIndex =
+        absl::StrFormat("%d/%d", candidate_window_.focused_index() + 1,
+                        candidate_window_.size());
+    const NSAttributedString *footerAttributedIndex =
+        MacViewUtil::ToNSAttributedString(footerIndex, style_.footer_style());
+    const NSSize footerSize = [footerAttributedIndex size];
+    NSPoint footerPosition = footerRect.origin;
+    footerPosition.x = footerPosition.x + footerRect.size.width -
+                       footerSize.width -
+                       style_.footer_style().right_padding();
+    [footerAttributedIndex drawAtPoint:footerPosition];
+  }
 }
 
 #pragma mark drawing aux methods
@@ -323,9 +1246,12 @@ using mozc::renderer::mac::MacViewUtil;
     [NSBezierPath strokeRect:focusedRect];
   } else {
     // Draw normal background
+    const mozc::Rect rowRect = tableLayout_.GetRowRect(row);
     auto drawBackground = [&](ColumnType type,
-                              const mozc::renderer::RendererStyle::TextStyle& text_style) {
-      const mozc::Rect cellRect = tableLayout_.GetCellRect(row, type);
+                              const mozc::renderer::RendererStyle::TextStyle &text_style) {
+      mozc::Rect cellRect = tableLayout_.GetCellRect(row, type);
+      cellRect.origin.y = rowRect.origin.y;
+      cellRect.size.height = rowRect.size.height;
       if (cellRect.size.width > 0 && cellRect.size.height > 0 &&
           text_style.has_background_color()) {
         [MacViewUtil::ToNSColor(text_style.background_color()) set];
@@ -370,8 +1296,12 @@ using mozc::renderer::mac::MacViewUtil;
   if (!candidate_window_.has_footer()) {
     return;
   }
+  const mozc::Rect footerLogicalRect = tableLayout_.GetFooterRect();
+  if (footerLogicalRect.IsRectEmpty()) {
+    return;
+  }
   const mozc::commands::Footer &footer = candidate_window_.footer();
-  NSRect footerRect = MacViewUtil::ToNSRect(tableLayout_.GetFooterRect());
+  NSRect footerRect = MacViewUtil::ToNSRect(footerLogicalRect);
 
   // Draw footer border
   for (int i = 0; i < style_.footer_border_colors_size(); ++i) {
@@ -405,7 +1335,7 @@ using mozc::renderer::mac::MacViewUtil;
   }
 
   // Draw label
-  if (footer.has_label()) {
+  if (footer.has_label() && ShouldRenderFooterText(footer.label())) {
     const NSAttributedString *footerLabel =
         MacViewUtil::ToNSAttributedString(footer.label(), style_.footer_style());
     footerRect.origin.x += style_.footer_style().left_padding();
@@ -416,7 +1346,8 @@ using mozc::renderer::mac::MacViewUtil;
   }
 
   // Draw sub_label
-  if (footer.has_sub_label()) {
+  if (footer.has_sub_label() &&
+      ShouldRenderFooterText(footer.sub_label())) {
     const NSAttributedString *footerSubLabel =
         MacViewUtil::ToNSAttributedString(footer.sub_label(), style_.footer_sub_label_style());
     footerRect.origin.x += style_.footer_sub_label_style().left_padding();
@@ -461,6 +1392,31 @@ using mozc::renderer::mac::MacViewUtil;
   [NSBezierPath fillRect:MacViewUtil::ToNSRect(indicatorRect)];
 }
 
+- (int)candidateRowAtPoint:(mozc::Point)localPos {
+  if (writingDirection_ == WritingDirection::kVertical) {
+    if (candidate_window_.candidate_size() <
+        static_cast<int>(verticalLayout_.candidate_count())) {
+      return -1;
+    }
+    for (size_t i = 0; i < verticalLayout_.candidate_count(); ++i) {
+      if (verticalLayout_.GetCandidateRect(i).PtrInRect(localPos)) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  }
+
+  if (candidate_window_.candidate_size() < tableLayout_.number_of_rows()) {
+    return -1;
+  }
+  for (int i = 0; i < tableLayout_.number_of_rows(); ++i) {
+    if (tableLayout_.GetRowRect(i).PtrInRect(localPos)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 #pragma mark event handling callbacks
 
 - (void)mouseDown:(NSEvent *)event {
@@ -469,15 +1425,18 @@ using mozc::renderer::mac::MacViewUtil;
 }
 
 - (void)updateFocusedRowForEvent:(NSEvent *)event {
-  const mozc::Point localPos = MacViewUtil::ToPoint([self convertPoint:[event locationInWindow]
-                                                              fromView:nil]);
-  int clickedRow = -1;
-  for (int i = 0; i < tableLayout_.number_of_rows(); ++i) {
-    const mozc::Rect rowRect = tableLayout_.GetRowRect(i);
-    if (rowRect.PtrInRect(localPos)) {
-      clickedRow = i;
-      break;
-    }
+  const mozc::Point localPos =
+      MacViewUtil::ToPoint([self convertPoint:[event locationInWindow]
+                                     fromView:nil]);
+  const int clickedRow = [self candidateRowAtPoint:localPos];
+
+  if (IsPassiveSuggestionCandidateWindow(candidate_window_)) {
+    suggestionMouseGestureActive_ = true;
+    pressedSuggestionCandidate_ =
+        GetPassiveSuggestionCandidateIdentity(candidate_window_, clickedRow);
+  } else {
+    suggestionMouseGestureActive_ = false;
+    pressedSuggestionCandidate_.reset();
   }
 
   if (clickedRow >= 0 && clickedRow != focusedRow_) {
@@ -487,38 +1446,82 @@ using mozc::renderer::mac::MacViewUtil;
 }
 
 - (void)mouseUp:(NSEvent *)event {
-  const mozc::Point localPos = MacViewUtil::ToPoint([self convertPoint:[event locationInWindow]
-                                                              fromView:nil]);
   const uint64_t mouse_down_token = mouseDownRendererCallbackToken_;
   mouseDownRendererCallbackToken_ = 0;
-  if (candidate_window_.candidate_size() < tableLayout_.number_of_rows()) {
+
+  if (suggestionMouseGestureActive_) {
+    suggestionMouseGestureActive_ = false;
+    const std::optional<PassiveSuggestionCandidateIdentity> candidate =
+        pressedSuggestionCandidate_;
+    pressedSuggestionCandidate_.reset();
+
+    if (candidate.has_value()) {
+      [self sendCandidateCommandOfType:SessionCommand::SUBMIT_CANDIDATE
+                           candidateId:candidate->id
+                        mouseDownToken:mouse_down_token];
+    }
     return;
   }
-  for (int i = 0; i < tableLayout_.number_of_rows(); ++i) {
-    const mozc::Rect rowRect = tableLayout_.GetRowRect(i);
-    if (rowRect.PtrInRect(localPos)) {
-      [self sendCandidateCommandForRow:i mouseDownToken:mouse_down_token];
-      break;
-    }
+
+  const mozc::Point localPos =
+      MacViewUtil::ToPoint([self convertPoint:[event locationInWindow]
+                                     fromView:nil]);
+  const int clickedRow = [self candidateRowAtPoint:localPos];
+  if (clickedRow < 0) {
+    return;
   }
+
+  [self sendCandidateCommandForRow:clickedRow mouseDownToken:mouse_down_token];
 }
 
 - (BOOL)sendCandidateCommandForRow:(int)row
                     mouseDownToken:(uint64_t)mouseDownToken {
+  if (row < 0 || row >= candidate_window_.candidate_size()) {
+    return NO;
+  }
+  return [self sendCandidateCommandOfType:SessionCommand::SELECT_CANDIDATE
+                              candidateId:candidate_window_.candidate(row).id()
+                           mouseDownToken:mouseDownToken];
+}
+
+- (BOOL)sendCandidateCommandOfType:(SessionCommand::CommandType)type
+                       candidateId:(int32_t)candidateId
+                    mouseDownToken:(uint64_t)mouseDownToken {
   if (command_sender_ == nullptr || rendererCallbackToken_ == 0 ||
-      mouseDownToken != rendererCallbackToken_ || row < 0 ||
-      row >= candidate_window_.candidate_size()) {
+      mouseDownToken != rendererCallbackToken_) {
     return NO;
   }
   SessionCommand command;
-  command.set_type(SessionCommand::SELECT_CANDIDATE);
-  command.set_id(candidate_window_.candidate(row).id());
+  command.set_type(type);
+  command.set_id(candidateId);
   command.set_renderer_callback_token(rendererCallbackToken_);
   Output dummy_output;
   return command_sender_->SendCommand(command, &dummy_output);
 }
 
 - (void)mouseDragged:(NSEvent *)event {
-  [self updateFocusedRowForEvent:event];
+  if (!suggestionMouseGestureActive_) {
+    // Do not rebind the gesture's renderer callback token while dragging.
+    [self updateFocusedRowForEvent:event];
+    return;
+  }
+
+  const mozc::Point localPos =
+      MacViewUtil::ToPoint([self convertPoint:[event locationInWindow]
+                                     fromView:nil]);
+
+  if (!IsPassiveSuggestionCandidateWindow(candidate_window_)) {
+    pressedSuggestionCandidate_.reset();
+    return;
+  }
+
+  const int clickedRow = [self candidateRowAtPoint:localPos];
+  pressedSuggestionCandidate_ =
+      GetPassiveSuggestionCandidateIdentity(candidate_window_, clickedRow);
+  if (pressedSuggestionCandidate_.has_value() &&
+      clickedRow != focusedRow_) {
+    focusedRow_ = clickedRow;
+    [self setNeedsDisplay:YES];
+  }
 }
 @end

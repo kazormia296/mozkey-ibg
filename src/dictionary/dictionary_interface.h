@@ -38,7 +38,7 @@
 #include "absl/strings/string_view.h"
 #include "dictionary/dictionary_token.h"
 #include "protocol/user_dictionary_storage.pb.h"
-#include "request/conversion_request.h"
+#include "request/options.h"
 
 namespace mozc {
 namespace dictionary {
@@ -104,9 +104,21 @@ class DictionaryInterface {
     }
 
     // Called back when a token is decoded.
+    // Takes Token by value to allow callers to std::move() key and value
+    // directly into Node or other storage without duplicate heap copies.
+    //
+    // Callers who own a temporary Token should std::move() it into OnToken.
+    // Callers who reuse an internal Token across iterations (e.g.
+    // TokenDecodeIterator in SystemDictionary) must pass it by lvalue (copy),
+    // because internal iterator state like Token::value is preserved across
+    // iterations for SAME_AS_PREV_VALUE.
+    //
+    // Implementations (such as NodeListBuilder) should std::move() the
+    // received Token into their destination structures to avoid duplicate
+    // allocations.
     virtual ResultType OnToken(absl::string_view key,
                                absl::string_view expanded_key,
-                               const Token& token_info) {
+                               Token token_info) {
       return TRAVERSE_CONTINUE;
     }
 
@@ -149,14 +161,13 @@ class DictionaryInterface {
     return false;
   }
 
-  // Legacy interfaces with conversion_request.
-  // TODO(taku): Gets rid of the dependency from Dictionary to
-  // ConversionRequest.
+  // Interfaces with conversion_options.
+  // Decoupled from ConversionRequest.
 
   // Looks up values whose keys start from the key.
   // (e.g. key = "abc" -> {"abc": "ABC", "abcd": "ABCD"})
   virtual void LookupPredictive(absl::string_view key,
-                                const ConversionRequest& conversion_request,
+                                const ConversionOptions& options,
                                 Callback* callback) const {
     return LookupPredictive(key, callback);
   }
@@ -164,7 +175,7 @@ class DictionaryInterface {
   // Looks up values whose keys are prefixes of the key.
   // (e.g. key = "abc" -> {"abc": "ABC", "a": "A"})
   virtual void LookupPrefix(absl::string_view key,
-                            const ConversionRequest& conversion_request,
+                            const ConversionOptions& options,
                             Callback* callback) const {
     return LookupPrefix(key, callback);
   }
@@ -172,7 +183,7 @@ class DictionaryInterface {
   // Looks up values whose keys are same with the key.
   // (e.g. key = "abc" -> {"abc": "ABC"})
   virtual void LookupExact(absl::string_view key,
-                           const ConversionRequest& conversion_request,
+                           const ConversionOptions& options,
                            Callback* callback) const {
     return LookupExact(key, callback);
   }
@@ -180,7 +191,7 @@ class DictionaryInterface {
   // For reverse lookup, the reading is stored in Token::value and the word
   // is stored in Token::key.
   virtual void LookupReverse(absl::string_view str,
-                             const ConversionRequest& conversion_request,
+                             const ConversionOptions& options,
                              Callback* callback) const {
     return LookupReverse(str, callback);
   }
@@ -189,7 +200,7 @@ class DictionaryInterface {
   // doesn't exist in this dictionary or user comment is empty, bool is
   // returned and string is kept as-is.
   virtual bool LookupComment(absl::string_view key, absl::string_view value,
-                             const ConversionRequest& conversion_request,
+                             const ConversionOptions& options,
                              std::string* comment) const {
     return LookupComment(key, value, comment);
   }
@@ -225,8 +236,8 @@ class InlineCallback : public DictionaryInterface::Callback {
   using KeyHandler = std::function<ResultType(absl::string_view)>;
   using ActualKeyHandler =
       std::function<ResultType(absl::string_view, absl::string_view, int)>;
-  using TokenHandler = std::function<ResultType(
-      absl::string_view, absl::string_view, const Token&)>;
+  using TokenHandler =
+      std::function<ResultType(absl::string_view, absl::string_view, Token)>;
 
   InlineCallback() = default;
 
@@ -256,9 +267,10 @@ class InlineCallback : public DictionaryInterface::Callback {
   }
 
   ResultType OnToken(absl::string_view key, absl::string_view expanded_key,
-                     const Token& token_info) override {
-    return token_handler_ ? token_handler_(key, expanded_key, token_info)
-                          : TRAVERSE_CONTINUE;
+                     Token token_info) override {
+    return token_handler_
+               ? token_handler_(key, expanded_key, std::move(token_info))
+               : TRAVERSE_CONTINUE;
   }
 
  private:
@@ -289,6 +301,14 @@ class UserDictionaryInterface : public DictionaryInterface {
 
   // Return true if the dictionary has at least one suppression entry.
   virtual bool HasSuppressedEntries() const = 0;
+
+  // Adds an exact (key, value) suppression entry to persistent user dictionary
+  // storage. Implementations that do not support persistent mutation may keep
+  // the default failure behavior.
+  virtual bool AddSuppressionEntry(absl::string_view key,
+                                   absl::string_view value) {
+    return false;
+  }
 
   // Reload dictionary data from local disk.
   virtual bool Reload() { return true; }

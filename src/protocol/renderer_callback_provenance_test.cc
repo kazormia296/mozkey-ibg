@@ -78,26 +78,70 @@ TEST(RendererCallbackProvenanceTest, SeparatesSelectAndHighlightDispatch) {
             RendererCallbackKind::kSelect);
   EXPECT_EQ(GetRendererCallbackKind(SessionCommand::HIGHLIGHT_CANDIDATE),
             RendererCallbackKind::kHighlight);
+  EXPECT_EQ(GetRendererCallbackKind(SessionCommand::SUBMIT_CANDIDATE),
+            RendererCallbackKind::kSubmit);
   EXPECT_EQ(GetRendererCallbackKind(SessionCommand::SUBMIT),
             RendererCallbackKind::kUnsupported);
 
   constexpr uint32_t kSelectMessage = 100;
   constexpr uint32_t kHighlightMessage = 101;
-  EXPECT_EQ(GetRendererCallbackKindForMessage(
-                kSelectMessage, kSelectMessage, kHighlightMessage),
+  constexpr uint32_t kSubmitMessage = 102;
+  EXPECT_EQ(GetRendererCallbackKindForMessage(kSelectMessage, kSelectMessage,
+                                              kHighlightMessage,
+                                              kSubmitMessage),
             RendererCallbackKind::kSelect);
-  EXPECT_EQ(GetRendererCallbackKindForMessage(
-                kHighlightMessage, kSelectMessage, kHighlightMessage),
+  EXPECT_EQ(GetRendererCallbackKindForMessage(kHighlightMessage,
+                                              kSelectMessage,
+                                              kHighlightMessage,
+                                              kSubmitMessage),
             RendererCallbackKind::kHighlight);
-  EXPECT_EQ(GetRendererCallbackKindForMessage(
-                /*message=*/102, kSelectMessage, kHighlightMessage),
+  EXPECT_EQ(GetRendererCallbackKindForMessage(kSubmitMessage, kSelectMessage,
+                                              kHighlightMessage,
+                                              kSubmitMessage),
+            RendererCallbackKind::kSubmit);
+  EXPECT_EQ(GetRendererCallbackKindForMessage(/*message=*/103, kSelectMessage,
+                                              kHighlightMessage,
+                                              kSubmitMessage),
             RendererCallbackKind::kUnsupported);
-  EXPECT_EQ(GetRendererCallbackKindForMessage(
-                kSelectMessage, kSelectMessage, kSelectMessage),
+  EXPECT_EQ(GetRendererCallbackKindForMessage(kSelectMessage, kSelectMessage,
+                                              kSelectMessage, kSubmitMessage),
             RendererCallbackKind::kUnsupported);
-  EXPECT_EQ(GetRendererCallbackKindForMessage(
-                /*message=*/0, kSelectMessage, kHighlightMessage),
+  EXPECT_EQ(GetRendererCallbackKindForMessage(kSelectMessage, kSelectMessage,
+                                              kHighlightMessage,
+                                              kSelectMessage),
             RendererCallbackKind::kUnsupported);
+  EXPECT_EQ(GetRendererCallbackKindForMessage(kHighlightMessage,
+                                              kSelectMessage,
+                                              kHighlightMessage,
+                                              kHighlightMessage),
+            RendererCallbackKind::kUnsupported);
+  EXPECT_EQ(GetRendererCallbackKindForMessage(/*message=*/0, kSelectMessage,
+                                              kHighlightMessage,
+                                              kSubmitMessage),
+            RendererCallbackKind::kUnsupported);
+  EXPECT_EQ(GetRendererCallbackKindForMessage(kSelectMessage, kSelectMessage,
+                                              kHighlightMessage,
+                                              /*submit_message=*/0),
+            RendererCallbackKind::kUnsupported);
+}
+
+TEST(RendererCallbackProvenanceTest, SubmitCandidateDispatchesLikeSelect) {
+  Output output;
+  CandidateWindow* candidate_window = output.mutable_candidate_window();
+  candidate_window->set_focused_index(0);
+  candidate_window->set_size(1);
+  candidate_window->set_position(0);
+  CandidateWindow::Candidate* candidate = candidate_window->add_candidate();
+  candidate->set_index(0);
+  candidate->set_id(7);
+  candidate->set_value("value");
+
+  EXPECT_EQ(GetRendererCallbackCandidateDisposition(
+                SessionCommand::SUBMIT_CANDIDATE, output, /*candidate_id=*/7),
+            RendererCallbackCandidateDisposition::kDispatch);
+  EXPECT_EQ(GetRendererCallbackCandidateDisposition(
+                SessionCommand::SUBMIT_CANDIDATE, output, /*candidate_id=*/8),
+            RendererCallbackCandidateDisposition::kReject);
 }
 
 TEST(RendererCallbackProvenanceTest,

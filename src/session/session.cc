@@ -44,6 +44,7 @@
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
@@ -62,9 +63,14 @@
 #include "session/ime_context.h"
 #include "session/key_event_transformer.h"
 #include "session/keymap.h"
+#include "session/vertical_writing_key_transform.h"
+#include "session/zenz_client_context.h"
+#include "session/zenz_client_factory.h"
+#include "session/zenz_context_assembler.h"
+#include "session/zenz_context_selector.h"
 #include "session/zenz_diagnostic.h"
-#include "session/zenz_named_pipe_client.h"
 #include "session/zenz_prompt_builder.h"
+#include "session/zenz_text_privacy_analyzer.h"
 #include "transliteration/transliteration.h"
 
 #ifdef __APPLE__
@@ -134,6 +140,8 @@ void ZenzDebugOutput(absl::string_view message) {
 void ZenzDebugOutput(absl::string_view) {}
 #endif
 
+bool IsValidDirectCommitTriggerKey(const config::Config& config,
+                                   const commands::KeyEvent& key_event);
 std::string ZenzRedactedTextStats(absl::string_view label,
                                   absl::string_view text) {
   return absl::StrCat(
@@ -213,6 +221,53 @@ void CaptureZenzSessionDecision(uint32_t generation,
   ZenzDiagnosticCapture::Write(diagnostic);
 }
 
+// Reverse-conversion anchors are cached per Zenz request when multiple
+// feedback candidates are inspected.  Nothing calls this on the OFF path.
+struct ZenzStrictReadingCache {
+  std::optional<std::string> normalized_key_reading;
+};
+
+ZenzValidationResult ValidateZenzStrictReading(
+    EngineConverterInterface* converter, absl::string_view key,
+    absl::string_view candidate_value,
+    ZenzStrictReadingCache* shared_cache = nullptr) {
+  if (candidate_value == key) {
+    return ZenzOutputValidator::ValidateReadingPreservation(key, "", key);
+  }
+
+  std::string candidate_reading;
+  if (converter == nullptr ||
+      !converter->GetReadingText(candidate_value, &candidate_reading)) {
+    return ZenzOutputValidator::ValidateReadingPreservation(key, "", "");
+  }
+  if (candidate_reading == key) {
+    return ZenzOutputValidator::ValidateReadingPreservation(
+        key, "", candidate_reading);
+  }
+
+  ZenzStrictReadingCache local_cache;
+  ZenzStrictReadingCache* cache =
+      shared_cache != nullptr ? shared_cache : &local_cache;
+  if (!cache->normalized_key_reading.has_value()) {
+    std::string reading;
+    if (!converter->GetReadingText(key, &reading)) {
+      reading.clear();
+    }
+    cache->normalized_key_reading = std::move(reading);
+  }
+  if (candidate_reading == *cache->normalized_key_reading &&
+      !candidate_reading.empty()) {
+    return ZenzOutputValidator::ValidateReadingPreservation(
+        key, *cache->normalized_key_reading, candidate_reading);
+  }
+
+  // The Mozc baseline is a safe display fallback, not a reading authority:
+  // it may itself omit part of the typed text.  Accepting its reverse reading
+  // as an independent anchor would defeat the purpose of strict mode.
+  return ZenzOutputValidator::ValidateReadingPreservation(
+      key, *cache->normalized_key_reading, candidate_reading);
+}
+
 // Maximum size of multiple undo stack.
 const size_t kMultipleUndoMaxSize = 10;
 
@@ -220,6 +275,25 @@ const size_t kMultipleUndoMaxSize = 10;
 // user segment history when the user cancels a conversion and immediately
 // commits the restored hiragana preedit.
 constexpr size_t kMinRerankedPreeditCommitCharsAfterConvertCancel = 2;
+
+// The keymap uses integer milliseconds, like the normal live conversion UI.
+// Delay(0) is a no-op; all positive delays suspend the command sequence.
+std::optional<uint32_t> ParseKeymapDelay(absl::string_view command) {
+  if (!command.starts_with("Delay(") || !command.ends_with(")")) {
+    return std::nullopt;
+  }
+  const absl::string_view digits = command.substr(6, command.size() - 7);
+  if (digits.empty() || digits.size() > 4 ||
+      !std::all_of(digits.begin(), digits.end(),
+                   [](char c) { return c >= '0' && c <= '9'; })) {
+    return std::nullopt;
+  }
+  uint32_t delay = 0;
+  if (!absl::SimpleAtoi(digits, &delay) || delay > 5000) {
+    return std::nullopt;
+  }
+  return delay;
+}
 
 // Default live conversion debounce delay. The user-visible value is stored in
 // Config::live_conversion_delay_msec.
@@ -234,12 +308,13 @@ constexpr uint32_t kDefaultLiveConversionMinKeyLength = 2;
 constexpr uint32_t kMinLiveConversionMinKeyLength = 1;
 constexpr uint32_t kMaxLiveConversionMinKeyLength = 20;
 
-constexpr uint32_t kDefaultZenzLiveCorrectionDelayMsec = 1000;
+constexpr uint32_t kDefaultZenzLiveCorrectionDelayMsec = 700;
 constexpr uint32_t kDefaultZenzLiveCorrectionTimeoutMsec = 180;
 constexpr uint32_t kDefaultZenzLiveCorrectionPollMsec = 24;
 constexpr uint32_t kDefaultZenzLiveCorrectionMinKeyLength = 2;
-constexpr uint32_t kDefaultZenzLiveCorrectionLeftContextLength = 24;
-constexpr uint32_t kDefaultZenzLiveCorrectionRightContextLength = 10;
+constexpr uint32_t kDefaultZenzDeferredPresentationTimeoutMsec = 300;
+constexpr uint32_t kMinZenzDeferredPresentationTimeoutMsec = 50;
+constexpr uint32_t kMaxZenzDeferredPresentationTimeoutMsec = 3000;
 constexpr uint32_t kMaxZenzLiveCorrectionRightContextLength = 128;
 constexpr uint32_t kMaxZenzLiveCorrectionDelayMsec = 5000;
 constexpr uint32_t kMaxZenzLiveCorrectionTimeoutMsec = 1000;
@@ -315,19 +390,6 @@ bool IsLiveConversionTrailingDecorativeSymbol(char32_t c) {
   }
 }
 
-enum class LiveConversionLeftBoundary {
-  kKnownBoundary,
-  kKnownNonBoundary,
-  kUnknown,
-};
-
-struct LiveConversionAtom {
-  absl::string_view text;
-  bool is_entire_composition = false;
-  LiveConversionLeftBoundary left_boundary =
-      LiveConversionLeftBoundary::kUnknown;
-};
-
 bool ContainsStringView(std::initializer_list<absl::string_view> values,
                         absl::string_view target) {
   for (absl::string_view value : values) {
@@ -338,1105 +400,47 @@ bool ContainsStringView(std::initializer_list<absl::string_view> values,
   return false;
 }
 
-bool IsLiveConversionAtomBoundaryChar(char32_t c) {
-  switch (c) {
-    case 0x0009:  // tab
-    case 0x000A:  // LF
-    case 0x000D:  // CR
-    case 0x0020:  // space
-    case 0x3000:  // ideographic space
-    case 0x002C:  // ,
-    case 0xFF0C:  // ，
-    case 0x3001:  // 、
-    case 0x002E:  // .
-    case 0xFF0E:  // ．
-    case 0x3002:  // 。
-    case 0x0021:  // !
-    case 0xFF01:  // ！
-    case 0x003F:  // ?
-    case 0xFF1F:  // ？
-    case 0x2025:  // ‥
-    case 0x2026:  // …
-    case 0x003A:  // :
-    case 0xFF1A:  // ：
-    case 0x003B:  // ;
-    case 0xFF1B:  // ；
-    case 0x0028:  // (
-    case 0xFF08:  // （
-    case 0x005B:  // [
-    case 0x007B:  // {
-    case 0x300C:  // 「
-    case 0x300D:  // 」
-    case 0x300E:  // 『
-    case 0x300F:  // 』
-    case 0x3010:  // 【
-    case 0x3011:  // 】
-    case 0x3014:  // 〔
-    case 0x3015:  // 〕
-    case 0x201C:  // “
-    case 0x201D:  // ”
-    case 0x2018:  // ‘
-    case 0x2019:  // ’
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool IsLiveConversionTrailingSentenceTailSymbol(char32_t c) {
-  switch (c) {
-    case 0x0009:  // tab
-    case 0x000A:  // LF
-    case 0x000D:  // CR
-    case 0x0020:  // space
-    case 0x3000:  // ideographic space
-    case 0x002C:  // ,
-    case 0xFF0C:  // ，
-    case 0x3001:  // 、
-    case 0x002E:  // .
-    case 0xFF0E:  // ．
-    case 0x3002:  // 。
-    case 0x0021:  // !
-    case 0xFF01:  // ！
-    case 0x003F:  // ?
-    case 0xFF1F:  // ？
-    case 0x2025:  // ‥
-    case 0x2026:  // …
-    case 0x003A:  // :
-    case 0xFF1A:  // ：
-    case 0x003B:  // ;
-    case 0xFF1B:  // ；
-    case 0x0029:  // )
-    case 0xFF09:  // ）
-    case 0x005D:  // ]
-    case 0x007D:  // }
-    case 0x300D:  // 」
-    case 0x300F:  // 』
-    case 0x3011:  // 】
-    case 0x3015:  // 〕
-    case 0x201D:  // ”
-    case 0x2019:  // ’
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool IsLiveConversionProlongationMark(char32_t c) {
-  switch (c) {
-    case 0x007E:  // ~
-    case 0xFF5E:  // ～
-    case 0x301C:  // 〜
-    case 0x30FC:  // ー
-    case 0x2015:  // ―
-      return true;
-    default:
-      return false;
-  }
-}
-
-absl::string_view StripTrailingLiveConversionSentenceTail(
-    absl::string_view key) {
-  absl::string_view core = key;
-
-  while (!core.empty()) {
-    absl::string_view rest;
-    char32_t last = 0;
-    if (!Util::SplitLastChar32(core, &rest, &last)) {
-      break;
+// Identify a standalone postal-code token when deciding whether to expose
+// the initial candidate window. ZIP-enabled live conversion already retains
+// the same converter candidate set, so no Space-triggered rebuild is needed.
+// ASCII-alphanumeric boundaries prevent matches inside longer IDs.
+bool HasExplicitPostalCodeToken(absl::string_view key) {
+  const auto ascii_digit = [](char c) { return c >= '0' && c <= '9'; };
+  const auto ascii_alnum = [&](char c) {
+    return ascii_digit(c) || (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z');
+  };
+  for (size_t i = 0; i < key.size(); ++i) {
+    if (!ascii_digit(key[i]) || (i > 0 && ascii_alnum(key[i - 1]))) {
+      continue;
     }
-    if (!IsLiveConversionTrailingSentenceTailSymbol(last)) {
-      break;
-    }
-    core = rest;
-  }
-
-  return core;
-}
-
-absl::string_view StripTrailingLiveConversionProlongationMarks(
-    absl::string_view key) {
-  absl::string_view core = key;
-
-  while (!core.empty()) {
-    absl::string_view rest;
-    char32_t last = 0;
-    if (!Util::SplitLastChar32(core, &rest, &last)) {
-      break;
-    }
-    if (!IsLiveConversionProlongationMark(last)) {
-      break;
-    }
-    core = rest;
-  }
-
-  return core;
-}
-
-LiveConversionLeftBoundary GetLiveConversionCommittedLeftBoundary(
-    const ImeContext& context) {
-  if (!context.client_context().has_preceding_text()) {
-    return LiveConversionLeftBoundary::kUnknown;
-  }
-
-  const std::string& preceding_text =
-      context.client_context().preceding_text();
-  if (preceding_text.empty()) {
-    return LiveConversionLeftBoundary::kKnownBoundary;
-  }
-
-  absl::string_view rest;
-  char32_t last = 0;
-  if (!Util::SplitLastChar32(preceding_text, &rest, &last)) {
-    return LiveConversionLeftBoundary::kUnknown;
-  }
-
-  return IsLiveConversionAtomBoundaryChar(last)
-             ? LiveConversionLeftBoundary::kKnownBoundary
-             : LiveConversionLeftBoundary::kKnownNonBoundary;
-}
-
-LiveConversionAtom ExtractTrailingLiveConversionAtom(
-    absl::string_view core,
-    LiveConversionLeftBoundary committed_left_boundary) {
-  LiveConversionAtom atom;
-  atom.text = core;
-  atom.is_entire_composition = true;
-  atom.left_boundary = committed_left_boundary;
-
-  absl::string_view cursor = core;
-  while (!cursor.empty()) {
-    absl::string_view rest;
-    char32_t last = 0;
-    if (!Util::SplitLastChar32(cursor, &rest, &last)) {
-      break;
-    }
-
-    if (IsLiveConversionAtomBoundaryChar(last)) {
-      atom.text =
-          absl::string_view(core.data() + cursor.size(),
-                            core.size() - cursor.size());
-      atom.is_entire_composition = false;
-      atom.left_boundary = LiveConversionLeftBoundary::kKnownBoundary;
-      return atom;
-    }
-
-    cursor = rest;
-  }
-
-  return atom;
-}
-
-bool IsStrongExpressiveKanaAtom(absl::string_view atom) {
-  return ContainsStringView(
-      {
-          "あっ",
-          "えっ",
-          "おっ",
-          "はっ",
-          "へっ",
-          "ちっ",
-          "ちぇっ",
-          "ほっ",
-          "いてっ",
-          "ぎゃっ",
-          "ひゃっ",
-      },
-      atom);
-}
-
-bool IsBoundarySensitiveExpressiveKanaCoreAtom(absl::string_view atom) {
-  return ContainsStringView(
-      {
-          "ふん",
-          "くそ",
-          "よう",
-          "ふむ",
-          "はて",
-          "ふう",
-          "ほう",
-          "ほい",
-          "ほいほい",
-          "へい",
-          "てへ",
-          "くちゃ",
-          "くちょ",
-          "ぐちょ",
-          "ぐちょぐちょ",
-          "どろどろ",
-          "つるつる",
-          "はいはい",
-          "うん",
-          "うんうん",
-          "そうそう",
-          "いやいや",
-          "まあまあ",
-      },
-      atom);
-}
-
-constexpr size_t kMaxRepeatedEInterjectionChars = 30;
-
-bool IsRepeatedEInterjectionAtom(absl::string_view atom) {
-  size_t count = 0;
-
-  for (absl::string_view c : Utf8AsChars(atom)) {
-    if (c != "え" && c != "ぇ") {
-      return false;
-    }
-    ++count;
-    if (count > kMaxRepeatedEInterjectionChars) {
-      return false;
-    }
-  }
-
-  return count >= 2;
-}
-
-bool IsHoFamilyExpressiveProsodyAtom(absl::string_view atom) {
-  return ContainsStringView(
-      {
-          "ほー",
-          "ほ〜",
-          "ほ～",
-          "ほお",
-          "ほほう",
-          "ほほお",
-          "ほほー",
-          "ほほ〜",
-          "ほほ～",
-          "ほほーん",
-          "ほほ〜ん",
-          "ほほ～ん",
-          "ほっほ",
-          "ほっほう",
-          "ほっほお",
-          "ほっほー",
-          "ほっほ〜",
-          "ほっほ～",
-          "ほっほーん",
-          "ほっほ〜ん",
-          "ほっほ～ん",
-      },
-      atom);
-}
-
-constexpr size_t kMaxExpressiveSokuonCount = 10;
-constexpr size_t kMaxEvaluativeSlangPrefixChars = 4;
-
-bool StripRepeatedExpressiveSokuonTail(absl::string_view atom,
-                                       absl::string_view* core) {
-  size_t sokuon_count = 0;
-  absl::string_view cursor = atom;
-
-  while (!cursor.empty()) {
-    absl::string_view rest;
-    char32_t last = 0;
-    if (!Util::SplitLastChar32(cursor, &rest, &last)) {
-      return false;
-    }
-
-    if (last != U'っ') {
-      break;
-    }
-
-    ++sokuon_count;
-    if (sokuon_count > kMaxExpressiveSokuonCount) {
-      return false;
-    }
-
-    cursor = rest;
-  }
-
-  if (sokuon_count == 0 || cursor.empty()) {
-    return false;
-  }
-
-  *core = cursor;
-  return true;
-}
-
-bool IsBoundarySensitiveExpressiveKanaAtom(absl::string_view atom) {
-  if (IsBoundarySensitiveExpressiveKanaCoreAtom(atom)) {
-    return true;
-  }
-
-  absl::string_view core;
-  if (!StripRepeatedExpressiveSokuonTail(atom, &core)) {
-    return false;
-  }
-
-  return IsBoundarySensitiveExpressiveKanaCoreAtom(core);
-}
-
-bool ConsumePrefixForLiveConversionMatcher(absl::string_view* text,
-                                           absl::string_view prefix) {
-  if (text->size() < prefix.size() ||
-      text->substr(0, prefix.size()) != prefix) {
-    return false;
-  }
-  *text = text->substr(prefix.size());
-  return true;
-}
-
-bool ConsumeAnyPrefixForLiveConversionMatcher(
-    absl::string_view* text,
-    std::initializer_list<absl::string_view> prefixes) {
-  for (absl::string_view prefix : prefixes) {
-    absl::string_view rest = *text;
-    if (ConsumePrefixForLiveConversionMatcher(&rest, prefix)) {
-      *text = rest;
+    const auto valid_end = [&](size_t n) {
+      return i + n == key.size() || !ascii_alnum(key[i + n]);
+    };
+    if (key.size() - i >= 7 && valid_end(7) &&
+        std::all_of(key.begin() + i, key.begin() + i + 7, ascii_digit)) {
       return true;
     }
-  }
-  return false;
-}
-
-bool IsOnlyLiveConversionProlongationMarks(absl::string_view text) {
-  if (text.empty()) {
-    return false;
-  }
-
-  while (!text.empty()) {
-    absl::string_view rest;
-    char32_t last = 0;
-    if (!Util::SplitLastChar32(text, &rest, &last)) {
-      return false;
-    }
-    if (!IsLiveConversionProlongationMark(last)) {
-      return false;
-    }
-    text = rest;
-  }
-
-  return true;
-}
-
-bool IsLiveConversionProlongationMarksWithOptionalN(
-    absl::string_view text) {
-  if (text == "ん") {
-    return true;
-  }
-
-  absl::string_view rest;
-  char32_t last = 0;
-  if (!Util::SplitLastChar32(text, &rest, &last)) {
-    return false;
-  }
-
-  return last == U'ん' && IsOnlyLiveConversionProlongationMarks(rest);
-}
-
-bool IsLiveConversionProlongationMarksWithOptionalI(
-    absl::string_view text) {
-  if (text == "い") {
-    return true;
-  }
-
-  absl::string_view rest;
-  char32_t last = 0;
-  if (!Util::SplitLastChar32(text, &rest, &last)) {
-    return false;
-  }
-
-  return last == U'い' && IsOnlyLiveConversionProlongationMarks(rest);
-}
-
-bool ConsumeRepeatedExpressiveSokuon(absl::string_view* text) {
-  size_t sokuon_count = 0;
-
-  while (ConsumePrefixForLiveConversionMatcher(text, "っ")) {
-    ++sokuon_count;
-    if (sokuon_count > kMaxExpressiveSokuonCount) {
-      return false;
+    if (key.size() - i >= 8 && key[i + 3] == '-' && valid_end(8)) {
+      bool formatted = true;
+      for (size_t j = 0; j < 8; ++j) {
+        if (j != 3 && !ascii_digit(key[i + j])) {
+          formatted = false;
+          break;
+        }
+      }
+      if (formatted) {
+        return true;
+      }
     }
   }
-
-  return sokuon_count > 0;
-}
-
-bool MatchesSokuonEndingMimeticAtom(absl::string_view atom,
-                                    absl::string_view stem) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, stem)) {
-    return false;
-  }
-
-  if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-    return false;
-  }
-
-  if (rest.empty()) {
-    return true;
-  }
-
-  return IsOnlyLiveConversionProlongationMarks(rest);
-}
-
-bool IsSokuonEndingMimeticAtom(absl::string_view atom) {
-  return MatchesSokuonEndingMimeticAtom(atom, "しゃ") ||
-         MatchesSokuonEndingMimeticAtom(atom, "どろ") ||
-         MatchesSokuonEndingMimeticAtom(atom, "とろ") ||
-         MatchesSokuonEndingMimeticAtom(atom, "さわ") ||
-         MatchesSokuonEndingMimeticAtom(atom, "つる");
-}
-
-bool MatchesRepeatedSokuonPrefix(absl::string_view atom,
-                                 absl::string_view head) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, head)) {
-    return false;
-  }
-
-  if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-    return false;
-  }
-
-  return rest.empty();
-}
-
-constexpr size_t kMaxCasualGreetingProlongedTailChars = 30;
-
-bool IsLiveConversionProlongationMarkText(absl::string_view text) {
-  absl::string_view rest;
-  char32_t c = 0;
-  return Util::SplitLastChar32(text, &rest, &c) &&
-         rest.empty() &&
-         IsLiveConversionProlongationMark(c);
-}
-
-bool IsCasualGreetingProlongedTail(absl::string_view text) {
-  size_t count = 0;
-
-  for (absl::string_view c : Utf8AsChars(text)) {
-    if (c != "い" && c != "ぃ" &&
-        !IsLiveConversionProlongationMarkText(c)) {
-      return false;
-    }
-    ++count;
-    if (count > kMaxCasualGreetingProlongedTailChars) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-bool IsPendingRomanSForCasualSsuGreeting(absl::string_view text) {
-  return text == "s" || text == "ss";
-}
-
-bool IsCasualGreetingProlongedTailWithPendingRomanS(
-    absl::string_view text) {
-  if (text.empty()) {
-    return false;
-  }
-
-  if (IsPendingRomanSForCasualSsuGreeting(text)) {
-    return true;
-  }
-
-  if (text.ends_with("ss")) {
-    return IsCasualGreetingProlongedTail(
-        text.substr(0, text.size() - 2));
-  }
-
-  if (text.ends_with("s")) {
-    return IsCasualGreetingProlongedTail(
-        text.substr(0, text.size() - 1));
-  }
-
-  return IsCasualGreetingProlongedTail(text);
-}
-
-bool MatchesCasualSsuGreetingAtom(absl::string_view atom,
-                                  absl::string_view head) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, head)) {
-    return false;
-  }
-
-  const size_t sokuon_pos = rest.find("っ");
-  if (sokuon_pos == absl::string_view::npos) {
-    return false;
-  }
-
-  if (!IsCasualGreetingProlongedTail(rest.substr(0, sokuon_pos))) {
-    return false;
-  }
-
-  rest = rest.substr(sokuon_pos);
-
-  if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-    return false;
-  }
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, "す")) {
-    return false;
-  }
-
-  return rest.empty() || IsOnlyLiveConversionProlongationMarks(rest);
-}
-
-bool IsCasualSsuGreetingAtom(absl::string_view atom) {
-  return MatchesCasualSsuGreetingAtom(atom, "ち") ||
-         MatchesCasualSsuGreetingAtom(atom, "ちょ") ||
-         MatchesCasualSsuGreetingAtom(atom, "ちょり");
-}
-
-bool MatchesCasualSsuGreetingPrefixAtom(absl::string_view atom,
-                                        absl::string_view head,
-                                        bool allow_bare_head) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, head)) {
-    return false;
-  }
-
-  if (allow_bare_head && rest.empty()) {
-    return true;
-  }
-
-  const size_t sokuon_pos = rest.find("っ");
-  if (sokuon_pos == absl::string_view::npos) {
-    return !rest.empty() &&
-           IsCasualGreetingProlongedTailWithPendingRomanS(rest);
-  }
-
-  if (!IsCasualGreetingProlongedTail(rest.substr(0, sokuon_pos))) {
-    return false;
-  }
-
-  rest = rest.substr(sokuon_pos);
-
-  if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-    return false;
-  }
-
-  return rest.empty() || IsPendingRomanSForCasualSsuGreeting(rest);
-}
-
-bool IsCasualSsuGreetingPrefixAtom(absl::string_view atom) {
-  return MatchesCasualSsuGreetingPrefixAtom(
-             atom, "ち", /*allow_bare_head=*/false) ||
-         MatchesCasualSsuGreetingPrefixAtom(
-             atom, "ちょ", /*allow_bare_head=*/true) ||
-         atom == "ちょr" ||
-         atom == "ちょri" ||
-         MatchesCasualSsuGreetingPrefixAtom(
-             atom, "ちょり", /*allow_bare_head=*/true);
-}
-
-enum class EvaluativeSlangTailType {
-  kNone,
-  kOptionalI,
-  kOptionalEe,
-  kRequiredIi,
-};
-
-struct RepeatedSokuonStemPattern {
-  absl::string_view head;
-  absl::string_view body;
-  EvaluativeSlangTailType tail_type;
-};
-
-constexpr size_t kMaxEvaluativeSlangVowelTailChars = 30;
-
-bool IsRepeatedKanaVowelTail(absl::string_view text,
-                             absl::string_view large,
-                             absl::string_view small_kana) {
-  size_t count = 0;
-
-  for (absl::string_view c : Utf8AsChars(text)) {
-    if (c != large && c != small_kana) {
-      return false;
-    }
-    ++count;
-    if (count > kMaxEvaluativeSlangVowelTailChars) {
-      return false;
-    }
-  }
-
-  return count > 0;
-}
-
-bool MatchesEvaluativeSlangTail(absl::string_view rest,
-                                EvaluativeSlangTailType tail_type) {
-  switch (tail_type) {
-    case EvaluativeSlangTailType::kNone:
-      return rest.empty();
-
-    case EvaluativeSlangTailType::kOptionalI:
-      return rest.empty() || rest == "い";
-
-    case EvaluativeSlangTailType::kOptionalEe:
-      return rest.empty() || rest == "ー" ||
-             IsRepeatedKanaVowelTail(rest, "え", "ぇ");
-
-    case EvaluativeSlangTailType::kRequiredIi:
-      return rest == "ー" || IsRepeatedKanaVowelTail(rest, "い", "ぃ");
-  }
-
-  return false;
-}
-
-bool MatchesRepeatedSokuonStemPattern(
-    absl::string_view atom,
-    const RepeatedSokuonStemPattern& pattern) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, pattern.head)) {
-    return false;
-  }
-
-  if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-    return false;
-  }
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, pattern.body)) {
-    return false;
-  }
-
-  return MatchesEvaluativeSlangTail(rest, pattern.tail_type);
-}
-
-const RepeatedSokuonStemPattern kEvaluativeSlangPatterns[] = {
-    // やばい / やべぇ
-    {"や", "ば", EvaluativeSlangTailType::kOptionalI},
-    {"や", "べ", EvaluativeSlangTailType::kOptionalEe},
-
-    // すごい / すげぇ / 少ない口語形 / 酸っぱい口語形
-    {"す", "ご", EvaluativeSlangTailType::kOptionalI},
-    {"す", "げ", EvaluativeSlangTailType::kOptionalEe},
-    {"す", "くな", EvaluativeSlangTailType::kOptionalI},
-    {"す", "くね", EvaluativeSlangTailType::kOptionalEe},
-    {"す", "ぱ", EvaluativeSlangTailType::kNone},
-    {"す", "ぺ", EvaluativeSlangTailType::kOptionalEe},
-
-    // 怖い / 強い / 辛い
-    {"こ", "わ", EvaluativeSlangTailType::kOptionalI},
-    {"つ", "よ", EvaluativeSlangTailType::kOptionalI},
-    {"つ", "ら", EvaluativeSlangTailType::kOptionalI},
-    {"つ", "れ", EvaluativeSlangTailType::kOptionalEe},
-
-    // でかい / 長い / 高い / 高ぇ
-    {"で", "か", EvaluativeSlangTailType::kOptionalI},
-    {"な", "が", EvaluativeSlangTailType::kOptionalI},
-    {"た", "か", EvaluativeSlangTailType::kOptionalI},
-    {"た", "け", EvaluativeSlangTailType::kOptionalEe},
-
-    // 小さい / 小っちゃい / 小せぇ
-    {"ち", "さ", EvaluativeSlangTailType::kOptionalI},
-    {"ち", "ちゃ", EvaluativeSlangTailType::kOptionalI},
-    {"ち", "せ", EvaluativeSlangTailType::kOptionalEe},
-
-    // 低い / 広い
-    {"ひ", "く", EvaluativeSlangTailType::kOptionalI},
-    {"ひ", "ろ", EvaluativeSlangTailType::kOptionalI},
-
-    // 寒い / 寒ぃ
-    {"さ", "む", EvaluativeSlangTailType::kOptionalI},
-    {"さ", "み", EvaluativeSlangTailType::kRequiredIi},
-
-    // 暑い / 熱い / あっちぃ
-    {"あ", "つ", EvaluativeSlangTailType::kOptionalI},
-    {"あ", "ち", EvaluativeSlangTailType::kRequiredIi},
-
-    // うまい / うめぇ / うざい / うぜぇ / 薄い
-    {"う", "ま", EvaluativeSlangTailType::kOptionalI},
-    {"う", "め", EvaluativeSlangTailType::kOptionalEe},
-    {"う", "ざ", EvaluativeSlangTailType::kOptionalI},
-    {"う", "ぜ", EvaluativeSlangTailType::kOptionalEe},
-    {"う", "す", EvaluativeSlangTailType::kOptionalI},
-
-    // 軽い
-    {"か", "る", EvaluativeSlangTailType::kOptionalI},
-
-    // きつい / きちぃ / きもい / きれい
-    {"き", "つ", EvaluativeSlangTailType::kOptionalI},
-    {"き", "ち", EvaluativeSlangTailType::kRequiredIi},
-    {"き", "も", EvaluativeSlangTailType::kOptionalI},
-    {"き", "れい", EvaluativeSlangTailType::kNone},
-
-    // だるい / だりぃ / ださい / だせぇ
-    {"だ", "る", EvaluativeSlangTailType::kOptionalI},
-    {"だ", "り", EvaluativeSlangTailType::kRequiredIi},
-    {"だ", "さ", EvaluativeSlangTailType::kOptionalI},
-    {"だ", "せ", EvaluativeSlangTailType::kOptionalEe},
-
-    // えぐい
-    {"え", "ぐ", EvaluativeSlangTailType::kOptionalI},
-
-    // 臭い / くせぇ / 黒い
-    {"く", "さ", EvaluativeSlangTailType::kOptionalI},
-    {"く", "せ", EvaluativeSlangTailType::kOptionalEe},
-    {"く", "ろ", EvaluativeSlangTailType::kOptionalI},
-
-    // まぶしい
-    {"ま", "ぶし", EvaluativeSlangTailType::kOptionalI},
-
-    // 重い / 遅い / 早い
-    {"お", "も", EvaluativeSlangTailType::kOptionalI},
-    {"お", "そ", EvaluativeSlangTailType::kOptionalI},
-    {"は", "や", EvaluativeSlangTailType::kOptionalI},
-
-    // めっちゃ / もっと
-    {"め", "ちゃ", EvaluativeSlangTailType::kNone},
-    {"も", "と", EvaluativeSlangTailType::kNone},
-
-    // 眠い / 細い / 狭い / 短い / 白い
-    {"ね", "む", EvaluativeSlangTailType::kOptionalI},
-    {"ほ", "そ", EvaluativeSlangTailType::kOptionalI},
-    {"せ", "ま", EvaluativeSlangTailType::kOptionalI},
-    {"み", "じか", EvaluativeSlangTailType::kOptionalI},
-    {"し", "ろ", EvaluativeSlangTailType::kOptionalI},
-};
-
-bool IsEvaluativeSlangAdjectiveAtom(absl::string_view atom) {
-  for (const RepeatedSokuonStemPattern& pattern :
-       kEvaluativeSlangPatterns) {
-    if (MatchesRepeatedSokuonStemPattern(atom, pattern)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-bool IsEvaluativeSlangAdjectivePrefixAtom(absl::string_view atom) {
-  for (const RepeatedSokuonStemPattern& pattern :
-       kEvaluativeSlangPatterns) {
-    if (MatchesRepeatedSokuonPrefix(atom, pattern.head)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-bool MatchesUsoOrKusoFamilyExpressiveProsodyAtom(
-    absl::string_view atom,
-    absl::string_view head,
-    bool allow_n_tail) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, head)) {
-    return false;
-  }
-
-  if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-    return false;
-  }
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, "そ")) {
-    return false;
-  }
-
-  if (rest.empty()) {
-    return true;
-  }
-
-  if (IsOnlyLiveConversionProlongationMarks(rest)) {
-    return true;
-  }
-
-  if (allow_n_tail &&
-      IsLiveConversionProlongationMarksWithOptionalN(rest)) {
-    return true;
-  }
-
-  return false;
-}
-
-bool IsUsoOrKusoFamilyExpressiveProsodyAtom(absl::string_view atom) {
-  // Match 「うっそ」「うっっそ」「うっそー」「うっそん」 etc.
-  // Do not match bare 「うそ」 or 「うっそう」 because 「嘘」 and 「鬱蒼」
-  // are useful live-conversion targets.
-  if (MatchesUsoOrKusoFamilyExpressiveProsodyAtom(
-          atom, "う", /*allow_n_tail=*/true)) {
-    return true;
-  }
-
-  // Match 「くっそ」「くっっそ」「くっそー」 etc.  Keep bare 「くそ」
-  // in the boundary-sensitive lexical list, and do not match 「くそう」.
-  return MatchesUsoOrKusoFamilyExpressiveProsodyAtom(
-      atom, "く", /*allow_n_tail=*/false);
-}
-
-bool IsUsoOrKusoFamilyExpressiveProsodyPrefixAtom(
-    absl::string_view atom) {
-  return MatchesRepeatedSokuonPrefix(atom, "う") ||
-         MatchesRepeatedSokuonPrefix(atom, "く");
-}
-
-bool MatchesUhyoFamilyExpressiveProsodyAtom(absl::string_view atom) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, "う")) {
-    return false;
-  }
-
-  // Accept both 「うひょ」/「うひゃ」 and emphasized forms such as
-  // 「うっひょ」, 「うっひゃ」, 「うっっひょ」 and 「うっっひゃ」.
-  if (!ConsumeAnyPrefixForLiveConversionMatcher(&rest, {"ひょ", "ひゃ"})) {
-    if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-      return false;
-    }
-    if (!ConsumeAnyPrefixForLiveConversionMatcher(&rest, {"ひょ", "ひゃ"})) {
-      return false;
-    }
-  }
-
-  if (rest.empty()) {
-    return true;
-  }
-
-  if (IsOnlyLiveConversionProlongationMarks(rest)) {
-    return true;
-  }
-
-  if (IsLiveConversionProlongationMarksWithOptionalN(rest)) {
-    return true;
-  }
-
-  if (IsLiveConversionProlongationMarksWithOptionalI(rest)) {
-    return true;
-  }
-
-  return false;
-}
-
-bool IsUhyoFamilyExpressiveProsodyAtom(absl::string_view atom) {
-  return MatchesUhyoFamilyExpressiveProsodyAtom(atom);
-}
-
-bool IsUhyoFamilyExpressiveProsodyPrefixAtom(absl::string_view atom) {
-  absl::string_view rest = atom;
-
-  if (!ConsumePrefixForLiveConversionMatcher(&rest, "う")) {
-    return false;
-  }
-
-  if (rest == "ひ") {
-    return true;
-  }
-
-  if (!ConsumeRepeatedExpressiveSokuon(&rest)) {
-    return false;
-  }
-
-  return rest == "ひ";
-}
-
-bool FindEvaluativeSlangAdjectiveOrPrefixSuffix(
-    absl::string_view text,
-    absl::string_view* suffix) {
-  size_t offset = 0;
-  for (absl::string_view c : Utf8AsChars(text)) {
-    const absl::string_view candidate = text.substr(offset);
-    if (IsEvaluativeSlangAdjectiveAtom(candidate) ||
-        IsEvaluativeSlangAdjectivePrefixAtom(candidate)) {
-      *suffix = candidate;
-      return true;
-    }
-    offset += c.size();
-  }
-
-  return false;
-}
-
-bool HasShortPrefixBeforeSuffix(absl::string_view text,
-                                absl::string_view suffix,
-                                size_t max_prefix_chars) {
-  if (suffix.data() < text.data() ||
-      suffix.data() + suffix.size() > text.data() + text.size()) {
-    return false;
-  }
-
-  const size_t prefix_bytes = suffix.data() - text.data();
-  return Util::CharsLen(text.substr(0, prefix_bytes)) <= max_prefix_chars;
-}
-
-bool ShouldHoldEvaluativeSlangAdjectiveForLiveConversion(
-    const LiveConversionAtom& atom,
-    absl::string_view lexical_core) {
-  if (IsEvaluativeSlangAdjectiveAtom(atom.text) ||
-      IsEvaluativeSlangAdjectivePrefixAtom(atom.text)) {
-    // Evaluative slang such as 「やっば」「なっがい」 is often typed after
-    // already-committed context, e.g. 「これ」 + 「やっば」.  Keep the atom
-    // as kana when the whole current composition is the slang atom, or when
-    // it appears after a clear in-composition boundary.
-    return atom.is_entire_composition ||
-           atom.left_boundary == LiveConversionLeftBoundary::kKnownBoundary;
-  }
-
-  absl::string_view suffix;
-  if (!FindEvaluativeSlangAdjectiveOrPrefixSuffix(lexical_core, &suffix)) {
-    return false;
-  }
-
-  // Also protect short colloquial phrases such as 「これやっば」 and
-  // 「まじでなっがい」, including their typing prefixes such as 「これやっ」.
-  // Avoid suppressing live conversion for long sentences whose tail merely
-  // happens to be evaluative slang.
-  return HasShortPrefixBeforeSuffix(
-      lexical_core, suffix, kMaxEvaluativeSlangPrefixChars);
-}
-
-bool CanHoldLowAmbiguityExpressiveAtom(const LiveConversionAtom& atom) {
-  return atom.is_entire_composition ||
-         atom.left_boundary == LiveConversionLeftBoundary::kKnownBoundary;
-}
-
-bool CanHoldBoundarySensitiveExpressiveAtom(const LiveConversionAtom& atom) {
-  if (atom.left_boundary == LiveConversionLeftBoundary::kKnownNonBoundary) {
-    return false;
-  }
-
-  return atom.is_entire_composition ||
-         atom.left_boundary == LiveConversionLeftBoundary::kKnownBoundary;
-}
-
-bool ShouldHoldExpressiveKanaAtomForLiveConversion(
-    const LiveConversionAtom& atom,
-    absl::string_view expressive_core) {
-  if (atom.text.empty()) {
-    return false;
-  }
-
-  if (IsHoFamilyExpressiveProsodyAtom(atom.text) ||
-      IsUhyoFamilyExpressiveProsodyAtom(atom.text) ||
-      IsUhyoFamilyExpressiveProsodyPrefixAtom(atom.text) ||
-      IsUsoOrKusoFamilyExpressiveProsodyAtom(atom.text) ||
-      IsUsoOrKusoFamilyExpressiveProsodyPrefixAtom(atom.text) ||
-      IsCasualSsuGreetingAtom(atom.text) ||
-      IsCasualSsuGreetingPrefixAtom(atom.text)) {
-    return CanHoldLowAmbiguityExpressiveAtom(atom);
-  }
-
-  const absl::string_view lexical_atom =
-      StripTrailingLiveConversionProlongationMarks(atom.text);
-  const absl::string_view lexical_core =
-      StripTrailingLiveConversionProlongationMarks(expressive_core);
-
-  if (!lexical_atom.empty() &&
-      Util::IsScriptType(lexical_atom, Util::HIRAGANA)) {
-    if (IsRepeatedEInterjectionAtom(lexical_atom)) {
-      return CanHoldLowAmbiguityExpressiveAtom(atom);
-    }
-
-    if (IsStrongExpressiveKanaAtom(lexical_atom)) {
-      return CanHoldLowAmbiguityExpressiveAtom(atom);
-    }
-
-    if (IsSokuonEndingMimeticAtom(lexical_atom)) {
-      return CanHoldBoundarySensitiveExpressiveAtom(atom);
-    }
-
-    if (IsBoundarySensitiveExpressiveKanaAtom(lexical_atom)) {
-      return CanHoldBoundarySensitiveExpressiveAtom(atom);
-    }
-  }
-
-  if (!lexical_core.empty() &&
-      Util::IsScriptType(lexical_core, Util::HIRAGANA) &&
-      ShouldHoldEvaluativeSlangAdjectiveForLiveConversion(atom,
-                                                          lexical_core)) {
-    return true;
-  }
-
-  return false;
-}
-
-bool FindEvaluativeSlangAdjectivePrefixSuffix(
-    absl::string_view text,
-    absl::string_view* suffix) {
-  size_t offset = 0;
-  for (absl::string_view c : Utf8AsChars(text)) {
-    const absl::string_view candidate = text.substr(offset);
-    if (IsEvaluativeSlangAdjectivePrefixAtom(candidate)) {
-      *suffix = candidate;
-      return true;
-    }
-    offset += c.size();
-  }
-
-  return false;
-}
-
-bool ShouldHoldEvaluativeSlangAdjectivePrefixForLiveConversion(
-    const LiveConversionAtom& atom,
-    absl::string_view lexical_core) {
-  if (IsEvaluativeSlangAdjectivePrefixAtom(atom.text)) {
-    return atom.is_entire_composition ||
-           atom.left_boundary == LiveConversionLeftBoundary::kKnownBoundary;
-  }
-
-  absl::string_view suffix;
-  if (!FindEvaluativeSlangAdjectivePrefixSuffix(lexical_core, &suffix)) {
-    return false;
-  }
-
-  // Protect short colloquial phrase prefixes such as 「これやっ」 or
-  // 「まじでなっ」, but let completed forms like 「これやっば」 reach the
-  // converter so user history and user dictionary preferences can apply.
-  return HasShortPrefixBeforeSuffix(
-      lexical_core, suffix, kMaxEvaluativeSlangPrefixChars);
-}
-
-bool ShouldHoldExpressiveKanaTypingPrefixForLiveConversion(
-    const LiveConversionAtom& atom,
-    absl::string_view expressive_core) {
-  if (atom.text.empty()) {
-    return false;
-  }
-
-  if (IsUhyoFamilyExpressiveProsodyPrefixAtom(atom.text) ||
-      IsUsoOrKusoFamilyExpressiveProsodyPrefixAtom(atom.text) ||
-      IsCasualSsuGreetingPrefixAtom(atom.text)) {
-    return CanHoldLowAmbiguityExpressiveAtom(atom);
-  }
-
-  const absl::string_view lexical_atom =
-      StripTrailingLiveConversionProlongationMarks(atom.text);
-  const absl::string_view lexical_core =
-      StripTrailingLiveConversionProlongationMarks(expressive_core);
-
-  if (!lexical_atom.empty() &&
-      Util::IsScriptType(lexical_atom, Util::HIRAGANA) &&
-      ShouldHoldEvaluativeSlangAdjectivePrefixForLiveConversion(
-          atom, lexical_core)) {
-    return true;
-  }
-
   return false;
 }
 
 bool ShouldSkipLiveConversionForCompositionKey(
-    absl::string_view key,
-    LiveConversionLeftBoundary committed_left_boundary,
-    size_t min_key_length) {
+    absl::string_view key, size_t min_key_length) {
   if (Util::CharsLen(key) < min_key_length) {
     return true;
-  }
-
-  // Keep only unfinished expressive typing prefixes out of live conversion.
-  // Completed expressive words should reach the converter so that normal
-  // dictionary ranking, user history, and user dictionary entries can decide
-  // between hiragana and katakana spellings.
-  const absl::string_view expressive_core =
-      StripTrailingLiveConversionSentenceTail(key);
-  if (!expressive_core.empty()) {
-    const LiveConversionAtom atom =
-        ExtractTrailingLiveConversionAtom(expressive_core,
-                                          committed_left_boundary);
-    if (ShouldHoldExpressiveKanaTypingPrefixForLiveConversion(
-            atom, expressive_core)) {
-      return true;
-    }
   }
 
   absl::string_view core = key;
@@ -1629,6 +633,44 @@ size_t CountSurfaceOccurrences(absl::string_view value,
   return count;
 }
 
+std::vector<ZenzBaselineSegment> BuildZenzBaselineSegmentsFromPreedit(
+    const commands::Preedit& preedit) {
+  std::vector<ZenzBaselineSegment> result;
+  result.reserve(preedit.segment_size());
+  for (int i = 0; i < preedit.segment_size(); ++i) {
+    const commands::Preedit::Segment& segment = preedit.segment(i);
+    if (segment.key().empty() || segment.value().empty()) {
+      return {};
+    }
+    result.push_back({segment.key(), segment.value()});
+  }
+  return result;
+}
+
+std::vector<ZenzBaselineSegment> BuildZenzAdoptionBaselineSegments(
+    const commands::Preedit& preedit, absl::string_view full_key,
+    absl::string_view full_value) {
+  const std::vector<ZenzBaselineSegment> segments =
+      BuildZenzBaselineSegmentsFromPreedit(preedit);
+
+  std::vector<ZenzBaselineSegment> reconciled_segments;
+  if (ReconcileZenzBaselineKeysForRequest(
+          segments, full_key, &reconciled_segments)) {
+    std::string concatenated_value;
+    for (const ZenzBaselineSegment& segment : reconciled_segments) {
+      concatenated_value.append(segment.value);
+    }
+    if (concatenated_value == full_value) {
+      return reconciled_segments;
+    }
+  }
+
+  if (full_key.empty() || full_value.empty()) {
+    return {};
+  }
+  return {{std::string(full_key), std::string(full_value)}};
+}
+
 struct ZenzReverseLearningProjection {
   std::vector<std::pair<std::string, std::string>> changed_segments;
   std::vector<ZenzProjectedLearningSegment> projected_segments;
@@ -1638,151 +680,40 @@ ZenzReverseLearningProjection BuildZenzReverseLearningSegmentsFromPreedit(
     const commands::Preedit& preedit,
     absl::string_view full_key,
     absl::string_view full_value) {
-  constexpr int kMaxReverseLearningPairs = 4;
-
-  const int segment_size = preedit.segment_size();
-  if (segment_size <= 0 || full_key.empty() || full_value.empty()) {
-    return {};
-  }
-
-  std::string concatenated_key;
-  std::vector<std::string> keys;
-  std::vector<std::string> mozc_values;
-  keys.reserve(segment_size);
-  mozc_values.reserve(segment_size);
-
-  for (int i = 0; i < segment_size; ++i) {
-    const commands::Preedit::Segment& segment = preedit.segment(i);
-    if (segment.key().empty() || segment.value().empty()) {
-      return {};
-    }
-    keys.push_back(segment.key());
-    mozc_values.push_back(segment.value());
-    concatenated_key.append(segment.key());
-  }
-
-  // The snapshot must describe the same full Zenz request.  Otherwise it may
-  // belong to an older live-conversion generation and must not be used.
-  if (concatenated_key != full_key) {
-    return {};
-  }
-
-  struct Anchor {
-    int index;
-    size_t begin;
-    size_t end;
-  };
-
-  std::vector<Anchor> anchors;
-  anchors.reserve(segment_size);
-  for (int i = 0; i < segment_size; ++i) {
-    const std::string& value = mozc_values[i];
-    if (CountSurfaceOccurrences(full_value, value) != 1) {
-      continue;
-    }
-    const size_t begin = full_value.find(value);
-    if (begin == absl::string_view::npos) {
-      return {};
-    }
-    anchors.push_back(Anchor{i, begin, begin + value.size()});
-  }
-
-  size_t previous_anchor_end = 0;
-  for (const Anchor& anchor : anchors) {
-    if (anchor.begin < previous_anchor_end) {
-      return {};
-    }
-    previous_anchor_end = anchor.end;
-  }
-
-  std::vector<std::string> projected_values(segment_size);
-  int left_index = -1;
-  size_t left_value_end = 0;
-
-  auto assign_gap = [&](int first_index, int last_index,
-                        absl::string_view value) -> bool {
-    const int gap_size = last_index - first_index + 1;
-    if (gap_size <= 0) {
-      return value.empty();
-    }
-
-    if (gap_size == 1) {
-      if (value.empty()) {
-        return false;
-      }
-      projected_values[first_index] = std::string(value);
-      return true;
-    }
-
-    std::string original_gap_value;
-    for (int i = first_index; i <= last_index; ++i) {
-      original_gap_value.append(mozc_values[i]);
-    }
-    if (original_gap_value != value) {
-      return false;
-    }
-    for (int i = first_index; i <= last_index; ++i) {
-      projected_values[i] = mozc_values[i];
-    }
-    return true;
-  };
-
-  for (const Anchor& anchor : anchors) {
-    if (!assign_gap(left_index + 1, anchor.index - 1,
-                    full_value.substr(left_value_end,
-                                      anchor.begin - left_value_end))) {
-      return {};
-    }
-    projected_values[anchor.index] = mozc_values[anchor.index];
-    left_index = anchor.index;
-    left_value_end = anchor.end;
-  }
-
-  if (!assign_gap(left_index + 1, segment_size - 1,
-                  full_value.substr(left_value_end))) {
-    return {};
-  }
-
-  std::string reconstructed_value;
-  for (const std::string& value : projected_values) {
-    if (value.empty()) {
-      return {};
-    }
-    reconstructed_value.append(value);
-  }
-  if (reconstructed_value != full_value) {
+  const std::vector<ZenzBaselineSegment> baseline_segments =
+      BuildZenzBaselineSegmentsFromPreedit(preedit);
+  const ZenzSegmentProjection projection = ProjectZenzValueToMozcSegments(
+      baseline_segments, full_key, full_value);
+  if (!projection.success) {
     return {};
   }
 
   ZenzReverseLearningProjection result;
-  result.projected_segments.reserve(segment_size);
-  for (int i = 0; i < segment_size; ++i) {
+  result.projected_segments.reserve(projection.segments.size());
+  for (const ZenzProjectedSegment& segment : projection.segments) {
     result.projected_segments.push_back(
-        {keys[i], projected_values[i],
-         projected_values[i] != mozc_values[i]});
-  }
+        {segment.key, segment.zenz_value, segment.changed, false,
+         !segment.boundary_known, segment.baseline_keys});
 
-  for (int i = 0; i < segment_size; ++i) {
-    // Full-sequence learning already covers the whole accepted result.  The
-    // reverse path records only segments that Zenz actually changed relative to
-    // the visible Mozc live-conversion result.
-    if (projected_values[i] == mozc_values[i]) {
+    // If structured projected learning later fails, the full-sequence fallback
+    // still covers the accepted result. Local synthetic fallback is allowed
+    // only when projection proved an exact original Mozc boundary. Ambiguous
+    // aggregate gaps must be converter-resolved instead of being generalized
+    // merely because they fit under an arbitrary count cap.
+    if (!segment.changed || !segment.boundary_known) {
       continue;
     }
-    if (keys[i] == full_key && projected_values[i] == full_value) {
+    if (segment.key == full_key && segment.zenz_value == full_value) {
       continue;
     }
-    result.changed_segments.push_back({keys[i], projected_values[i]});
-    if (result.changed_segments.size() > kMaxReverseLearningPairs) {
-      return {};
-    }
+    result.changed_segments.push_back({segment.key, segment.zenz_value});
   }
 
-  // If the correction rewrites too many independent segments, it is likely a
-  // style-level rewrite rather than a stable local conversion preference.
-  if (result.changed_segments.empty()) {
-    result.projected_segments.clear();
-  }
+  // Keep the projected sequence even when the full-context Mozc surfaces are
+  // already identical to the accepted Zenz result. A later context-loss probe
+  // may still find that a segment (for example "げんしょう" -> "現象") stops
+  // being the top candidate when a following punctuation separator has not yet
+  // been typed. No learning happens merely because this projection is kept.
   return result;
 }
 
@@ -1880,7 +811,9 @@ void AddOrUpdateProtectedSpan(
     if (existing->key.empty() && !key.empty()) {
       existing->key = std::string(key);
     }
-    if (tier == ProtectedConversionSpan::Tier::kIdentityCritical) {
+    if (tier == ProtectedConversionSpan::Tier::kIdentityCritical ||
+        (tier == ProtectedConversionSpan::Tier::kNumericLiteral &&
+         existing->tier == ProtectedConversionSpan::Tier::kUserPreferred)) {
       existing->tier = tier;
     }
     if (!existing->repairable && repairable && !key.empty()) {
@@ -1914,9 +847,13 @@ void AddPreeditIdentityProtectedSpans(
     for (const std::string& surface : identity_surfaces) {
       const std::string surface_key = InferProtectedKeyForEmbeddedSurface(
           segment_key, segment.value(), surface);
+      const ProtectedConversionSpan::Tier tier =
+          ClassifyProtectedAsciiSurface(surface);
       AddOrUpdateProtectedSpan(
-          surface_key, surface, ProtectedConversionSpan::Tier::kIdentityCritical,
-          !surface_key.empty(), mozc_value, protected_spans);
+          surface_key, surface, tier,
+          tier == ProtectedConversionSpan::Tier::kIdentityCritical &&
+              !surface_key.empty(),
+          mozc_value, protected_spans);
     }
   }
 }
@@ -2077,9 +1014,13 @@ std::vector<ProtectedConversionSpan> BuildZenzProtectedConversionSpans(
         for (const std::string& surface : identity_surfaces) {
           const std::string surface_key = InferProtectedKeyForEmbeddedSurface(
               protected_key, candidate.value(), surface);
+          const ProtectedConversionSpan::Tier tier =
+              ClassifyProtectedAsciiSurface(surface);
           AddOrUpdateProtectedSpan(
-              surface_key, surface, ProtectedConversionSpan::Tier::kIdentityCritical,
-              !surface_key.empty(), mozc_value, &protected_spans);
+              surface_key, surface, tier,
+              tier == ProtectedConversionSpan::Tier::kIdentityCritical &&
+                  !surface_key.empty(),
+              mozc_value, &protected_spans);
         }
         continue;
       }
@@ -2128,6 +1069,44 @@ size_t GetLiveConversionMinKeyLength(const config::Config& config) {
                  kMaxLiveConversionMinKeyLength));
 }
 
+bool ShouldExposePreLiveConversionReading(const ImeContext& context) {
+  const config::Config& config = context.GetConfig();
+  if (!config.use_live_conversion() ||
+      context.state() != ImeContext::COMPOSITION) {
+    return false;
+  }
+
+  if (context.composer().GetInputFieldType() == commands::Context::PASSWORD) {
+    return false;
+  }
+
+  const transliteration::TransliterationType input_mode =
+      context.composer().GetInputMode();
+  if (input_mode == transliteration::HALF_ASCII ||
+      input_mode == transliteration::FULL_ASCII) {
+    return false;
+  }
+
+  const size_t length = context.composer().GetLength();
+  if (length != context.composer().GetCursor()) {
+    return false;
+  }
+
+  const std::string key = context.composer().GetQueryForConversion();
+  const size_t configured_min_key_length =
+      GetLiveConversionMinKeyLength(config);
+
+  // This state exists only while the configured minimum length is the reason
+  // live conversion is being skipped.  If the same composition would still be
+  // skipped with the minimum supported value (1), do not expose the reading.
+  if (!ShouldSkipLiveConversionForCompositionKey(
+          key, configured_min_key_length)) {
+    return false;
+  }
+  return !ShouldSkipLiveConversionForCompositionKey(
+      key, kMinLiveConversionMinKeyLength);
+}
+
 uint32_t GetZenzLiveCorrectionDelayMsec(const config::Config& config) {
   if (!config.has_zenz_live_correction_delay_msec()) {
     return kDefaultZenzLiveCorrectionDelayMsec;
@@ -2144,6 +1123,17 @@ uint32_t GetZenzLiveCorrectionTimeoutMsec(const config::Config& config) {
                   kMaxZenzLiveCorrectionTimeoutMsec);
 }
 
+uint32_t GetZenzDeferredPresentationTimeoutMsec(
+    const config::Config& config) {
+  const uint32_t value =
+      config.has_zenz_deferred_presentation_timeout_msec()
+          ? config.zenz_deferred_presentation_timeout_msec()
+          : kDefaultZenzDeferredPresentationTimeoutMsec;
+  return std::clamp(value,
+                    kMinZenzDeferredPresentationTimeoutMsec,
+                    kMaxZenzDeferredPresentationTimeoutMsec);
+}
+
 uint32_t GetZenzLiveCorrectionMinKeyLength(const config::Config& config) {
   if (!config.has_zenz_live_correction_min_key_length()) {
     return kDefaultZenzLiveCorrectionMinKeyLength;
@@ -2153,9 +1143,6 @@ uint32_t GetZenzLiveCorrectionMinKeyLength(const config::Config& config) {
 
 uint32_t GetZenzLiveCorrectionLeftContextLength(
     const config::Config& config) {
-  if (!config.has_zenz_live_correction_left_context_length()) {
-    return kDefaultZenzLiveCorrectionLeftContextLength;
-  }
   return config.zenz_live_correction_left_context_length();
 }
 
@@ -2166,31 +1153,55 @@ uint32_t GetZenzLiveCorrectionRightContextLength(
   }
 
   const uint32_t length =
-      config.has_zenz_live_correction_right_context_length()
-          ? config.zenz_live_correction_right_context_length()
-          : kDefaultZenzLiveCorrectionRightContextLength;
+      config.zenz_live_correction_right_context_length();
   return std::min<uint32_t>(length,
                             kMaxZenzLiveCorrectionRightContextLength);
 }
 
-bool UseZenzFeedbackLearning(const config::Config& config) {
-  return config.use_zenz_feedback_learning();
+// Incognito prevents reading as well as writing persistent Zenz observations.
+// Keep this independent from the three user-facing learning switches.
+bool IsZenzPersistentPersonalizationContextAllowed(const ImeContext& context) {
+  return !context.GetConfig().incognito_mode() &&
+         !context.GetRequest().is_incognito_mode();
 }
 
-ZenzFeedbackAutoBlockPolicy GetZenzFeedbackAutoBlockPolicy(
+bool CanReuseZenzFeedbackAutomatically(const ImeContext& context) {
+  return context.GetConfig().use_zenz_feedback_reuse() &&
+         IsZenzPersistentPersonalizationContextAllowed(context);
+}
+
+// Private input is read-only, whereas incognito cannot even read user feedback.
+// Password fields must never generate persisted learning observations.
+bool CanPersistZenzLearningFromInput(const ImeContext& context) {
+  return IsZenzPersistentPersonalizationContextAllowed(context) &&
+         !context.client_context().is_private_input() &&
+         context.composer().GetInputFieldType() != commands::Context::PASSWORD;
+}
+
+bool CanRecordZenzFeedback(const ImeContext& context) {
+  return context.GetConfig().use_zenz_feedback_recording() &&
+         CanPersistZenzLearningFromInput(context);
+}
+
+bool CanLearnZenzToMozcHistory(const ImeContext& context) {
+  return context.GetConfig().use_zenz_mozc_history_learning() &&
+         CanPersistZenzLearningFromInput(context);
+}
+
+ZenzFeedbackReusePolicy GetZenzFeedbackReusePolicy(
     const config::Config& config) {
-  ZenzFeedbackAutoBlockPolicy policy;
-  policy.enabled = config.use_zenz_auto_block_rejected_correction();
-  policy.reject_threshold =
+  ZenzFeedbackReusePolicy policy;
+  policy.minimum_key_length_enabled =
+      config.use_zenz_feedback_min_key_length();
+  policy.minimum_key_length =
+      std::clamp<uint32_t>(config.zenz_feedback_min_key_length(), 1, 20);
+  policy.auto_block_policy.enabled =
+      config.use_zenz_auto_block_rejected_correction();
+  policy.auto_block_policy.minimum_reject_count =
       static_cast<int>(config.zenz_auto_block_reject_threshold());
+  policy.auto_block_policy.minimum_reject_percentage = static_cast<int>(
+      config.zenz_auto_block_minimum_reject_percentage());
   return policy;
-}
-
-bool IsExplicitZenzHardRejectReason(absl::string_view reason) {
-  return reason == "hard_reject" ||
-         reason == "user_hard_reject" ||
-         reason == "manual_hard_reject" ||
-         reason == "explicit_hard_reject";
 }
 
 bool StartsWithString(absl::string_view text, absl::string_view prefix) {
@@ -2205,55 +1216,6 @@ struct ZenzTextPrivacyDecision {
   bool allow = false;
   const char* reason = "unspecified";
 };
-
-bool IsAsciiAlpha(unsigned char c) {
-  return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
-}
-
-bool IsAsciiDigit(unsigned char c) {
-  return '0' <= c && c <= '9';
-}
-
-bool IsAsciiAlnum(unsigned char c) {
-  return IsAsciiAlpha(c) || IsAsciiDigit(c);
-}
-
-bool IsAsciiControl(unsigned char c) {
-  return c < 0x20 || c == 0x7f;
-}
-
-std::string ToLowerAscii(absl::string_view text) {
-  std::string result;
-  result.reserve(text.size());
-
-  for (const unsigned char c : text) {
-    if ('A' <= c && c <= 'Z') {
-      result.push_back(static_cast<char>(c - 'A' + 'a'));
-    } else {
-      result.push_back(static_cast<char>(c));
-    }
-  }
-
-  return result;
-}
-
-bool ContainsAsciiSubstring(const std::string& text,
-                            absl::string_view needle) {
-  if (needle.empty()) {
-    return true;
-  }
-
-  return text.find(needle.data(), 0, needle.size()) != std::string::npos;
-}
-
-bool ContainsAsciiControl(absl::string_view text) {
-  for (const unsigned char c : text) {
-    if (IsAsciiControl(c)) {
-      return true;
-    }
-  }
-  return false;
-}
 
 bool IsJapaneseScriptSignal(char32_t c) {
   // Hiragana
@@ -2298,388 +1260,19 @@ bool IsJapaneseScriptSignal(char32_t c) {
   return false;
 }
 
-bool ContainsJapaneseScriptSignal(absl::string_view text) {
-  for (ConstChar32Iterator iter(text); !iter.Done(); iter.Next()) {
-    if (IsJapaneseScriptSignal(iter.Get())) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool LooksLikeUrlOrDomain(absl::string_view text) {
-  const std::string lower = ToLowerAscii(text);
-
-  if (lower.find("://") != std::string::npos ||
-      lower.find("www.") != std::string::npos) {
-    return true;
-  }
-
-  constexpr absl::string_view kDomainSuffixes[] = {
-      ".com",
-      ".net",
-      ".org",
-      ".jp",
-      ".co.jp",
-      ".io",
-      ".dev",
-      ".app",
-      ".local",
-      ".localhost",
-  };
-
-  for (const absl::string_view suffix : kDomainSuffixes) {
-    if (ContainsAsciiSubstring(lower, suffix)) {
+bool ContainsJapaneseScriptSignal(
+    absl::string_view text) {
+  for (ConstChar32Iterator iter(text);
+       !iter.Done();
+       iter.Next()) {
+    if (IsJapaneseScriptSignal(
+            iter.Get())) {
       return true;
     }
   }
 
   return false;
 }
-
-bool LooksLikeEmail(absl::string_view text) {
-  // Broad by design. In Japanese composition, raw '@' almost always means an
-  // address-like or handle-like token. Keep it out of the local model path.
-  return text.find('@') != absl::string_view::npos;
-}
-
-bool LooksLikePath(absl::string_view text) {
-  const std::string lower = ToLowerAscii(text);
-
-  if (text.find('\\') != absl::string_view::npos) {
-    return true;
-  }
-
-  if (lower.size() >= 3 &&
-      IsAsciiAlpha(static_cast<unsigned char>(lower[0])) &&
-      lower[1] == ':' &&
-      (lower[2] == '\\' || lower[2] == '/')) {
-    return true;
-  }
-
-  if (StartsWithString(lower, "/") ||
-      StartsWithString(lower, "~/") ||
-      lower.find("../") != std::string::npos ||
-      lower.find("./") != std::string::npos) {
-    return true;
-  }
-
-  return false;
-}
-
-bool IsAsciiTokenChar(unsigned char c) {
-  return IsAsciiAlnum(c) || c == '_' || c == '-' || c == '.';
-}
-
-bool IsAsciiHexDigit(unsigned char c) {
-  return IsAsciiDigit(c) ||
-         ('a' <= c && c <= 'f') ||
-         ('A' <= c && c <= 'F');
-}
-
-bool IsIpv4LikeAsciiToken(absl::string_view token) {
-  size_t i = 0;
-  int group_count = 0;
-
-  while (i < token.size()) {
-    if (group_count >= 4) {
-      return false;
-    }
-
-    const size_t start = i;
-    int value = 0;
-
-    while (i < token.size() &&
-           IsAsciiDigit(static_cast<unsigned char>(token[i]))) {
-      value = value * 10 + (token[i] - '0');
-      if (value > 255) {
-        return false;
-      }
-      ++i;
-    }
-
-    if (i == start) {
-      return false;
-    }
-
-    ++group_count;
-
-    if (group_count == 4) {
-      break;
-    }
-
-    if (i >= token.size() || token[i] != '.') {
-      return false;
-    }
-
-    ++i;
-  }
-
-  return group_count == 4 && i == token.size();
-}
-
-bool IsVersionLikeAsciiToken(absl::string_view token) {
-  if (token.empty()) {
-    return false;
-  }
-
-  size_t i = 0;
-
-  if (i < token.size() && (token[i] == 'v' || token[i] == 'V')) {
-    ++i;
-  }
-
-  const auto consume_digits = [&token, &i]() {
-    const size_t start = i;
-    while (i < token.size() &&
-           IsAsciiDigit(static_cast<unsigned char>(token[i]))) {
-      ++i;
-    }
-    return i > start;
-  };
-
-  if (!consume_digits()) {
-    return false;
-  }
-
-  size_t numeric_group_count = 1;
-  bool saw_dot = false;
-
-  while (i < token.size() && token[i] == '.') {
-    saw_dot = true;
-    ++i;
-
-    if (!consume_digits()) {
-      return false;
-    }
-
-    ++numeric_group_count;
-    if (numeric_group_count > 4) {
-      return false;
-    }
-  }
-
-  // Require at least one dot so plain "v12345678" is not treated as a
-  // harmless version string.
-  if (!saw_dot) {
-    return false;
-  }
-
-  if (i < token.size() && token[i] == '-') {
-    ++i;
-
-    const size_t suffix_start = i;
-    while (i < token.size() &&
-           IsAsciiAlpha(static_cast<unsigned char>(token[i]))) {
-      ++i;
-    }
-
-    if (i == suffix_start) {
-      return false;
-    }
-
-    while (i < token.size() &&
-           IsAsciiDigit(static_cast<unsigned char>(token[i]))) {
-      ++i;
-    }
-  }
-
-  return i == token.size();
-}
-
-bool LooksLikeLongAsciiToken(absl::string_view text) {
-  size_t token_start = 0;
-  bool in_token = false;
-
-  const auto check_token = [&](size_t start, size_t end) {
-    if (end <= start) {
-      return false;
-    }
-
-    const absl::string_view token = text.substr(start, end - start);
-
-    if (IsIpv4LikeAsciiToken(token)) {
-      return true;
-    }
-
-    if (IsVersionLikeAsciiToken(token)) {
-      return false;
-    }
-
-    size_t longest_digit_run = 0;
-    size_t current_digit_run = 0;
-
-    bool has_alpha = false;
-    bool has_digit = false;
-    bool has_symbol = false;
-    bool all_hex = true;
-
-    for (const unsigned char c : token) {
-      if (IsAsciiDigit(c)) {
-        has_digit = true;
-        ++current_digit_run;
-        longest_digit_run = std::max(longest_digit_run, current_digit_run);
-      } else {
-        current_digit_run = 0;
-      }
-
-      if (IsAsciiAlpha(c)) {
-        has_alpha = true;
-      }
-
-      if (c == '_' || c == '-' || c == '.') {
-        has_symbol = true;
-      }
-
-      if (!IsAsciiHexDigit(c)) {
-        all_hex = false;
-      }
-    }
-
-    const size_t len = token.size();
-
-    // Long digit runs are often phone numbers, account IDs, ticket IDs,
-    // verification codes, order numbers, or other sensitive identifiers.
-    //
-    // This intentionally rejects some harmless numbers.  For live correction,
-    // falling back to Mozc is safer than sending opaque numeric IDs to Zenz.
-    if (longest_digit_run >= 8) {
-      return true;
-    }
-
-    // Separator-bearing mixed identifiers:
-    //   ghb_741298790561977834
-    //   abc-1234567890
-    //   user_12345678
-    //
-    // Keep version-like strings such as v0.7.0 and v1.0.0-alpha out of this
-    // branch by checking IsVersionLikeAsciiToken() first.
-    if (len >= 12 && has_alpha && has_digit && has_symbol) {
-      return true;
-    }
-
-    // Mixed alphanumeric opaque identifiers without separators:
-    //   AKIAIOSFODNN7EXAMPLE
-    //   a1b2c3d4e5f6g7h8
-    if (len >= 16 && has_alpha && has_digit) {
-      return true;
-    }
-
-    // Long hex-like values:
-    //   deadbeefcafebabe
-    //   0123456789abcdef
-    if (len >= 16 && all_hex && has_alpha) {
-      return true;
-    }
-
-    // Very long ASCII words / identifiers are poor live-correction targets and
-    // may be generated IDs, slugs, or copied tokens.
-    if (len >= 24 && has_alpha) {
-      return true;
-    }
-
-    if (len >= 32) {
-      return true;
-    }
-
-    return false;
-  };
-
-  for (size_t i = 0; i < text.size(); ++i) {
-    const unsigned char c = static_cast<unsigned char>(text[i]);
-
-    if (IsAsciiTokenChar(c)) {
-      if (!in_token) {
-        token_start = i;
-        in_token = true;
-      }
-      continue;
-    }
-
-    if (in_token) {
-      if (check_token(token_start, i)) {
-        return true;
-      }
-      in_token = false;
-    }
-  }
-
-  if (in_token && check_token(token_start, text.size())) {
-    return true;
-  }
-
-  return false;
-}
-
-bool LooksLikeKnownSecretPrefix(absl::string_view text) {
-  const std::string lower = ToLowerAscii(text);
-
-  constexpr absl::string_view kPrefixes[] = {
-      "ghp_",
-      "github_pat_",
-      "glpat-",
-      "sk-",
-      "xoxb-",
-      "xoxp-",
-      "ya29.",
-      "akia",
-      "bearer ",
-  };
-
-  for (const absl::string_view prefix : kPrefixes) {
-    if (ContainsAsciiSubstring(lower, prefix)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-bool ContainsSensitiveCredentialWord(absl::string_view text) {
-  const std::string lower = ToLowerAscii(text);
-
-  constexpr absl::string_view kAsciiWords[] = {
-      "password",
-      "passwd",
-      "passphrase",
-      "secret",
-      "token",
-      "apikey",
-      "api_key",
-      "credential",
-      "privatekey",
-      "private_key",
-      "authorization",
-  };
-
-  for (const absl::string_view word : kAsciiWords) {
-    if (ContainsAsciiSubstring(lower, word)) {
-      return true;
-    }
-  }
-
-  constexpr absl::string_view kJapaneseWords[] = {
-      "パスワード",
-      "暗証番号",
-      "認証コード",
-      "認証番号",
-      "秘密鍵",
-      "秘密キー",
-      "トークン",
-      "アクセストークン",
-      "APIキー",
-      "apiキー",
-  };
-
-  for (const absl::string_view word : kJapaneseWords) {
-    if (text.find(word) != absl::string_view::npos) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 ZenzTextPrivacyDecision EvaluateZenzLiveKeyPrivacy(
     absl::string_view key) {
   if (key.empty()) {
@@ -2690,47 +1283,38 @@ ZenzTextPrivacyDecision EvaluateZenzLiveKeyPrivacy(
     return {false, "invalid_utf8"};
   }
 
-  if (ContainsAsciiControl(key)) {
-    return {false, "control_char"};
+  for (const unsigned char c : key) {
+    if (c < 0x20 ||
+        c == 0x7f) {
+      return {false, "control_char"};
+    }
   }
 
-  if (Util::CharsLen(key) > kMaxZenzLiveCorrectionKeyChars) {
+  if (Util::CharsLen(key) >
+      kMaxZenzLiveCorrectionKeyChars) {
     return {false, "key_too_long"};
   }
 
-  // Main difference from the old ContainsAsciiAlphabet() gate:
-  // ASCII is allowed only when the composition has a Japanese script signal.
-  if (!ContainsJapaneseScriptSignal(key)) {
+  // Preserve the existing live-key requirement exactly.
+  if (!ContainsJapaneseScriptSignal(
+          key)) {
     return {false, "no_japanese_signal"};
   }
 
-  if (LooksLikeEmail(key)) {
-    return {false, "email_like"};
-  }
+  const ZenzTextPrivacyAnalysis privacy =
+      ZenzTextPrivacyAnalyzer().Analyze(
+          key,
+          ZenzTextPrivacyPolicy::kLiveText);
 
-  if (LooksLikeUrlOrDomain(key)) {
-    return {false, "url_or_domain_like"};
-  }
-
-  if (LooksLikePath(key)) {
-    return {false, "path_like"};
-  }
-
-  if (LooksLikeKnownSecretPrefix(key)) {
-    return {false, "secret_prefix"};
-  }
-
-  if (LooksLikeLongAsciiToken(key)) {
-    return {false, "token_like"};
-  }
-
-  if (ContainsSensitiveCredentialWord(key)) {
-    return {false, "credential_word"};
+  if (privacy.sensitive()) {
+    return {
+        false,
+        privacy.reason(),
+    };
   }
 
   return {true, "allow"};
 }
-
 ZenzTextPrivacyDecision EvaluateZenzLiveValuePrivacy(
     absl::string_view value) {
   if (value.empty()) {
@@ -2741,43 +1325,34 @@ ZenzTextPrivacyDecision EvaluateZenzLiveValuePrivacy(
     return {false, "invalid_utf8"};
   }
 
-  if (ContainsAsciiControl(value)) {
-    return {false, "control_char"};
+  for (const unsigned char c : value) {
+    if (c < 0x20 ||
+        c == 0x7f) {
+      return {false, "control_char"};
+    }
   }
 
-  if (Util::CharsLen(value) > kMaxZenzLiveCorrectionValueChars) {
+  if (Util::CharsLen(value) >
+      kMaxZenzLiveCorrectionValueChars) {
     return {false, "value_too_long"};
   }
 
-  // Do not require a Japanese signal for value.
-  // Example: key=ぎっとはぶ, value=GitHub should remain valid.
-  if (LooksLikeEmail(value)) {
-    return {false, "email_like"};
-  }
+  // Value intentionally does not require a Japanese-script signal.
+  // Example: key=ぎっとはぶ, value=GitHub remains valid.
+  const ZenzTextPrivacyAnalysis privacy =
+      ZenzTextPrivacyAnalyzer().Analyze(
+          value,
+          ZenzTextPrivacyPolicy::kLiveText);
 
-  if (LooksLikeUrlOrDomain(value)) {
-    return {false, "url_or_domain_like"};
-  }
-
-  if (LooksLikePath(value)) {
-    return {false, "path_like"};
-  }
-
-  if (LooksLikeKnownSecretPrefix(value)) {
-    return {false, "secret_prefix"};
-  }
-
-  if (LooksLikeLongAsciiToken(value)) {
-    return {false, "token_like"};
-  }
-
-  if (ContainsSensitiveCredentialWord(value)) {
-    return {false, "credential_word"};
+  if (privacy.sensitive()) {
+    return {
+        false,
+        privacy.reason(),
+    };
   }
 
   return {true, "allow"};
 }
-
 void AddPreeditSegment(absl::string_view key,
                        absl::string_view value,
                        commands::Preedit::Segment::Annotation annotation,
@@ -2787,6 +1362,145 @@ void AddPreeditSegment(absl::string_view key,
   segment->set_key(std::string(key));
   segment->set_value(std::string(value));
   segment->set_value_length(Util::CharsLen(value));
+}
+
+void AddPreeditSegmentWithPendingRomanTail(
+    absl::string_view key, absl::string_view value,
+    size_t pending_roman_length, commands::Preedit* preedit) {
+  const size_t value_length = Util::CharsLen(value);
+  if (pending_roman_length == 0 || pending_roman_length > value_length) {
+    AddPreeditSegment(key, value, commands::Preedit::Segment::UNDERLINE,
+                      preedit);
+    return;
+  }
+
+  const size_t stable_length = value_length - pending_roman_length;
+  if (stable_length == 0) {
+    AddPreeditSegment(key, value, commands::Preedit::Segment::UNDERLINE,
+                      preedit);
+    preedit->mutable_segment(preedit->segment_size() - 1)
+        ->set_is_pending_roman(true);
+    return;
+  }
+
+  const absl::string_view stable_value =
+      Util::Utf8SubString(value, 0, stable_length);
+  const absl::string_view pending_value =
+      Util::Utf8SubString(value, stable_length, pending_roman_length);
+
+  // This split is presentation-only, so it must never synthesize segment keys
+  // from values. If the supplied key cannot preserve a non-empty stable prefix
+  // plus the pending suffix exactly, keep the original segment unsplit.
+  const size_t key_length = Util::CharsLen(key);
+  if (key_length <= pending_roman_length) {
+    AddPreeditSegment(key, value, commands::Preedit::Segment::UNDERLINE,
+                      preedit);
+    return;
+  }
+
+  const size_t stable_key_length = key_length - pending_roman_length;
+  const absl::string_view stable_key =
+      Util::Utf8SubString(key, 0, stable_key_length);
+  const absl::string_view pending_key =
+      Util::Utf8SubString(key, stable_key_length, pending_roman_length);
+
+  AddPreeditSegment(stable_key, stable_value,
+                    commands::Preedit::Segment::UNDERLINE, preedit);
+  AddPreeditSegment(pending_key, pending_value,
+                    commands::Preedit::Segment::UNDERLINE, preedit);
+  preedit->mutable_segment(preedit->segment_size() - 1)
+      ->set_is_pending_roman(true);
+}
+
+void MarkPendingRomanTailOnPreedit(const composer::Composer& composer,
+                                   commands::Preedit* preedit) {
+  if (preedit == nullptr || preedit->segment_size() == 0) {
+    return;
+  }
+
+  const size_t pending_length = composer.GetPendingRomanDisplayLength();
+  if (pending_length == 0) {
+    return;
+  }
+
+  const std::string display = composer.GetStringForPreedit();
+  const size_t display_length = Util::CharsLen(display);
+  if (pending_length > display_length) {
+    return;
+  }
+
+  const absl::string_view expected_display_suffix =
+      Util::Utf8SubString(display, display_length - pending_length,
+                          pending_length);
+
+  const std::string query = composer.GetQueryForConversion();
+  const size_t query_length = Util::CharsLen(query);
+  if (pending_length > query_length) {
+    return;
+  }
+
+  const absl::string_view expected_key_suffix =
+      Util::Utf8SubString(query, query_length - pending_length,
+                          pending_length);
+
+  commands::Preedit::Segment* last =
+      preedit->mutable_segment(preedit->segment_size() - 1);
+  const size_t value_length = Util::CharsLen(last->value());
+  const size_t key_length = Util::CharsLen(last->key());
+
+  if (pending_length > value_length) {
+    return;
+  }
+
+  const absl::string_view actual_value_suffix =
+      Util::Utf8SubString(last->value(), value_length - pending_length,
+                          pending_length);
+
+  // A conversion candidate may preserve the unresolved roman either in the
+  // visible preedit style (for example, full-width "ｔ") or in the conversion
+  // query style (for example, ASCII "t").  Do not mark an unrelated converted
+  // tail.
+  if (actual_value_suffix != expected_display_suffix &&
+      actual_value_suffix != expected_key_suffix) {
+    return;
+  }
+
+  if (value_length == pending_length) {
+    last->set_is_pending_roman(true);
+    return;
+  }
+
+  // Splitting a conversion output segment is presentation-only.  Preserve the
+  // concatenated key/value, cursor, highlighted position, annotation, and every
+  // other segment field.  If the source key cannot be split at the same trailing
+  // character count, leave the converter-owned presentation untouched.
+  if (pending_length > key_length) {
+    return;
+  }
+
+  const size_t stable_value_length = value_length - pending_length;
+  const size_t stable_key_length = key_length - pending_length;
+
+  const std::string stable_value(
+      Util::Utf8SubString(last->value(), 0, stable_value_length));
+  const std::string pending_value(actual_value_suffix);
+  const std::string stable_key(
+      Util::Utf8SubString(last->key(), 0, stable_key_length));
+  const std::string pending_key(
+      Util::Utf8SubString(last->key(), stable_key_length, pending_length));
+
+  commands::Preedit::Segment pending_segment = *last;
+
+  last->set_key(stable_key);
+  last->set_value(stable_value);
+  last->set_value_length(stable_value_length);
+  last->set_is_pending_roman(false);
+
+  pending_segment.set_key(pending_key);
+  pending_segment.set_value(pending_value);
+  pending_segment.set_value_length(pending_length);
+  pending_segment.set_is_pending_roman(true);
+  *preedit->add_segment() = std::move(pending_segment);
 }
 void RestorePreeditSegmentKeysForSymbolStyle(
     absl::string_view symbol_style_source,
@@ -3101,6 +1815,58 @@ ImeContext::State GetEffectiveStateForTestSendKey(const commands::KeyEvent& key,
   return state;
 }
 
+std::string AbbreviateCandidateActionKeyToken(absl::string_view token) {
+  if (token == "Control" || token == "control" || token == "Ctrl" ||
+      token == "ctrl") {
+    return "Ctrl";
+  }
+  if (token == "Delete" || token == "delete") {
+    return "Del";
+  }
+  if (token == "Backspace" || token == "backspace") {
+    return "Bksp";
+  }
+  if (token == "Escape" || token == "escape") {
+    return "Esc";
+  }
+  if (token == "Insert" || token == "insert") {
+    return "Ins";
+  }
+  if (token == "PageUp" || token == "pageup") {
+    return "PgUp";
+  }
+  if (token == "PageDown" || token == "pagedown") {
+    return "PgDn";
+  }
+  return std::string(token);
+}
+
+std::string FormatCandidateActionKeyLabel(absl::string_view key_name) {
+  std::string result;
+  size_t begin = 0;
+  while (begin < key_name.size()) {
+    while (begin < key_name.size() && key_name[begin] == ' ') {
+      ++begin;
+    }
+    if (begin == key_name.size()) {
+      break;
+    }
+
+    size_t end = key_name.find(' ', begin);
+    if (end == absl::string_view::npos) {
+      end = key_name.size();
+    }
+
+    if (!result.empty()) {
+      result.push_back('+');
+    }
+    result.append(
+        AbbreviateCandidateActionKeyToken(key_name.substr(begin, end - begin)));
+    begin = end + 1;
+  }
+  return result;
+}
+
 void MergeCommandResult(const commands::Result& step_result,
                         commands::Result* accumulated_result) {
   if (!accumulated_result->has_key() && !accumulated_result->has_value()) {
@@ -3167,8 +1933,43 @@ std::unique_ptr<ImeContext> Session::CreateContext(
 }
 
 void Session::PushUndoContext() {
-  // Copy the current context and push it to the undo stack.
-  undo_contexts_.emplace_back(std::make_unique<ImeContext>(*context_));
+  UndoEntry entry;
+  entry.context = std::make_unique<ImeContext>(*context_);
+
+  // A pending live-conversion preedit is partly owned by Session rather than
+  // ImeContext: the converted stable prefix and the raw suffix are composed at
+  // output time. Preserve that display state so Undo can restore exactly what
+  // the user saw before submitting it. Generation numbers are intentionally not
+  // stored; PopUndoContext() issues a fresh generation to keep old callbacks
+  // stale.
+  if (live_conversion_pending_ &&
+      context_->state() == ImeContext::COMPOSITION) {
+    PendingLiveConversionUndoState state;
+    state.pending_key = pending_live_conversion_key_;
+    state.pending_input = pending_live_conversion_input_;
+    state.pending_presentation = pending_live_conversion_presentation_;
+    state.pending_suggestion_candidate_window =
+        pending_live_conversion_suggestion_candidate_window_;
+    if (pending_live_conversion_suggestion_context_ != nullptr) {
+      state.pending_suggestion_context =
+          std::make_unique<ImeContext>(
+              *pending_live_conversion_suggestion_context_);
+    }
+    state.live_suggestion_candidate_window =
+        live_conversion_suggestion_candidate_window_;
+    if (live_conversion_suggestion_context_ != nullptr) {
+      state.live_suggestion_context =
+          std::make_unique<ImeContext>(*live_conversion_suggestion_context_);
+    }
+    state.live_key = live_conversion_key_;
+    state.live_preedit = live_conversion_preedit_;
+    state.live_value = live_conversion_value_;
+    state.live_preedit_output = live_conversion_preedit_output_;
+    entry.pending_live_conversion = std::move(state);
+  }
+
+  undo_contexts_.push_back(std::move(entry));
+
   // If the stack size exceeds the limitation, purge the oldest entries.
   while (undo_contexts_.size() > kMultipleUndoMaxSize) {
     undo_contexts_.pop_front();
@@ -3176,12 +1977,64 @@ void Session::PushUndoContext() {
   DCHECK_LE(undo_contexts_.size(), kMultipleUndoMaxSize);
 }
 
+void Session::PushDirectCommitUndoContext() {
+  PushUndoContext();
+  DCHECK(!undo_contexts_.empty());
+  undo_contexts_.back().revert_converter_on_undo = false;
+}
+
 void Session::PopUndoContext() {
   if (!HasUndoContext()) {
     return;
   }
-  context_ = std::move(undo_contexts_.back());
+
+  UndoEntry entry = std::move(undo_contexts_.back());
   undo_contexts_.pop_back();
+  context_ = std::move(entry.context);
+
+  // Invalidate every callback issued before Undo. If the restored entry was
+  // pending, it receives a new generation and a new callback from Undo().
+  ClearLiveConversionState();
+
+  if (!entry.pending_live_conversion.has_value() ||
+      context_->state() != ImeContext::COMPOSITION) {
+    return;
+  }
+
+  PendingLiveConversionUndoState& state =
+      *entry.pending_live_conversion;
+  const std::string current_key =
+      context_->composer().GetQueryForConversion();
+  if (state.pending_key.empty() || state.pending_key != current_key) {
+    return;
+  }
+
+  live_conversion_pending_ = true;
+  pending_live_conversion_generation_ = live_conversion_generation_;
+  pending_live_conversion_key_ = std::move(state.pending_key);
+  pending_live_conversion_input_ = std::move(state.pending_input);
+  pending_live_conversion_suggestion_candidate_window_ =
+      std::move(state.pending_suggestion_candidate_window);
+  pending_live_conversion_suggestion_context_ =
+      std::move(state.pending_suggestion_context);
+  live_conversion_suggestion_candidate_window_ =
+      std::move(state.live_suggestion_candidate_window);
+  live_conversion_suggestion_context_ =
+      std::move(state.live_suggestion_context);
+  live_conversion_key_ = std::move(state.live_key);
+  live_conversion_corrected_key_.clear();
+  live_conversion_corrected_raw_.clear();
+  live_conversion_preedit_ = std::move(state.live_preedit);
+  live_conversion_value_ = std::move(state.live_value);
+  live_conversion_preedit_output_ =
+      std::move(state.live_preedit_output);
+  pending_live_conversion_presentation_ =
+      std::move(state.pending_presentation);
+}
+
+bool Session::ShouldRevertConverterOnUndo() const {
+  return HasUndoContext() &&
+         undo_contexts_.back().revert_converter_on_undo;
 }
 
 void Session::ClearUndoContext() { undo_contexts_.clear(); }
@@ -3210,6 +2063,10 @@ void Session::ApplyCurrentGrimodexDomainToContext(
   if (clear_surrounding_text || grimodex_domain_.secure_input) {
     context->clear_preceding_text();
     context->clear_following_text();
+    // The Zenz-specific surrounding text is the same application text under
+    // a wider budget and must follow the same domain rule.
+    context->clear_zenz_preceding_text();
+    context->clear_zenz_following_text();
   }
   if (grimodex_domain_.secure_input) {
     context->set_input_field_type(commands::Context::PASSWORD);
@@ -3229,6 +2086,14 @@ void Session::PurgeForGrimodexDomainTransition(bool secure_input) {
   ClearPendingRerankedPreeditCommitAfterConvertCancel();
   ClearLiveConversionState();
   ClearUndoContext();
+
+  // A suspended keymap command sequence belongs to the domain that issued it
+  // and must not resume inside the replacement domain.
+  ++command_sequence_generation_;
+  pending_command_sequence_.clear();
+  pending_command_sequence_key_.clear();
+  command_sequence_waits_for_reconversion_ = false;
+  composition_holds_passive_suggestion_ = false;
 
   engine::EngineConverterInterface* converter =
       context_->mutable_converter();
@@ -3333,6 +2198,8 @@ void Session::UpdateGrimodexContext(commands::Command* command) {
       wire_context->clear_grimodex();
       wire_context->clear_preceding_text();
       wire_context->clear_following_text();
+      wire_context->clear_zenz_preceding_text();
+      wire_context->clear_zenz_following_text();
     }
     return;
   }
@@ -3486,6 +2353,28 @@ bool Session::SendCommand(commands::Command* command) {
   TransformInput(command->mutable_input());
 
   const commands::SessionCommand& session_command = command->input().command();
+  // SEND_COMMAND bypasses SendKey's generation invalidation. Candidate
+  // selection/highlighting, cursor movement, and other client-side actions
+  // must cancel a pending macro too, even when the reading stays unchanged.
+  // Only query commands, timer callbacks, and the expected TSF reconversion
+  // acknowledgement are allowed to preserve the suspended continuation.
+  switch (session_command.type()) {
+    case commands::SessionCommand::NONE:
+    case commands::SessionCommand::GET_STATUS:
+    case commands::SessionCommand::APPLY_LIVE_CONVERSION:
+    case commands::SessionCommand::APPLY_ZENZ_LIVE_CORRECTION:
+    case commands::SessionCommand::RESUME_COMMAND_SEQUENCE:
+      break;
+    case commands::SessionCommand::CONVERT_REVERSE:
+      if (command_sequence_waits_for_reconversion_) break;
+      [[fallthrough]];
+    default:
+      ++command_sequence_generation_;
+      pending_command_sequence_.clear();
+      pending_command_sequence_key_.clear();
+      command_sequence_waits_for_reconversion_ = false;
+      break;
+  }
   HandlePendingDirectCommitLearningForSessionCommand(session_command.type());
   HandlePendingZenzFeedbackForSessionCommand(session_command.type());
 
@@ -3597,6 +2486,9 @@ bool Session::SendCommand(commands::Command* command) {
     case commands::SessionCommand::APPLY_ZENZ_LIVE_CORRECTION:
       result = ApplyZenzLiveCorrection(command);
       break;
+    case commands::SessionCommand::RESUME_COMMAND_SEQUENCE:
+      result = ResumeCommandSequence(command);
+      break;
 
     case commands::SessionCommand::RECONVERT_SELECTION_OR_INSERT_SPACE:
       // This command is a client-side callback command.  It should normally be
@@ -3618,7 +2510,7 @@ bool Session::SendCommand(commands::Command* command) {
       // Resets converter's state (e.g. previous segments).
       // NWP will be generated from surrounding text given by the client.
       context_->mutable_converter()->Reset();
-      result = context_->mutable_converter()->SuggestWithPreferences(
+      result = context_->mutable_converter()->Suggest(
           context_->composer(), command->input().context(),
           conversion_preferences);
       if (result) {
@@ -3633,6 +2525,7 @@ bool Session::SendCommand(commands::Command* command) {
   }
   if (context_->state() != ImeContext::CONVERSION) {
     live_conversion_active_ = false;
+    live_conversion_from_composition_ = false;
     ClearZenzLiveCorrectionState();
   }
 
@@ -3685,15 +2578,18 @@ bool Session::TestSendKey(commands::Command* command) {
         return Revert(command);
       }
 
-      if (pending_direct_commit_learning_.pending &&
+      if ((pending_direct_commit_learning_.pending ||
+           pending_zenz_feedback_.pending) &&
           IsCancelKeyForCompositionOrConversion(key)) {
-        // A direct-commit punctuation/symbol may have already sent text to the
-        // application without creating Mozc's undo context.  In that case a
-        // cancel-like key such as Ctrl+Z should still cancel Mozkey's pending
-        // learning, while the key itself must be echoed back so that the
-        // application can decide how to undo the visible text.
+        // A direct-commit punctuation/symbol or accepted Zenz result may have
+        // already sent text to the application without creating Mozc's undo
+        // context. A cancel-like key such as Ctrl+Z should still cancel all
+        // pending learning/feedback, while the key itself is echoed back so
+        // that the application can undo the visible text.
         DiscardPendingDirectCommitLearning(
             "precomposition_cancel_key_after_direct_commit_learning");
+        DiscardPendingZenzFeedback(
+            "precomposition_cancel_key_after_pending_zenz_feedback");
         return EchoBackAndClearUndoContext(command);
       }
 
@@ -3716,10 +2612,14 @@ bool Session::TestSendKey(commands::Command* command) {
     // the inconsistency between TestSendKey and SendKey.
     switch (key_command) {
       case keymap::PrecompositionState::INSERT_SPACE:
-      case keymap::PrecompositionState::RECONVERT_SELECTION_OR_INSERT_SPACE:
         if (!IsFullWidthInsertSpace(command->input()) && IsPureSpaceKey(key)) {
           return EchoBackAndClearUndoContext(command);
         }
+        return DoNothing(command);
+      case keymap::PrecompositionState::RECONVERT_SELECTION_OR_INSERT_SPACE:
+        // TestSendKey reserves Space so the TSF client can inspect selection.
+        // SendKey then prepares an explicit Space fallback that the client
+        // applies only when reconversion is unavailable.
         return DoNothing(command);
       case keymap::PrecompositionState::INSERT_ALTERNATE_SPACE:
         if (IsFullWidthInsertSpace(command->input()) && IsPureSpaceKey(key)) {
@@ -3756,6 +2656,12 @@ bool Session::TestSendKey(commands::Command* command) {
 }
 
 bool Session::SendKey(commands::Command* command) {
+  // A new physical key always invalidates a suspended macro, including a
+  // reconversion continuation that has not reached the TSF callback yet.
+  ++command_sequence_generation_;
+  pending_command_sequence_.clear();
+  pending_command_sequence_key_.clear();
+  command_sequence_waits_for_reconversion_ = false;
   UpdateTime();
   UpdatePreferences(command);
   UpdateGrimodexContext(command);
@@ -3789,6 +2695,7 @@ bool Session::SendKey(commands::Command* command) {
 
   if (context_->state() != ImeContext::CONVERSION) {
     live_conversion_active_ = false;
+    live_conversion_from_composition_ = false;
     ClearZenzLiveCorrectionState();
   }
 
@@ -3866,9 +2773,46 @@ bool Session::ExecuteCommandSequenceWithInitialOutput(
     executed = true;
   }
 
-  for (const std::string& command_name : command_sequence) {
-    if (command_name.empty()) {
-      continue;
+  for (size_t i = 0; i < command_sequence.size(); ++i) {
+    const std::string& command_name = command_sequence[i];
+    if (command_name.empty()) continue;
+
+    const std::optional<uint32_t> delay = ParseKeymapDelay(command_name);
+    if (delay.has_value()) {
+      if (*delay == 0 || i + 1 == command_sequence.size()) continue;
+      // An earlier command may already have installed an asynchronous
+      // callback (live conversion, Zenz, undo, etc.). Never overwrite it with
+      // RESUME_COMMAND_SEQUENCE: preserving that callback is more important
+      // than running unsupported chained steps. Malformed imported keymaps
+      // can reach here even if the normal keymap validator rejects them.
+      if (final_output.has_callback()) {
+        LOG(WARNING) << "Skipping keymap Delay after asynchronous callback";
+        final_output.set_consumed(consumed);
+        if (has_accumulated_result) {
+          *final_output.mutable_result() = accumulated_result;
+        }
+        *command->mutable_output() = final_output;
+        return true;
+      }
+      pending_command_sequence_.assign(command_sequence.begin() + i + 1,
+                                       command_sequence.end());
+      command_sequence_waits_for_reconversion_ = false;
+      pending_command_sequence_key_ = context_->composer().GetQueryForConversion();
+      commands::Output::Callback* callback =
+          final_output.mutable_callback();
+      callback->mutable_session_command()->set_type(
+          commands::SessionCommand::RESUME_COMMAND_SEQUENCE);
+      callback->mutable_session_command()->set_command_sequence_generation(
+          ++command_sequence_generation_);
+      callback->set_delay_millisec(*delay);
+      // Delaying the remainder must not change the original key's
+      // pass-through semantics (e.g. a half-width Space).
+      final_output.set_consumed(consumed);
+      if (has_accumulated_result) {
+        *final_output.mutable_result() = accumulated_result;
+      }
+      *command->mutable_output() = final_output;
+      return true;
     }
 
     command->mutable_output()->Clear();
@@ -3894,6 +2838,24 @@ bool Session::ExecuteCommandSequenceWithInitialOutput(
                             &has_accumulated_result,
                             &accumulated_result,
                             &final_output);
+
+    if (command_name == "ReconvertSelectionOrInsertSpace" &&
+        i + 1 < command_sequence.size() &&
+        step_output.has_callback() &&
+        step_output.callback().has_session_command() &&
+        step_output.callback().session_command().type() ==
+            commands::SessionCommand::RECONVERT_SELECTION_OR_INSERT_SPACE) {
+      pending_command_sequence_.assign(command_sequence.begin() + i + 1,
+                                       command_sequence.end());
+      command_sequence_waits_for_reconversion_ = true;
+      pending_command_sequence_key_.clear();
+      ++command_sequence_generation_;
+      // The client still decides whether a selection is present. If not,
+      // it applies the already-generated fallback Space result.
+      final_output.set_consumed(consumed);
+      *command->mutable_output() = final_output;
+      return true;
+    }
   }
 
   if (!executed) {
@@ -3906,6 +2868,49 @@ bool Session::ExecuteCommandSequenceWithInitialOutput(
   }
   *command->mutable_output() = final_output;
   return true;
+}
+
+bool Session::ResumeCommandSequence(commands::Command* command) {
+  command->mutable_output()->set_consumed(true);
+  const commands::SessionCommand& resume = command->input().command();
+  if (!resume.has_command_sequence_generation() ||
+      resume.command_sequence_generation() != command_sequence_generation_ ||
+      pending_command_sequence_.empty()) {
+    return IgnoreStaleDelayedLiveConversion(command);
+  }
+  if (!command_sequence_waits_for_reconversion_ &&
+      context_->composer().GetQueryForConversion() !=
+          pending_command_sequence_key_) {
+    pending_command_sequence_.clear();
+    pending_command_sequence_key_.clear();
+    return IgnoreStaleDelayedLiveConversion(command);
+  }
+  if (command_sequence_waits_for_reconversion_) {
+    // Never resume client reconversion until TSF has made a real preedit.
+    if (context_->state() != ImeContext::CONVERSION) {
+      pending_command_sequence_.clear();
+      command_sequence_waits_for_reconversion_ = false;
+      return IgnoreStaleDelayedLiveConversion(command);
+    }
+  }
+  keymap::CommandSequence remaining = std::move(pending_command_sequence_);
+  pending_command_sequence_.clear();
+  command_sequence_waits_for_reconversion_ = false;
+  pending_command_sequence_key_.clear();
+  ++command_sequence_generation_;
+  // A continuation may only install a new callback, not emit fresh preedit.
+  // The baseline output must be carried forward, or the Windows TSF client
+  // will interpret an empty output as EndComposition.
+  if (!remaining.empty() &&
+      (remaining.front() == "ForceZenzLiveCorrection" ||
+       remaining.front() == "ForceZenzLiveCorrectionWithoutFeedback")) {
+    // ForceZenzLiveCorrection builds its own baseline output. Avoid a second
+    // PopOutput in one callback, which may duplicate TSF composition text.
+    return ExecuteCommandSequence(remaining, command);
+  }
+  OutputFromState(command);
+  const commands::Output initial = command->output();
+  return ExecuteCommandSequenceWithInitialOutput(remaining, &initial, command);
 }
 
 bool Session::ExecuteCommandName(const std::string& command_name,
@@ -4001,7 +3006,7 @@ bool Session::ExecutePrecompositionCommand(
     case keymap::PrecompositionState::IME_OFF:
       return IMEOff(command);
     case keymap::PrecompositionState::IME_ON:
-      return DoNothing(command);
+      return IMEOnWhenAlreadyOn(command);
 
     case keymap::PrecompositionState::COMPOSITION_MODE_HIRAGANA:
       return CompositionModeHiragana(command);
@@ -4054,6 +3059,10 @@ bool Session::ExecuteCompositionCommand(
     keymap::CompositionState::Commands key_command,
     commands::Command* command) {
   switch (key_command) {
+    case keymap::CompositionState::FORCE_ZENZ_LIVE_CORRECTION:
+      return ForceZenzLiveCorrection(command);
+    case keymap::CompositionState::FORCE_ZENZ_LIVE_CORRECTION_WITHOUT_FEEDBACK:
+      return ForceZenzLiveCorrection(command, /*bypass_automatic_feedback=*/true);
     case keymap::CompositionState::INSERT_CHARACTER:
       return InsertCharacter(command);
 
@@ -4115,7 +3124,7 @@ bool Session::ExecuteCompositionCommand(
       return IMEOff(command);
 
     case keymap::CompositionState::IME_ON:
-      return DoNothing(command);
+      return IMEOnWhenAlreadyOn(command);
 
     case keymap::CompositionState::CONVERT_TO_HIRAGANA:
       return ConvertToHiragana(command);
@@ -4185,6 +3194,23 @@ bool Session::ExecuteConversionCommand(
     keymap::ConversionState::Commands key_command,
     commands::Command* command) {
   switch (key_command) {
+    case keymap::ConversionState::FORCE_ZENZ_LIVE_CORRECTION:
+      return ForceZenzLiveCorrection(command);
+    case keymap::ConversionState::FORCE_ZENZ_LIVE_CORRECTION_WITHOUT_FEEDBACK:
+      return ForceZenzLiveCorrection(command, /*bypass_automatic_feedback=*/true);
+    case keymap::ConversionState::REVERT_ZENZ_TO_MOZC:
+      return HasVisibleZenzLiveCorrection()
+                 ? RevertZenzLiveCorrectionToNormalConversion(command)
+                 : DoNothing(command);
+    case keymap::ConversionState::BACKSPACE:
+      // Backspace() edits the composer, not the visible kanji surface. An
+      // ordinary (non-live) conversion must first return to composition.
+      if (!live_conversion_active_ &&
+          context_->state() == ImeContext::CONVERSION &&
+          !ConvertCancel(command)) {
+        return false;
+      }
+      return Backspace(command);
     case keymap::ConversionState::INSERT_CHARACTER:
       return InsertCharacter(command);
 
@@ -4255,7 +3281,7 @@ bool Session::ExecuteConversionCommand(
       return IMEOff(command);
 
     case keymap::ConversionState::IME_ON:
-      return DoNothing(command);
+      return IMEOnWhenAlreadyOn(command);
 
     case keymap::ConversionState::CONVERT_TO_HIRAGANA:
       return ConvertToHiragana(command);
@@ -4318,7 +3344,7 @@ bool Session::ExecuteConversionCommand(
       return ReportBug(command);
 
     case keymap::ConversionState::DELETE_SELECTED_CANDIDATE:
-      return DeleteCandidateFromHistory(command);
+      return DeleteSelectedCandidate(command);
 
     case keymap::ConversionState::NONE:
       return DoNothing(command);
@@ -4354,15 +3380,18 @@ bool Session::SendKeyPrecompositionState(commands::Command* command) {
       return Revert(command);
     }
 
-    if (pending_direct_commit_learning_.pending &&
+    if ((pending_direct_commit_learning_.pending ||
+         pending_zenz_feedback_.pending) &&
         IsCancelKeyForCompositionOrConversion(command->input().key())) {
-      // A direct-commit punctuation/symbol may have already sent text to the
-      // application without creating Mozc's undo context.  In that case a
-      // cancel-like key such as Ctrl+Z should still cancel Mozkey's pending
-      // learning, while the key itself must be echoed back so that the
-      // application can decide how to undo the visible text.
+      // A direct-commit punctuation/symbol or accepted Zenz result may have
+      // already sent text to the application without creating Mozc's undo
+      // context. A cancel-like key such as Ctrl+Z should still cancel all
+      // pending learning/feedback, while the key itself is echoed back so
+      // that the application can undo the visible text.
       DiscardPendingDirectCommitLearning(
           "precomposition_cancel_key_after_direct_commit_learning");
+      DiscardPendingZenzFeedback(
+          "precomposition_cancel_key_after_pending_zenz_feedback");
       return EchoBackAndClearUndoContext(command);
     }
     return EchoBackAndClearUndoContext(command);
@@ -4397,11 +3426,26 @@ bool Session::SendKeyPrecompositionState(commands::Command* command) {
   return ExecuteCommandSequence(command_sequence, command);
 }
 
+namespace {
+bool IsPassiveLiveSuggestionCandidateWindow(
+    const commands::CandidateWindow& candidate_window);
+bool HaveSamePassiveSuggestionCandidates(
+    const commands::CandidateWindow& lhs,
+    const commands::CandidateWindow& rhs);
+}  // namespace
+
 bool Session::SendKeyCompositionState(commands::Command* command) {
   keymap::CommandSequence command_sequence;
   const keymap::KeyMapManager* keymap = &context_->GetKeyMapManager();
+  // During delayed live conversion, the real converter may still have an
+  // obsolete SUGGESTION state.  Select the keymap from the visible window.
+  const bool has_visible_suggestion =
+      live_conversion_pending_
+          ? IsPassiveLiveSuggestionCandidateWindow(
+                pending_live_conversion_suggestion_candidate_window_)
+          : context_->converter().CheckState(EngineConverterInterface::SUGGESTION);
   const bool result =
-      context_->converter().CheckState(EngineConverterInterface::SUGGESTION)
+      has_visible_suggestion
           ? keymap->GetCommandSequenceSuggestion(command->input().key(),
                                                  &command_sequence)
           : keymap->GetCommandSequenceComposition(command->input().key(),
@@ -4417,12 +3461,33 @@ bool Session::SendKeyCompositionState(commands::Command* command) {
 bool Session::SendKeyConversionState(commands::Command* command) {
   keymap::CommandSequence command_sequence;
   const keymap::KeyMapManager* keymap = &context_->GetKeyMapManager();
-  const bool result =
-      context_->converter().CheckState(EngineConverterInterface::PREDICTION)
-          ? keymap->GetCommandSequencePrediction(command->input().key(),
-                                                 &command_sequence)
-          : keymap->GetCommandSequenceConversion(command->input().key(),
+  const bool is_prediction =
+      context_->converter().CheckState(EngineConverterInterface::PREDICTION);
+  // Manual Zenz can temporarily use the live converter implementation even
+  // when use_live_conversion() is false.  Do not equate its internal flag with
+  // the user's live-conversion mode.
+  const bool live_keymap_active = live_conversion_active_ &&
+      live_conversion_from_composition_ &&
+      context_->GetConfig().use_live_conversion();
+  const bool zenz_visible = HasVisibleZenzLiveCorrection();
+  bool specialized_override = false;
+  bool result = false;
+  if (is_prediction) {
+    result = keymap->GetCommandSequencePrediction(command->input().key(),
                                                  &command_sequence);
+  } else if (zenz_visible && live_keymap_active) {
+    result = keymap->GetCommandSequenceZenzLiveConversion(
+        command->input().key(), &command_sequence, &specialized_override);
+  } else if (zenz_visible) {
+    result = keymap->GetCommandSequenceZenzConversion(
+        command->input().key(), &command_sequence, &specialized_override);
+  } else if (live_keymap_active) {
+    result = keymap->GetCommandSequenceLiveConversion(
+        command->input().key(), &command_sequence, &specialized_override);
+  } else {
+    result = keymap->GetCommandSequenceConversion(command->input().key(),
+                                                  &command_sequence);
+  }
 
   if (!result || command_sequence.empty()) {
     return DoNothing(command);
@@ -4466,13 +3531,66 @@ bool Session::SendKeyConversionState(commands::Command* command) {
       " mode=", input_key.has_mode() ? static_cast<int>(input_key.mode()) : -1,
       " input_style=", static_cast<int>(input_key.input_style())));
 
+  // Explicit user-selected return to the baseline. Handle before the
+  // generic live-conversion promotion clears the visible Zenz snapshot.
+  // Ordinary Conversion is preserved if the command is not applicable.
+  if (key_command == keymap::ConversionState::REVERT_ZENZ_TO_MOZC) {
+    return HasVisibleZenzLiveCorrection()
+               ? RevertZenzLiveCorrectionToNormalConversion(command)
+               : DoNothing(command);
+  }
+
+  // A standalone manual Zenz correction is not a candidate-navigation action.
+  // Avoid clearing live provenance before ForceZenzLiveCorrection captures it.
+  // Multi-step sequences retain their existing ordered-command semantics.
+  if ((key_command == keymap::ConversionState::FORCE_ZENZ_LIVE_CORRECTION ||
+       key_command == keymap::ConversionState::
+                          FORCE_ZENZ_LIVE_CORRECTION_WITHOUT_FEEDBACK) &&
+      command_sequence.size() == 1) {
+    return ExecuteCommandSequence(command_sequence, command);
+  }
+
+  // Honor an explicit editing command on any bound key. Keep the command
+  // sequence dispatcher responsible for executing macro continuations.
+  // This must precede generic live-conversion promotion/feedback rejection.
+  if (key_command == keymap::ConversionState::BACKSPACE) {
+    return ExecuteCommandSequence(command_sequence, command);
+  }
+
   if (live_conversion_active_) {
-    // During live conversion, Backspace should edit the underlying
-    // composition instead of cancelling conversion.
-    if (IsPlainBackspaceKey(command->input().key())) {
+    // Backward compatibility with older CUSTOM tables lacking a specialized
+    // Backspace row. Built-in maps now express this behavior explicitly in
+    // LiveConversion, and custom explicit overrides always win. Manual Zenz
+    // can temporarily set live_conversion_active_ even when it originated in
+    // ordinary conversion, where an inherited Cancel must remain Cancel.
+    if (live_keymap_active && IsPlainBackspaceKey(input_key) &&
+        key_command == keymap::ConversionState::CANCEL &&
+        !specialized_override) {
       DiscardPendingZenzFeedback("backspace_after_zenz");
-      ClearZenzLiveCorrectionState();
+      // Backspace() calls CancelLiveConversionForEditing(), which must see a
+      // deferred Zenz presentation before it is cleared so it can restore the
+      // actually visible preedit rather than the hidden Mozc result.
       return Backspace(command);
+    }
+
+    // In deferred-presentation mode, Enter must commit only the preedit the
+    // user actually saw.  The internal Mozc conversion is speculative until it
+    // has either been revealed explicitly or selected as the Zenz fallback.
+    if (key_command == keymap::ConversionState::COMMIT &&
+        HasDeferredZenzLivePresentation()) {
+      if (!CommitDeferredZenzLivePresentationForSubmit(command)) {
+        return false;
+      }
+
+      if (command_sequence.size() == 1) {
+        return true;
+      }
+
+      const commands::Output deferred_commit_output = command->output();
+      keymap::CommandSequence remaining_sequence(
+          command_sequence.begin() + 1, command_sequence.end());
+      return ExecuteCommandSequenceWithInitialOutput(
+          remaining_sequence, &deferred_commit_output, command);
     }
 
     // If a zenz correction is visible, Enter should commit the zenz value
@@ -4502,6 +3620,46 @@ bool Session::SendKeyConversionState(commands::Command* command) {
           remaining_sequence, &zenz_commit_output, command);
     }
 
+    // Cancelling a still-visible Zenz correction is not itself negative
+    // feedback. Preserve the exact Zenz observation across ConvertCancel(),
+    // then compare it with the user's eventual full commit. Requiring the
+    // reading to match prevents edits to the composition from being treated as
+    // rejection of the original correction.
+    if (key_command == keymap::ConversionState::CANCEL &&
+        HasVisibleZenzLiveCorrection()) {
+      const std::string cancelled_zenz_key = zenz_live_key_;
+      const std::string cancelled_zenz_context_class =
+          zenz_live_context_class_.empty()
+              ? "empty"
+              : zenz_live_context_class_;
+      const std::string cancelled_zenz_value = zenz_live_value_;
+
+      if (!ExecuteCommandSequence(command_sequence, command)) {
+        return false;
+      }
+
+      if (context_->state() == ImeContext::COMPOSITION &&
+          context_->composer().GetQueryForConversion() ==
+              cancelled_zenz_key) {
+        SetPendingZenzFeedbackComparison(
+            cancelled_zenz_key,
+            cancelled_zenz_context_class,
+            cancelled_zenz_value,
+            "cancel_visible_zenz_to_composition",
+            true);
+      }
+      return true;
+    }
+
+    // While a hidden Mozc result is waiting for Zenz, plain Space explicitly
+    // asks for normal Mozc conversion. Reveal the already-computed first Mozc
+    // result without advancing to the second candidate on the same keypress.
+    if (key_command == keymap::ConversionState::CONVERT_NEXT &&
+        IsPureSpaceKey(input_key) &&
+        HasDeferredZenzLivePresentation()) {
+      return RevealDeferredZenzLiveConversion(command);
+    }
+
     // While a zenz correction is visible, plain Space is an explicit
     // candidate-change operation.  Reject the speculative zenz layer and
     // restore the underlying Mozc conversion, but promote it to ordinary
@@ -4511,6 +3669,16 @@ bool Session::SendKeyConversionState(commands::Command* command) {
         IsPureSpaceKey(input_key) &&
         HasVisibleZenzLiveCorrection()) {
       return RevertZenzLiveCorrectionToNormalConversion(command);
+    }
+
+    // IME-off commits the current user-visible presentation before switching
+    // to direct input.  Do not let the generic conversion-command path clear a
+    // deferred or visible Zenz presentation first; Commit() already knows how
+    // to commit either presentation correctly.
+    if (key_command == keymap::ConversionState::IME_OFF &&
+        (HasDeferredZenzLivePresentation() ||
+         HasVisibleZenzLiveCorrection())) {
+      return ExecuteCommandSequence(command_sequence, command);
     }
 
     // A prediction key such as Tab should focus prediction candidates even while
@@ -4549,6 +3717,7 @@ bool Session::SendKeyConversionState(commands::Command* command) {
         ClearZenzLiveCorrectionState();
       }
       live_conversion_active_ = false;
+      live_conversion_from_composition_ = false;
       context_->mutable_converter()->SetCandidateListVisible(true);
     }
   }
@@ -4592,6 +3761,18 @@ bool Session::IMEOn(commands::Command* command) {
   }
   OutputMode(command);
   return true;
+}
+
+bool Session::IMEOnWhenAlreadyOn(commands::Command* command) {
+  const composer::Composer& composer = context_->composer();
+  // Shift-triggered ASCII mode is temporary.  Restore Japanese input without
+  // committing the existing preedit, which may contain both ASCII and kana.
+  // An explicitly selected HALF_ASCII mode has no distinct comeback mode.
+  if (composer.GetInputMode() == transliteration::HALF_ASCII &&
+      composer.GetComebackInputMode() != composer.GetInputMode()) {
+    return CompositionModeHiragana(command);
+  }
+  return DoNothing(command);
 }
 
 bool Session::IMEOff(commands::Command* command) {
@@ -4685,6 +3866,15 @@ bool Session::EchoBackAndClearUndoContext(commands::Command* command) {
 
   if (IsPendingZenzFeedbackDiscardKey(key_event)) {
     DiscardPendingZenzFeedback("echo_back_discard_key");
+  } else if (!IsPureModifierKeyEvent(key_event) &&
+             !IsCancelKeyForCompositionOrConversion(key_event)) {
+    // A finalized kCompareFinalCommit may be waiting for one more normal
+    // action before it is persisted so that an immediate Undo/Backspace can
+    // still neutralize the observation.  A pass-through key such as the
+    // second Enter in a search box is that normal action.  Confirm before the
+    // key is echoed to the application; otherwise navigation can destroy the
+    // session while the comparison is still only in memory.
+    ConfirmPendingZenzFeedback();
   }
 
   if (!IsPureModifierKeyEvent(key_event)) {
@@ -4739,9 +3929,9 @@ bool Session::Revert(commands::Command* command) {
 }
 
 bool Session::ResetContext(commands::Command* command) {
-  DiscardPendingDirectCommitLearning(
+  ConfirmPendingDirectCommitLearning(
       "reset_context_after_direct_commit_learning");
-  DiscardPendingZenzFeedback("reset_context_after_pending_feedback");
+  ConfirmPendingZenzFeedback();
 
   ClearPendingRerankedPreeditCommitAfterConvertCancel();
 
@@ -4820,10 +4010,15 @@ bool Session::RequestReconvertSelectionOrInsertSpace(
     return DoNothing(command);
   }
 
-  // Build the normal InsertSpace output first.  The TSF client will apply this
-  // output only when the application has no selected text.  When selected text
-  // exists, the callback is handled before the fallback output is applied.
-  if (!InsertSpace(command)) {
+  // The TSF client applies this output only when reconversion is unavailable.
+  // A half-width fallback must be committed by Mozkey: once OnTestKey reserves
+  // the physical Space, some clients will not deliver a pass-through key.
+  // Normal InsertSpaceHalfWidth behavior remains unchanged elsewhere.
+  const bool inserted =
+      IsFullWidthInsertSpace(command->input())
+          ? InsertSpaceFullWidth(command)
+          : InsertSpaceHalfWidth(command, /*allow_pass_through=*/false);
+  if (!inserted) {
     return false;
   }
 
@@ -4882,6 +4077,11 @@ bool Session::ConvertReverse(commands::Command* command) {
   SetSessionState(ImeContext::CONVERSION, context_.get());
   context_->mutable_converter()->SetCandidateListVisible(true);
   Output(command);
+  if (command_sequence_waits_for_reconversion_ &&
+      !pending_command_sequence_.empty()) {
+    command->mutable_output()->set_command_sequence_resume_generation(
+        command_sequence_generation_);
+  }
   return true;
 }
 
@@ -4931,8 +4131,12 @@ bool Session::Undo(commands::Command* command) {
     return DoNothing(command);
   }
 
-  // Rollback the last user history.
-  context_->mutable_converter()->Revert();
+  // Roll back converter learning only for commit paths that actually used the
+  // converter. Pending-display Submit commits a visible string directly and
+  // therefore has no converter learning to revert.
+  if (ShouldRevertConverterOnUndo()) {
+    context_->mutable_converter()->Revert();
+  }
 
   size_t result_size = 0;
   int32_t cursor_offset = 0;
@@ -4955,6 +4159,20 @@ bool Session::Undo(commands::Command* command) {
     range->set_length(result_size);
   }
 
+  if (live_conversion_pending_ &&
+      context_->state() == ImeContext::COMPOSITION) {
+    if (OutputPendingLiveConversion(command)) {
+      AttachCachedLiveConversionSuggestionCandidateWindow(
+          command->mutable_output());
+      AttachDelayedLiveConversionCallback(command);
+      return true;
+    }
+
+    // A corrupted or incompatible snapshot must degrade to ordinary
+    // composition rather than leave an unserviceable pending state.
+    CancelPendingLiveConversion();
+  }
+
   Output(command);
   return true;
 }
@@ -4972,15 +4190,82 @@ bool Session::SelectCandidateInternal(commands::Command* command) {
     LOG(WARNING) << "input.command or input.command.id did not exist.";
     return false;
   }
+  // Passive live suggestions belong to a cloned ImeContext, not the real
+  // converter.  Candidate IDs are local to their owning candidate list.  Never
+  // resolve a displayed suggestion ID against the hidden real converter.
+  if (live_conversion_pending_ || live_conversion_active_) {
+    const bool pending = live_conversion_pending_;
+    const commands::CandidateWindow& window =
+        pending ? pending_live_conversion_suggestion_candidate_window_
+                : live_conversion_suggestion_candidate_window_;
+    const ImeContext* suggestion_context =
+        pending ? pending_live_conversion_suggestion_context_.get()
+                : live_conversion_suggestion_context_.get();
+
+    if (!IsPassiveLiveSuggestionCandidateWindow(window) ||
+        suggestion_context == nullptr ||
+        suggestion_context->composer().GetQueryForConversion() !=
+            context_->composer().GetQueryForConversion()) {
+      return false;
+    }
+
+    commands::Output snapshot_output;
+    suggestion_context->converter().FillOutput(
+        suggestion_context->composer(), &snapshot_output);
+    if (!snapshot_output.has_candidate_window() ||
+        !HaveSamePassiveSuggestionCandidates(
+            window, snapshot_output.candidate_window())) {
+      return false;
+    }
+
+    bool id_is_visible = false;
+    for (const auto& candidate : window.candidate()) {
+      if (candidate.has_id() &&
+          candidate.id() == command->input().command().id()) {
+        id_is_visible = true;
+        break;
+      }
+    }
+    if (!id_is_visible) {
+      return false;
+    }
+
+    auto focused_context = std::make_unique<ImeContext>(*suggestion_context);
+    if (!focused_context->mutable_converter()
+             ->FocusSuggestionCandidateWithoutPrediction(
+                 command->input().command().id())) {
+      return false;
+    }
+    if (HasVisibleZenzLiveCorrection()) {
+      SetPendingZenzFeedbackRejected("candidate_selection_after_zenz");
+    }
+    ClearLiveConversionState();
+    context_ = std::move(focused_context);
+    command->mutable_output()->set_consumed(true);
+    SetSessionState(ImeContext::CONVERSION, context_.get());
+    return true;
+  }
+
   if (!context_->converter().IsActive()) {
     LOG(WARNING) << "converter is not active. (no candidates)";
     return false;
   }
 
+  // A candidate ID from the visible SUGGESTION list must be resolved
+  // against that very list, not against a newly generated PREDICTION list.
+  // FocusSuggestionCandidateWithoutPrediction also retains the provenance
+  // needed when the later commit uses EngineConverter::Commit().
+  if (context_->converter().CheckState(EngineConverterInterface::SUGGESTION)) {
+    if (!context_->mutable_converter()
+             ->FocusSuggestionCandidateWithoutPrediction(
+                 command->input().command().id())) {
+      return false;
+    }
+  } else {
+    context_->mutable_converter()->CandidateMoveToId(
+        command->input().command().id(), context_->composer());
+  }
   command->mutable_output()->set_consumed(true);
-
-  context_->mutable_converter()->CandidateMoveToId(
-      command->input().command().id(), context_->composer());
   SetSessionState(ImeContext::CONVERSION, context_.get());
 
   return true;
@@ -5004,13 +4289,122 @@ bool Session::CommitCandidate(commands::Command* command) {
     LOG(WARNING) << "input.command or input.command.id did not exist.";
     return false;
   }
-  if (!context_->converter().IsActive()) {
+
+  // Live conversion deliberately keeps the real converter in CONVERSION while
+  // rendering a passive SUGGESTION list generated from a cloned ImeContext.
+  // Therefore an ID from the visible suggestion window must never be resolved
+  // against the real converter: the same integer can identify an unrelated
+  // normal-conversion candidate.
+  const commands::CandidateWindow* passive_suggestion_window = nullptr;
+  std::unique_ptr<ImeContext>* passive_suggestion_context_owner = nullptr;
+
+  if (live_conversion_active_ &&
+      live_conversion_suggestion_candidate_window_.has_category() &&
+      live_conversion_suggestion_candidate_window_.category() ==
+          commands::SUGGESTION &&
+      live_conversion_suggestion_candidate_window_.candidate_size() > 0 &&
+      !live_conversion_suggestion_candidate_window_.has_focused_index()) {
+    passive_suggestion_window = &live_conversion_suggestion_candidate_window_;
+    passive_suggestion_context_owner =
+        &live_conversion_suggestion_context_;
+  } else if (
+      live_conversion_pending_ &&
+      pending_live_conversion_suggestion_candidate_window_.has_category() &&
+      pending_live_conversion_suggestion_candidate_window_.category() ==
+          commands::SUGGESTION &&
+      pending_live_conversion_suggestion_candidate_window_.candidate_size() >
+          0 &&
+      !pending_live_conversion_suggestion_candidate_window_
+           .has_focused_index()) {
+    passive_suggestion_window =
+        &pending_live_conversion_suggestion_candidate_window_;
+    passive_suggestion_context_owner =
+        &pending_live_conversion_suggestion_context_;
+  }
+
+  const commands::CandidateWindow::Candidate* passive_suggestion = nullptr;
+  if (passive_suggestion_window != nullptr) {
+    for (const auto& candidate : passive_suggestion_window->candidate()) {
+      if (candidate.has_id() && candidate.id() == input.command().id()) {
+        passive_suggestion = &candidate;
+        break;
+      }
+    }
+  }
+
+  // Even if an integer ID exists in the hidden converter, it must not be
+  // treated as a match for an absent/stale passive live suggestion.
+  if ((live_conversion_active_ || live_conversion_pending_) &&
+      passive_suggestion == nullptr) {
+    return DoNothing(command);
+  }
+
+  bool submit_passive_live_suggestion = false;
+  if (passive_suggestion != nullptr) {
+    if (passive_suggestion_context_owner == nullptr ||
+        *passive_suggestion_context_owner == nullptr) {
+      LOG(ERROR) << "passive suggestion context is missing";
+      return DoNothing(command);
+    }
+
+    ImeContext& passive_suggestion_context =
+        **passive_suggestion_context_owner;
+
+    // Verify that the stored semantic context still owns exactly the candidate
+    // the renderer displayed. If it does not, failing closed is safer than
+    // aliasing the ID into another converter state.
+    commands::Output suggestion_snapshot;
+    passive_suggestion_context.converter().FillOutput(
+        passive_suggestion_context.composer(), &suggestion_snapshot);
+
+    const commands::CandidateWindow::Candidate* snapshot_candidate = nullptr;
+    if (suggestion_snapshot.has_candidate_window() &&
+        suggestion_snapshot.candidate_window().category() ==
+            commands::SUGGESTION &&
+        !suggestion_snapshot.candidate_window().has_focused_index()) {
+      for (const auto& candidate :
+           suggestion_snapshot.candidate_window().candidate()) {
+        if (candidate.has_id() && candidate.id() == input.command().id()) {
+          snapshot_candidate = &candidate;
+          break;
+        }
+      }
+    }
+
+    if (snapshot_candidate == nullptr ||
+        snapshot_candidate->value() != passive_suggestion->value() ||
+        passive_suggestion_context.composer().GetQueryForConversion() !=
+            context_->composer().GetQueryForConversion()) {
+      LOG(ERROR) << "passive suggestion semantic snapshot mismatch";
+      return DoNothing(command);
+    }
+
+    submit_passive_live_suggestion = true;
+  }
+
+  if (!submit_passive_live_suggestion &&
+      !context_->converter().IsActive()) {
     LOG(WARNING) << "converter is not active. (no candidates)";
     return false;
   }
   command->mutable_output()->set_consumed(true);
 
   PushUndoContext();
+
+  if (submit_passive_live_suggestion) {
+    // Clicking a passive suggestion is an explicit override of the speculative
+    // live-conversion/Zenz presentation.  Switch to the exact cloned suggestion
+    // context that produced the displayed ID, then reuse the ordinary
+    // CommitSuggestionById path below.
+    if (HasVisibleZenzLiveCorrection()) {
+      SetPendingZenzFeedbackRejected("suggestion_click_after_zenz");
+    }
+
+    std::unique_ptr<ImeContext> suggestion_context =
+        std::move(*passive_suggestion_context_owner);
+    ClearLiveConversionState();
+    context_ = std::move(suggestion_context);
+  }
 
   if (context_->state() & ImeContext::CONVERSION) {
     // There is a focused candidate so just select a candidate based on
@@ -5095,6 +4489,8 @@ void Session::CancelPendingLiveConversion() {
   pending_live_conversion_key_.clear();
   pending_live_conversion_input_.Clear();
   pending_live_conversion_suggestion_candidate_window_.Clear();
+  pending_live_conversion_suggestion_context_.reset();
+  pending_live_conversion_holds_passive_suggestion_ = false;
   CancelPendingZenzLiveCorrection();
 }
 
@@ -5108,12 +4504,18 @@ void Session::ClearLiveConversionState() {
   ++live_conversion_generation_;
 
   live_conversion_active_ = false;
+
+  live_conversion_from_composition_ = false;
   live_conversion_pending_ = false;
   pending_live_conversion_generation_ = 0;
   pending_live_conversion_key_.clear();
   pending_live_conversion_input_.Clear();
   pending_live_conversion_suggestion_candidate_window_.Clear();
+  pending_live_conversion_suggestion_context_.reset();
+  pending_live_conversion_holds_passive_suggestion_ = false;
   live_conversion_suggestion_candidate_window_.Clear();
+  live_conversion_suggestion_context_.reset();
+  live_conversion_holds_passive_suggestion_ = false;
 
   live_conversion_key_.clear();
   live_conversion_corrected_key_.clear();
@@ -5121,11 +4523,19 @@ void Session::ClearLiveConversionState() {
   live_conversion_preedit_.clear();
   live_conversion_value_.clear();
   live_conversion_preedit_output_.Clear();
+  pending_live_conversion_presentation_.reset();
   live_conversion_protected_spans_.clear();
   ClearZenzLiveCorrectionState();
 }
 
 void Session::CancelLiveConversionForEditing() {
+  if (HasDeferredZenzLivePresentation()) {
+    RestoreDeferredZenzLivePresentationForEditing();
+    pending_live_conversion_presentation_.reset();
+    return;
+  }
+
+  pending_live_conversion_presentation_.reset();
   CancelPendingLiveConversion();
   ClearZenzLiveCorrectionState();
   live_conversion_corrected_key_.clear();
@@ -5136,17 +4546,108 @@ void Session::CancelLiveConversionForEditing() {
   }
 
   live_conversion_active_ = false;
+
+  live_conversion_from_composition_ = false;
   SetSessionState(ImeContext::COMPOSITION, context_.get());
   context_->mutable_converter()->Cancel();
 }
 
 namespace {
+bool IsPassiveLiveSuggestionCandidateWindow(
+    const commands::CandidateWindow& candidate_window) {
+  return candidate_window.has_category() &&
+         candidate_window.category() == commands::SUGGESTION &&
+         candidate_window.candidate_size() > 0 &&
+         !candidate_window.has_focused_index();
+}
+
+constexpr size_t kMaxPendingRomanLengthForSuggestionRefresh = 2;
+
+bool ShouldHoldSuggestionForPendingRoman(
+    const composer::Composer& composer) {
+  const size_t pending_length = composer.GetPendingRomanInputLength();
+  if (pending_length == 0) {
+    return false;
+  }
+
+  // Only the first unresolved Roman sequence of a fresh composition is allowed
+  // to refresh suggestion, and only through two characters (e.g. "s" -> "sh",
+  // "k" -> "ky"). Once a fixed reading exists before the suffix, even the
+  // first pending character holds the previously displayed suggestion.
+  if (!composer.IsPendingRomanInputAtCompositionStart()) {
+    return true;
+  }
+
+  return pending_length > kMaxPendingRomanLengthForSuggestionRefresh;
+}
+
+bool IsPendingRomanSuggestionHoldKey(const commands::KeyEvent& key) {
+  if (!key.has_key_code() || key.has_key_string() ||
+      key.input_style() != commands::KeyEvent::FOLLOW_MODE ||
+      key.modifier_keys_size() != 0 ||
+      (key.has_modifiers() && key.modifiers() != 0)) {
+    return false;
+  }
+
+  // Only an unmodified physical lower-case Roman key is eligible.  Modifier
+  // combinations such as Ctrl+a can preserve a lower-case key_code while also
+  // carrying modifier_keys, so they must be excluded explicitly rather than
+  // inferred from key_code casing.
+  const uint32_t key_code = key.key_code();
+  return key_code >= static_cast<uint32_t>('a') &&
+         key_code <= static_cast<uint32_t>('z');
+}
+
+bool HaveSamePassiveSuggestionCandidates(
+    const commands::CandidateWindow& lhs,
+    const commands::CandidateWindow& rhs) {
+  if (!IsPassiveLiveSuggestionCandidateWindow(lhs) ||
+      !IsPassiveLiveSuggestionCandidateWindow(rhs) ||
+      lhs.candidate_size() != rhs.candidate_size()) {
+    return false;
+  }
+
+  for (int i = 0; i < lhs.candidate_size(); ++i) {
+    const commands::CandidateWindow::Candidate& lhs_candidate =
+        lhs.candidate(i);
+    const commands::CandidateWindow::Candidate& rhs_candidate =
+        rhs.candidate(i);
+
+    if (lhs_candidate.has_id() != rhs_candidate.has_id() ||
+        (lhs_candidate.has_id() &&
+         lhs_candidate.id() != rhs_candidate.id()) ||
+        lhs_candidate.value() != rhs_candidate.value()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool ShouldSuppressShiftedAsciiAutoSuggestion(
     const config::Config& config,
     const composer::Composer& composer);
 }  // namespace
 
 bool Session::MaybeStartLiveConversion(commands::Command* command) {
+  return MaybeStartLiveConversionInternal(
+      command, /*allow_zenz_live_correction=*/true,
+      /*held_suggestion=*/nullptr);
+}
+
+bool Session::MaybeStartLiveConversionAfterEditing(
+    commands::Command* command) {
+  const config::Config& config = context_->GetConfig();
+  const bool suppress_zenz_for_edit =
+      config.use_zenz_live_correction() &&
+      config.defer_live_conversion_display_until_zenz_result();
+  return MaybeStartLiveConversionInternal(
+      command, /*allow_zenz_live_correction=*/!suppress_zenz_for_edit,
+      /*held_suggestion=*/nullptr);
+}
+
+bool Session::MaybeStartLiveConversionInternal(
+    commands::Command* command, const bool allow_zenz_live_correction,
+    PassiveSuggestionSnapshot* held_suggestion) {
   if (!context_->GetConfig().use_live_conversion()) {
     return false;
   }
@@ -5173,7 +4674,6 @@ bool Session::MaybeStartLiveConversion(commands::Command* command) {
 
   if (ShouldSkipLiveConversionForCompositionKey(
           live_conversion_key,
-          GetLiveConversionCommittedLeftBoundary(*context_),
           GetLiveConversionMinKeyLength(context_->GetConfig())) ||
       length != context_->composer().GetCursor()) {
     return false;
@@ -5183,6 +4683,56 @@ bool Session::MaybeStartLiveConversion(commands::Command* command) {
   // source for the next pending-suffix display.
   const std::string live_conversion_preedit =
       context_->composer().GetStringForPreedit();
+
+  // In deferred-presentation mode, Mozc still runs first because its result is
+  // the Zenz baseline, validation reference, and fallback. Preserve the last
+  // presentation the user actually saw, but do not construct the next visible
+  // snapshot yet. A romaji key can rewrite the current chunk in place, so the
+  // safe reusable prefix must be determined against the *new* Mozc segments
+  // produced by Convert(), not against the previous hidden Mozc result.
+  std::optional<DeferredZenzLivePresentation> deferred_zenz_presentation;
+  const config::Config& config = context_->GetConfig();
+  if (allow_zenz_live_correction && config.use_zenz_live_correction() &&
+      config.defer_live_conversion_display_until_zenz_result()) {
+    DeferredZenzLivePresentation state;
+    state.previous_live_key = live_conversion_key_;
+    state.previous_live_preedit = live_conversion_preedit_;
+    state.previous_live_value = live_conversion_value_;
+    state.previous_live_preedit_output = live_conversion_preedit_output_;
+    state.previous_live_suggestion_candidate_window =
+        live_conversion_suggestion_candidate_window_;
+    if (IsPassiveLiveSuggestionCandidateWindow(
+            state.previous_live_suggestion_candidate_window) &&
+        live_conversion_suggestion_context_ != nullptr) {
+      state.previous_live_suggestion_context =
+          std::make_unique<ImeContext>(*live_conversion_suggestion_context_);
+    } else {
+      state.previous_live_suggestion_candidate_window.Clear();
+    }
+
+    if (pending_live_conversion_presentation_.has_value()) {
+      // Keep the full previous visible basis even when the current composition
+      // is no longer a textual prefix of it. After Convert(), the new Mozc
+      // segment boundaries may still prove that a leading part is safe to
+      // preserve.
+      state.continued_input_presentation =
+          *pending_live_conversion_presentation_;
+    } else if (!live_conversion_key_.empty() &&
+               !live_conversion_preedit_.empty() &&
+               !live_conversion_value_.empty() &&
+               live_conversion_preedit_output_.segment_size() > 0) {
+      PendingLiveConversionPresentation presentation;
+      presentation.key = live_conversion_key_;
+      presentation.raw_preedit = live_conversion_preedit_;
+      presentation.value = live_conversion_value_;
+      presentation.preedit_output = live_conversion_preedit_output_;
+      presentation.stable_spans =
+          BuildStablePresentationSpans(presentation.value);
+      state.continued_input_presentation = std::move(presentation);
+    }
+
+    deferred_zenz_presentation = std::move(state);
+  }
 
   // Delayed live-conversion callbacks are SEND_COMMAND inputs and may not carry
   // the same request_suggestion/context data as the original SEND_KEY input.
@@ -5195,17 +4745,30 @@ bool Session::MaybeStartLiveConversion(commands::Command* command) {
   const commands::Input live_conversion_suggestion_input =
       use_pending_live_conversion_input ? pending_live_conversion_input_
                                         : command->input();
-  const commands::CandidateWindow
-      pending_live_conversion_suggestion_candidate_window =
-          pending_live_conversion_suggestion_candidate_window_;
+  commands::CandidateWindow pending_live_conversion_suggestion_candidate_window =
+      std::move(pending_live_conversion_suggestion_candidate_window_);
+  std::unique_ptr<ImeContext> pending_live_conversion_suggestion_context =
+      std::move(pending_live_conversion_suggestion_context_);
+  const bool should_hold_pending_roman_suggestion =
+      held_suggestion != nullptr ||
+      (live_conversion_pending_ &&
+       pending_live_conversion_holds_passive_suggestion_);
 
   live_conversion_pending_ = false;
   pending_live_conversion_generation_ = 0;
   pending_live_conversion_key_.clear();
   pending_live_conversion_input_.Clear();
   pending_live_conversion_suggestion_candidate_window_.Clear();
+  pending_live_conversion_suggestion_context_.reset();
+  pending_live_conversion_holds_passive_suggestion_ = false;
 
-  if (!context_->mutable_converter()->Convert(context_->composer())) {
+  // Keep ZIP lookup enabled during live conversion, while keeping the
+  // numeric literal first. Space can then navigate the SAME candidate set.
+  ConversionPreferences live_preferences =
+      context_->converter().conversion_preferences();
+  live_preferences.prefer_zipcode_literal_top = true;
+  if (!context_->mutable_converter()->ConvertWithPreferences(
+          context_->composer(), live_preferences)) {
     live_conversion_corrected_key_.clear();
     live_conversion_corrected_raw_.clear();
     if (ShouldKeepPendingLiveConversionForTransientSokuon(live_conversion_key) &&
@@ -5214,12 +4777,20 @@ bool Session::MaybeStartLiveConversion(commands::Command* command) {
       return true;
     }
 
+    pending_live_conversion_presentation_.reset();
     OutputComposition(command);
     return true;
   }
 
-  SetSessionState(ImeContext::CONVERSION, context_.get());
+  // Live conversion is a temporary view of the same ongoing composition.
+  // SetSessionState(CONVERSION) also calls Composer::ResetInputMode(), which
+  // marks the next key as a new input. That separates a pending roman suffix
+  // from a following symbol without its own table rule (e.g. n + ')'), even
+  // when the custom table contains a combined rule such as n) -> ん）.
+  // Preserve the composer input mode and chunk continuity for further typing.
+  context_->set_state(ImeContext::CONVERSION);
   live_conversion_active_ = true;
+  live_conversion_from_composition_ = true;
 
   // Keep the candidate list visible internally so that the Windows renderer is
   // updated.
@@ -5261,6 +4832,7 @@ bool Session::MaybeStartLiveConversion(commands::Command* command) {
     live_conversion_value_ = context_->composer().GetStringForSubmission();
   }
 
+  pending_live_conversion_presentation_.reset();
   live_conversion_protected_spans_.clear();
   if (context_->GetConfig().use_zenz_live_correction()) {
     live_conversion_protected_spans_ = BuildZenzProtectedConversionSpans(
@@ -5270,40 +4842,313 @@ bool Session::MaybeStartLiveConversion(commands::Command* command) {
 
   ClearZenzLiveCorrectionState();
 
-  if (MaybeApplyZenzFeedbackLiveCorrection(command)) {
-    return true;
-  }
-
+  // Passive suggestion belongs to the current composer query and must be
+  // materialized before any synchronous Zenz feedback fast-path can replace
+  // the preedit. Otherwise a feedback hit skips Suggest() entirely and either
+  // hides the suggestion or leaves a renderer-specific stale window behind.
   const bool should_suppress_shifted_ascii_suggestion =
       ShouldSuppressShiftedAsciiAutoSuggestion(context_->GetConfig(),
                                                context_->composer());
 
+  live_conversion_holds_passive_suggestion_ = false;
+
   if (should_suppress_shifted_ascii_suggestion) {
     live_conversion_suggestion_candidate_window_.Clear();
     pending_live_conversion_suggestion_candidate_window_.Clear();
+    live_conversion_suggestion_context_.reset();
+    pending_live_conversion_suggestion_context_.reset();
     command->mutable_output()->clear_candidate_window();
+  } else if (should_hold_pending_roman_suggestion) {
+    PassiveSuggestionSnapshot fallback_snapshot;
+    PassiveSuggestionSnapshot* snapshot = held_suggestion;
+
+    if ((snapshot == nullptr || snapshot->context == nullptr) &&
+        IsPassiveLiveSuggestionCandidateWindow(
+            pending_live_conversion_suggestion_candidate_window) &&
+        pending_live_conversion_suggestion_context != nullptr) {
+      fallback_snapshot.candidate_window =
+          std::move(pending_live_conversion_suggestion_candidate_window);
+      fallback_snapshot.context =
+          std::move(pending_live_conversion_suggestion_context);
+      snapshot = &fallback_snapshot;
+    }
+
+    if ((snapshot == nullptr || snapshot->context == nullptr) &&
+        IsPassiveLiveSuggestionCandidateWindow(
+            live_conversion_suggestion_candidate_window_) &&
+        live_conversion_suggestion_context_ != nullptr) {
+      fallback_snapshot.candidate_window =
+          std::move(live_conversion_suggestion_candidate_window_);
+      fallback_snapshot.context =
+          std::move(live_conversion_suggestion_context_);
+      snapshot = &fallback_snapshot;
+    }
+
+    live_conversion_suggestion_candidate_window_.Clear();
+    live_conversion_suggestion_context_.reset();
+
+    if (snapshot != nullptr &&
+        AttachPassiveSuggestionSnapshot(
+            live_conversion_suggestion_input, snapshot,
+            command->mutable_output())) {
+      live_conversion_suggestion_candidate_window_ =
+          snapshot->candidate_window;
+      live_conversion_suggestion_context_ =
+          std::move(snapshot->context);
+      live_conversion_holds_passive_suggestion_ = true;
+    } else {
+      command->mutable_output()->clear_candidate_window();
+    }
   } else if (
       !AttachLiveConversionSuggestionCandidateWindow(
           live_conversion_suggestion_input, command->mutable_output()) &&
       pending_live_conversion_suggestion_candidate_window.candidate_size() > 0) {
+    // A delayed-live-conversion suggestion may only be reused with the exact
+    // cloned context that produced its candidate IDs.
     live_conversion_suggestion_candidate_window_ =
-        pending_live_conversion_suggestion_candidate_window;
-    *command->mutable_output()->mutable_candidate_window() =
-        live_conversion_suggestion_candidate_window_;
+        std::move(pending_live_conversion_suggestion_candidate_window);
+    live_conversion_suggestion_context_ =
+        std::move(pending_live_conversion_suggestion_context);
+    AttachCachedLiveConversionSuggestionCandidateWindow(
+        command->mutable_output());
   }
-  MaybeScheduleZenzLiveCorrection(command);
+
+  if (allow_zenz_live_correction &&
+      MaybeApplyZenzFeedbackLiveCorrection(command)) {
+    return true;
+  }
+
+  const bool zenz_scheduled =
+      allow_zenz_live_correction && MaybeScheduleZenzLiveCorrection(command);
+  if (zenz_scheduled && deferred_zenz_presentation.has_value()) {
+    DeferredZenzLivePresentation& state = *deferred_zenz_presentation;
+
+    commands::Command visible_command;
+    *visible_command.mutable_input() = command->input();
+
+    PendingLiveConversionPresentation stable_presentation;
+    bool built_from_previous_presentation = false;
+    if (state.continued_input_presentation.has_value()) {
+      built_from_previous_presentation =
+          OutputPendingLiveConversionWithPresentation(
+              &visible_command, &*state.continued_input_presentation,
+              &stable_presentation);
+    }
+
+    if (!built_from_previous_presentation) {
+      // There is no provably reusable visible prefix. Raw composition is the
+      // truthful fallback, but only after the new Mozc result has had a chance
+      // to establish safe segment boundaries.
+      OutputComposition(&visible_command);
+      state.continued_input_presentation.reset();
+    } else if (!stable_presentation.key.empty() &&
+               !stable_presentation.raw_preedit.empty() &&
+               !stable_presentation.value.empty() &&
+               stable_presentation.preedit_output.segment_size() > 0) {
+      // Preserve exactly the basis that was proven safe against the new Mozc
+      // result. This may be a shorter segment prefix than the old visible
+      // presentation and must survive transient romaji rewrites on the next
+      // key event.
+      state.continued_input_presentation =
+          std::move(stable_presentation);
+    } else {
+      state.continued_input_presentation.reset();
+    }
+
+    if (visible_command.output().has_preedit()) {
+      state.visible_preedit = visible_command.output().preedit();
+      state.visible_raw_preedit = live_conversion_preedit;
+      state.visible_key = live_conversion_key;
+
+      std::string unused_visible_key;
+      ExtractPreeditKeyAndValue(
+          visible_command.output().preedit(),
+          &unused_visible_key, &state.visible_value);
+
+      deferred_zenz_live_presentation_ = std::move(state);
+      OverrideOutputWithDeferredZenzLivePresentation(command);
+    }
+  }
   return true;
 }
 
 bool Session::OutputPendingLiveConversion(commands::Command* command) const {
+  const PendingLiveConversionPresentation* presentation =
+      pending_live_conversion_presentation_.has_value()
+          ? &*pending_live_conversion_presentation_
+          : nullptr;
+  return OutputPendingLiveConversionWithPresentation(
+      command, presentation, nullptr);
+}
+
+bool Session::OutputPendingLiveConversionWithPresentation(
+    commands::Command* command,
+    const PendingLiveConversionPresentation* presentation,
+    PendingLiveConversionPresentation* stable_presentation) const {
+  if (stable_presentation != nullptr) {
+    *stable_presentation = PendingLiveConversionPresentation();
+  }
+
   const std::string current_key = context_->composer().GetQueryForConversion();
   const std::string raw_preedit = context_->composer().GetStringForPreedit();
 
+  const std::string* stable_key = &live_conversion_key_;
+  const std::string* stable_raw_preedit = &live_conversion_preedit_;
+  const std::string* stable_value = &live_conversion_value_;
+  const commands::Preedit* stable_preedit_output =
+      &live_conversion_preedit_output_;
+  const std::vector<StablePresentationSpan>* stable_spans = nullptr;
+  bool selected_visible_presentation = false;
+
+  // A visible Zenz presentation is synthetic and may later cease to be a
+  // textual prefix when the trailing romaji chunk is rewritten in place.  Do
+  // not ask the *new* Mozc segmentation to rediscover the old display
+  // boundary.  First reuse the leading key/value spans that were already
+  // proven by the Mozc result that existed when the visible presentation was
+  // captured.  Each span is indivisible: a character-level common prefix is
+  // never treated as a reading/value correspondence.
+  std::optional<PendingLiveConversionPresentation>
+      safe_common_prefix_presentation;
+
+  if (presentation != nullptr) {
+    if (StartsWithString(current_key, presentation->key) &&
+        StartsWithString(raw_preedit, presentation->raw_preedit)) {
+      stable_key = &presentation->key;
+      stable_raw_preedit = &presentation->raw_preedit;
+      stable_value = &presentation->value;
+      stable_preedit_output = &presentation->preedit_output;
+      stable_spans = &presentation->stable_spans;
+      selected_visible_presentation = true;
+    } else if (!presentation->stable_spans.empty()) {
+      PendingLiveConversionPresentation prefix;
+      std::string prefix_key;
+      std::string prefix_raw_preedit;
+      std::string prefix_value;
+
+      for (const StablePresentationSpan& span : presentation->stable_spans) {
+        const std::string next_key = absl::StrCat(prefix_key, span.key);
+        const std::string next_raw_preedit =
+            absl::StrCat(prefix_raw_preedit, span.raw_preedit);
+        const std::string next_value = absl::StrCat(prefix_value, span.value);
+
+        if (!StartsWithString(presentation->key, next_key) ||
+            !StartsWithString(presentation->raw_preedit, next_raw_preedit) ||
+            !StartsWithString(presentation->value, next_value) ||
+            !StartsWithString(current_key, next_key) ||
+            !StartsWithString(raw_preedit, next_raw_preedit)) {
+          break;
+        }
+
+        prefix_key = next_key;
+        prefix_raw_preedit = next_raw_preedit;
+        prefix_value = next_value;
+        prefix.key = prefix_key;
+        prefix.raw_preedit = prefix_raw_preedit;
+        prefix.value = prefix_value;
+        *prefix.preedit_output.add_segment() = span.preedit_segment;
+        prefix.stable_spans.push_back(span);
+      }
+
+      if (!prefix.key.empty() && !prefix.raw_preedit.empty() &&
+          !prefix.value.empty() && prefix.preedit_output.segment_size() > 0) {
+        prefix.preedit_output.set_cursor(Util::CharsLen(prefix.value));
+        safe_common_prefix_presentation = std::move(prefix);
+
+        stable_key = &safe_common_prefix_presentation->key;
+        stable_raw_preedit =
+            &safe_common_prefix_presentation->raw_preedit;
+        stable_value = &safe_common_prefix_presentation->value;
+        stable_preedit_output =
+            &safe_common_prefix_presentation->preedit_output;
+        stable_spans = &safe_common_prefix_presentation->stable_spans;
+        selected_visible_presentation = true;
+      }
+    }
+
+    // Older presentations do not necessarily have stable spans yet.  Keep the
+    // post-Convert outer-segment salvage as a conservative fallback, but only
+    // when no previously proven span survived.  This fallback never splits a
+    // converter segment and therefore cannot invent a key/value boundary.
+    if (!selected_visible_presentation && !presentation->value.empty() &&
+        !live_conversion_key_.empty() && !live_conversion_preedit_.empty() &&
+        live_conversion_preedit_output_.segment_size() > 0) {
+      PendingLiveConversionPresentation prefix;
+      std::string prefix_value;
+      std::string prefix_raw_preedit;
+      size_t prefix_key_chars = 0;
+
+      const size_t live_key_chars = Util::CharsLen(live_conversion_key_);
+      for (int i = 0; i < live_conversion_preedit_output_.segment_size(); ++i) {
+        const commands::Preedit::Segment& segment =
+            live_conversion_preedit_output_.segment(i);
+        if (!segment.has_key() || segment.key().empty() ||
+            segment.value().empty()) {
+          break;
+        }
+
+        const std::string next_value =
+            absl::StrCat(prefix_value, segment.value());
+        if (!StartsWithString(presentation->value, next_value)) {
+          break;
+        }
+
+        const std::string next_raw_preedit =
+            absl::StrCat(prefix_raw_preedit, segment.key());
+        const size_t segment_key_chars = Util::CharsLen(segment.key());
+        const size_t next_key_chars = prefix_key_chars + segment_key_chars;
+        if (next_key_chars > live_key_chars) {
+          break;
+        }
+
+        const std::string next_key = std::string(
+            Util::Utf8SubString(live_conversion_key_, 0, next_key_chars));
+
+        if (!StartsWithString(live_conversion_preedit_, next_raw_preedit) ||
+            !StartsWithString(presentation->key, next_key) ||
+            !StartsWithString(presentation->raw_preedit, next_raw_preedit) ||
+            !StartsWithString(current_key, next_key) ||
+            !StartsWithString(raw_preedit, next_raw_preedit)) {
+          break;
+        }
+
+        StablePresentationSpan span;
+        span.key = std::string(Util::Utf8SubString(
+            live_conversion_key_, prefix_key_chars, segment_key_chars));
+        span.raw_preedit = segment.key();
+        span.value = segment.value();
+        span.preedit_segment = segment;
+
+        prefix.key = next_key;
+        prefix.raw_preedit = next_raw_preedit;
+        prefix.value = next_value;
+        *prefix.preedit_output.add_segment() = segment;
+        prefix.stable_spans.push_back(std::move(span));
+
+        prefix_value = next_value;
+        prefix_raw_preedit = next_raw_preedit;
+        prefix_key_chars = next_key_chars;
+      }
+
+      if (!prefix.key.empty() && !prefix.raw_preedit.empty() &&
+          !prefix.value.empty() && prefix.preedit_output.segment_size() > 0) {
+        prefix.preedit_output.set_cursor(Util::CharsLen(prefix.value));
+        safe_common_prefix_presentation = std::move(prefix);
+
+        stable_key = &safe_common_prefix_presentation->key;
+        stable_raw_preedit =
+            &safe_common_prefix_presentation->raw_preedit;
+        stable_value = &safe_common_prefix_presentation->value;
+        stable_preedit_output =
+            &safe_common_prefix_presentation->preedit_output;
+        stable_spans = &safe_common_prefix_presentation->stable_spans;
+        selected_visible_presentation = true;
+      }
+    }
+  }
+
   const bool has_stable_live_conversion =
-      !live_conversion_key_.empty() &&
-      !live_conversion_preedit_.empty() &&
-      !live_conversion_value_.empty() &&
-      live_conversion_preedit_output_.segment_size() > 0;
+      !stable_key->empty() && !stable_raw_preedit->empty() &&
+      !stable_value->empty() && stable_preedit_output->segment_size() > 0;
 
   // First composition after starting IME has no stable converted prefix yet.
   // In that case, raw pending display is expected and should still be debounced.
@@ -5312,8 +5157,7 @@ bool Session::OutputPendingLiveConversion(commands::Command* command) const {
 
     if (command->output().has_preedit()) {
       RestorePreeditSegmentKeysForSymbolStyle(
-          raw_preedit,
-          command->mutable_output()->mutable_preedit());
+          raw_preedit, command->mutable_output()->mutable_preedit());
     }
 
     commands::Output* output = command->mutable_output();
@@ -5325,15 +5169,14 @@ bool Session::OutputPendingLiveConversion(commands::Command* command) const {
 
   // If stable-prefix composition cannot be built safely, do not fall back to
   // raw hiragana. The caller should immediately run live conversion instead.
-  if (!StartsWithString(current_key, live_conversion_key_) ||
-      !StartsWithString(raw_preedit, live_conversion_preedit_)) {
+  if (!StartsWithString(current_key, *stable_key) ||
+      !StartsWithString(raw_preedit, *stable_raw_preedit)) {
     return false;
   }
 
-  const std::string suffix_key =
-      current_key.substr(live_conversion_key_.size());
+  const std::string suffix_key = current_key.substr(stable_key->size());
   const std::string suffix_value =
-      raw_preedit.substr(live_conversion_preedit_.size());
+      raw_preedit.substr(stable_raw_preedit->size());
 
   OutputComposition(command);
 
@@ -5345,26 +5188,242 @@ bool Session::OutputPendingLiveConversion(commands::Command* command) const {
   commands::Preedit* preedit = output->mutable_preedit();
   preedit->Clear();
 
-  // Reuse the exact segment structure and annotations from the latest real
-  // live conversion. This avoids flickering between UNDERLINE and HIGHLIGHT
-  // display attributes.
-  for (int i = 0; i < live_conversion_preedit_output_.segment_size(); ++i) {
-    *preedit->add_segment() = live_conversion_preedit_output_.segment(i);
+  // Reuse the exact segment structure and annotations from the presentation
+  // that proved this prefix. This avoids flickering between UNDERLINE and
+  // HIGHLIGHT display attributes.
+  for (int i = 0; i < stable_preedit_output->segment_size(); ++i) {
+    *preedit->add_segment() = stable_preedit_output->segment(i);
   }
 
   if (!suffix_value.empty()) {
-    AddPreeditSegment(suffix_key.empty() ? suffix_value : suffix_key,
-                      suffix_value,
-                      commands::Preedit::Segment::UNDERLINE,
-                      preedit);
+    AddPreeditSegmentWithPendingRomanTail(
+        suffix_key.empty() ? suffix_value : suffix_key, suffix_value,
+        context_->composer().GetPendingRomanDisplayLength(), preedit);
   }
 
   RestorePreeditSegmentKeysForSymbolStyle(raw_preedit, preedit);
 
-  preedit->set_cursor(Util::CharsLen(live_conversion_value_) +
+  preedit->set_cursor(Util::CharsLen(*stable_value) +
                       Util::CharsLen(suffix_value));
 
+  if (stable_presentation != nullptr) {
+    stable_presentation->key = *stable_key;
+    stable_presentation->raw_preedit = *stable_raw_preedit;
+    stable_presentation->value = *stable_value;
+    stable_presentation->preedit_output = *stable_preedit_output;
+    if (stable_spans != nullptr) {
+      stable_presentation->stable_spans = *stable_spans;
+    } else {
+      stable_presentation->stable_spans =
+          BuildStablePresentationSpans(*stable_value);
+    }
+  }
+
   return true;
+}
+
+std::vector<Session::StablePresentationSpan>
+Session::BuildStablePresentationSpans(absl::string_view visible_value) const {
+  return MergeStablePresentationSpans(visible_value, {});
+}
+
+std::vector<Session::StablePresentationSpan>
+Session::MergeStablePresentationSpans(
+    absl::string_view visible_value,
+    const std::vector<StablePresentationSpan>& previous_spans) const {
+  std::vector<StablePresentationSpan> spans;
+  if (visible_value.empty() || live_conversion_key_.empty() ||
+      live_conversion_preedit_.empty() ||
+      live_conversion_preedit_output_.segment_size() == 0) {
+    return spans;
+  }
+
+  std::string prefix_key;
+  std::string prefix_raw_preedit;
+  std::string prefix_value;
+  size_t prefix_key_chars = 0;
+
+  // Keep the longest leading sequence of previously proven spans that still
+  // matches both the current reading and the newly visible Zenz value.  The
+  // spans are indivisible: if a span changes anywhere, discard that span and
+  // everything after it instead of taking a character-level common prefix.
+  for (const StablePresentationSpan& span : previous_spans) {
+    if (span.key.empty() || span.raw_preedit.empty() || span.value.empty() ||
+        !span.preedit_segment.has_key() ||
+        span.preedit_segment.key() != span.raw_preedit ||
+        span.preedit_segment.value() != span.value) {
+      break;
+    }
+
+    const std::string next_key = absl::StrCat(prefix_key, span.key);
+    const std::string next_raw_preedit =
+        absl::StrCat(prefix_raw_preedit, span.raw_preedit);
+    const std::string next_value = absl::StrCat(prefix_value, span.value);
+    if (!StartsWithString(live_conversion_key_, next_key) ||
+        !StartsWithString(live_conversion_preedit_, next_raw_preedit) ||
+        !StartsWithString(visible_value, next_value)) {
+      break;
+    }
+
+    spans.push_back(span);
+    prefix_key = next_key;
+    prefix_raw_preedit = next_raw_preedit;
+    prefix_value = next_value;
+    prefix_key_chars += Util::CharsLen(span.key);
+  }
+
+  // The latest Mozc result may be more coarsely segmented than the retained
+  // spans.  It must never coarsen or replace a still-valid old span.  New Mozc
+  // segments are therefore used only to extend the proven prefix when one of
+  // their boundaries lands exactly at the end of the retained prefix.
+  int extension_begin = 0;
+  if (!spans.empty()) {
+    std::string mozc_raw_preedit;
+    size_t mozc_key_chars = 0;
+    bool found_exact_boundary = false;
+
+    for (int i = 0; i < live_conversion_preedit_output_.segment_size(); ++i) {
+      const commands::Preedit::Segment& segment =
+          live_conversion_preedit_output_.segment(i);
+      if (!segment.has_key() || segment.key().empty()) {
+        return spans;
+      }
+
+      mozc_raw_preedit.append(segment.key());
+      mozc_key_chars += Util::CharsLen(segment.key());
+      if (mozc_key_chars > prefix_key_chars ||
+          mozc_raw_preedit.size() > prefix_raw_preedit.size()) {
+        return spans;
+      }
+
+      if (mozc_key_chars == prefix_key_chars &&
+          mozc_raw_preedit == prefix_raw_preedit) {
+        const std::string mozc_key = std::string(
+            Util::Utf8SubString(live_conversion_key_, 0, mozc_key_chars));
+        if (mozc_key != prefix_key) {
+          return spans;
+        }
+        extension_begin = i + 1;
+        found_exact_boundary = true;
+        break;
+      }
+    }
+
+    if (!found_exact_boundary) {
+      return spans;
+    }
+  }
+
+  const size_t live_key_chars = Util::CharsLen(live_conversion_key_);
+  for (int i = extension_begin;
+       i < live_conversion_preedit_output_.segment_size(); ++i) {
+    const commands::Preedit::Segment& segment =
+        live_conversion_preedit_output_.segment(i);
+    if (!segment.has_key() || segment.key().empty() ||
+        segment.value().empty()) {
+      break;
+    }
+
+    const size_t segment_key_chars = Util::CharsLen(segment.key());
+    const size_t next_key_chars = prefix_key_chars + segment_key_chars;
+    const std::string next_raw_preedit =
+        absl::StrCat(prefix_raw_preedit, segment.key());
+    const std::string next_value =
+        absl::StrCat(prefix_value, segment.value());
+    if (next_key_chars > live_key_chars ||
+        !StartsWithString(live_conversion_preedit_, next_raw_preedit) ||
+        !StartsWithString(visible_value, next_value)) {
+      break;
+    }
+
+    const std::string next_key = std::string(
+        Util::Utf8SubString(live_conversion_key_, 0, next_key_chars));
+    if (!StartsWithString(live_conversion_key_, next_key)) {
+      break;
+    }
+
+    StablePresentationSpan span;
+    span.key = std::string(Util::Utf8SubString(
+        live_conversion_key_, prefix_key_chars, segment_key_chars));
+    span.raw_preedit = segment.key();
+    span.value = segment.value();
+    span.preedit_segment = segment;
+    spans.push_back(std::move(span));
+
+    prefix_key = next_key;
+    prefix_raw_preedit = next_raw_preedit;
+    prefix_value = next_value;
+    prefix_key_chars = next_key_chars;
+  }
+
+  return spans;
+}
+
+std::optional<Session::PendingLiveConversionPresentation>
+Session::CapturePendingLiveConversionPresentationForContinuedInput() const {
+  PendingLiveConversionPresentation presentation;
+
+  // GetQueryForPrediction() trims trailing alphabet characters.  If it differs
+  // from the conversion query, the tail is still a transient romaji fragment
+  // such as the "s" in "さすがでs".  Do not promote that transient display to
+  // a new stable basis: the next key may rewrite it in place ("s" + "u" ->
+  // "す").
+  const std::string current_key = context_->composer().GetQueryForConversion();
+  const std::string current_raw_preedit =
+      context_->composer().GetStringForPreedit();
+  const bool has_transient_trailing_alphabet =
+      context_->composer().GetQueryForPrediction() != current_key;
+
+  if (has_transient_trailing_alphabet &&
+      pending_live_conversion_presentation_.has_value()) {
+    const PendingLiveConversionPresentation& stable =
+        *pending_live_conversion_presentation_;
+    if (StartsWithString(current_key, stable.key) &&
+        StartsWithString(current_raw_preedit, stable.raw_preedit)) {
+      return stable;
+    }
+  }
+
+  if (HasVisibleZenzLiveCorrection()) {
+    presentation.key = context_->composer().GetQueryForConversion();
+    presentation.raw_preedit = context_->composer().GetStringForPreedit();
+    presentation.value = zenz_live_value_;
+    presentation.preedit_output = zenz_live_preedit_output_;
+    presentation.stable_spans = MergeStablePresentationSpans(
+        presentation.value, zenz_live_stable_spans_);
+    if (!presentation.key.empty() && !presentation.raw_preedit.empty() &&
+        !presentation.value.empty() &&
+        presentation.preedit_output.segment_size() > 0) {
+      return presentation;
+    }
+  }
+
+  if (HasDeferredZenzLivePresentation()) {
+    if (deferred_zenz_live_presentation_->continued_input_presentation
+            .has_value()) {
+      return deferred_zenz_live_presentation_->continued_input_presentation;
+    }
+
+    presentation.key = deferred_zenz_live_presentation_->visible_key;
+    presentation.raw_preedit =
+        deferred_zenz_live_presentation_->visible_raw_preedit;
+    presentation.value = deferred_zenz_live_presentation_->visible_value;
+    presentation.preedit_output =
+        deferred_zenz_live_presentation_->visible_preedit;
+    presentation.stable_spans =
+        BuildStablePresentationSpans(presentation.value);
+    if (!presentation.key.empty() && !presentation.raw_preedit.empty() &&
+        !presentation.value.empty() &&
+        presentation.preedit_output.segment_size() > 0) {
+      return presentation;
+    }
+  }
+
+  if (pending_live_conversion_presentation_.has_value()) {
+    return pending_live_conversion_presentation_;
+  }
+
+  return std::nullopt;
 }
 
 void Session::AttachDelayedLiveConversionCallback(
@@ -5385,7 +5444,9 @@ void Session::AttachDelayedLiveConversionCallback(
     GetLiveConversionDelayMillisec(context_->GetConfig()));
 }
 
-bool Session::MaybeScheduleLiveConversion(commands::Command* command) {
+bool Session::MaybeScheduleLiveConversion(
+    commands::Command* command,
+    PassiveSuggestionSnapshot* held_suggestion) {
   if (!context_->GetConfig().use_live_conversion()) {
     return false;
   }
@@ -5412,31 +5473,10 @@ bool Session::MaybeScheduleLiveConversion(commands::Command* command) {
   const bool should_skip_live_conversion =
       ShouldSkipLiveConversionForCompositionKey(
           key,
-          GetLiveConversionCommittedLeftBoundary(*context_),
           GetLiveConversionMinKeyLength(context_->GetConfig()));
   const bool cursor_at_end = length == context_->composer().GetCursor();
 
   if (should_skip_live_conversion || !cursor_at_end) {
-    if (should_skip_live_conversion && cursor_at_end &&
-        ShouldKeepPendingLiveConversionForTransientSokuon(key)) {
-      // Inputs such as 「おもっ」 and 「くさっ」 can be transient sokuon
-      // prefixes before 「て」/「た」.  They may be skipped before Convert()
-      // is attempted, so keep the live conversion overlay as pending instead
-      // of falling back to plain composition output.
-      ++live_conversion_generation_;
-      live_conversion_pending_ = true;
-      pending_live_conversion_generation_ = live_conversion_generation_;
-      pending_live_conversion_key_ = key;
-      pending_live_conversion_input_ = command->input();
-      pending_live_conversion_suggestion_candidate_window_.Clear();
-
-      if (OutputPendingLiveConversion(command)) {
-        AttachDelayedLiveConversionCallback(command);
-        return true;
-      }
-
-      CancelPendingLiveConversion();
-    }
 
     CancelPendingLiveConversion();
     return false;
@@ -5445,7 +5485,8 @@ bool Session::MaybeScheduleLiveConversion(commands::Command* command) {
   const uint32_t delay_msec =
       GetLiveConversionDelayMillisec(context_->GetConfig());
   if (delay_msec == 0) {
-    return MaybeStartLiveConversion(command);
+    return MaybeStartLiveConversionInternal(
+        command, /*allow_zenz_live_correction=*/true, held_suggestion);
   }
 
   ++live_conversion_generation_;
@@ -5454,6 +5495,8 @@ bool Session::MaybeScheduleLiveConversion(commands::Command* command) {
   pending_live_conversion_key_ = key;
   pending_live_conversion_input_ = command->input();
   pending_live_conversion_suggestion_candidate_window_.Clear();
+  pending_live_conversion_suggestion_context_.reset();
+  pending_live_conversion_holds_passive_suggestion_ = false;
 
   if (!OutputPendingLiveConversion(command)) {
     // Avoid showing raw hiragana fallback. If pending display cannot be built
@@ -5461,10 +5504,27 @@ bool Session::MaybeScheduleLiveConversion(commands::Command* command) {
     return MaybeStartLiveConversion(command);
   }
 
-  if (AttachLiveConversionSuggestionCandidateWindow(command->input(),
-                                                    command->mutable_output())) {
+  if (held_suggestion != nullptr) {
+    if (AttachPassiveSuggestionSnapshot(
+            command->input(), held_suggestion, command->mutable_output())) {
+      pending_live_conversion_suggestion_candidate_window_ =
+          held_suggestion->candidate_window;
+      pending_live_conversion_suggestion_context_ =
+          std::move(held_suggestion->context);
+      pending_live_conversion_holds_passive_suggestion_ = true;
+      live_conversion_suggestion_candidate_window_.Clear();
+      live_conversion_suggestion_context_.reset();
+    } else {
+      command->mutable_output()->clear_candidate_window();
+    }
+  } else if (
+      AttachLiveConversionSuggestionCandidateWindow(
+          command->input(), command->mutable_output())) {
     pending_live_conversion_suggestion_candidate_window_ =
         command->output().candidate_window();
+    pending_live_conversion_suggestion_context_ =
+        std::move(live_conversion_suggestion_context_);
+    live_conversion_suggestion_candidate_window_.Clear();
   }
   AttachDelayedLiveConversionCallback(command);
 
@@ -5473,6 +5533,16 @@ bool Session::MaybeScheduleLiveConversion(commands::Command* command) {
 
 bool Session::IgnoreStaleDelayedLiveConversion(commands::Command* command) {
   command->mutable_output()->set_consumed(true);
+
+  // Synthetic Zenz preedit is not the converter's PopOutput. Re-emitting
+  // ordinary conversion here would visually undo a newer manual correction.
+  if (HasVisibleZenzLiveCorrection()) {
+    return OutputZenzLiveCorrection(zenz_live_value_, command);
+  }
+  if (pending_zenz_live_.pending && live_conversion_active_ &&
+      context_->state() == ImeContext::CONVERSION) {
+    return OutputCurrentLiveConversionWithZenzPending(command);
+  }
 
   // A stale delayed callback must not return an empty Output. In TSF, an empty
   // consumed Output may clear the visible composition even though the server-side
@@ -5499,6 +5569,7 @@ bool Session::IgnoreStaleDelayedLiveConversion(commands::Command* command) {
     command->mutable_output()->set_live_conversion_pending(false);
     AttachCachedLiveConversionSuggestionCandidateWindow(
         command->mutable_output());
+    OverrideOutputWithDeferredZenzLivePresentation(command);
     return true;
   }
 
@@ -5540,18 +5611,10 @@ bool Session::ApplyDelayedLiveConversion(commands::Command* command) {
   const bool should_skip_live_conversion =
       ShouldSkipLiveConversionForCompositionKey(
           current_key,
-          GetLiveConversionCommittedLeftBoundary(*context_),
           GetLiveConversionMinKeyLength(context_->GetConfig()));
   const bool cursor_at_end = length == context_->composer().GetCursor();
 
   if (should_skip_live_conversion || !cursor_at_end) {
-    if (should_skip_live_conversion && cursor_at_end &&
-        ShouldKeepPendingLiveConversionForTransientSokuon(current_key)) {
-      OutputPendingLiveConversion(command);
-      AttachCachedLiveConversionSuggestionCandidateWindow(
-          command->mutable_output());
-      return true;
-    }
 
     CancelPendingLiveConversion();
     OutputFromState(command);
@@ -5570,19 +5633,19 @@ std::string Session::ExtractZenzLeftContext(uint32_t max_chars) const {
     return "";
   }
 
-  if (!context_->client_context().has_preceding_text()) {
+  const absl::string_view preceding_text =
+      GetZenzClientContextView(context_->client_context()).preceding_text;
+  if (preceding_text.empty()) {
     return "";
   }
 
-  const std::string& preceding_text =
-      context_->client_context().preceding_text();
-
   // Left context should describe only the text before the cursor on the
-  // current line.  Do not concatenate preceding lines when the prompt builder
-  // removes line-feed characters.
+  // current line.  The prompt builder removes line-feed characters, so text
+  // from preceding lines must not be handed to the context assembler where it
+  // would be concatenated with the current line.
   const size_t line_break_pos = preceding_text.find_last_of("\r\n");
   absl::string_view current_line = preceding_text;
-  if (line_break_pos != std::string::npos) {
+  if (line_break_pos != absl::string_view::npos) {
     current_line.remove_prefix(line_break_pos + 1);
   }
 
@@ -5593,39 +5656,6 @@ std::string Session::ExtractZenzLeftContext(uint32_t max_chars) const {
 
   return std::string(
       Util::Utf8SubString(current_line, len - max_chars, max_chars));
-}
-
-std::string Session::ExtractZenzRightContext(uint32_t max_chars) const {
-  if (IsGrimodexSecureInput()) {
-    return "";
-  }
-
-  if (max_chars == 0) {
-    return "";
-  }
-
-  if (!context_->client_context().has_following_text()) {
-    return "";
-  }
-
-  const std::string& following_text =
-      context_->client_context().following_text();
-
-  // Right context should describe the continuation of the current line.
-  // Do not let text from following lines leak into the Zenz prompt, because
-  // multi-line editors often expose the rest of the document as following_text.
-  const size_t line_break_pos = following_text.find_first_of("\r\n");
-  const std::string current_line =
-      line_break_pos == std::string::npos
-          ? following_text
-          : following_text.substr(0, line_break_pos);
-
-  const size_t len = Util::CharsLen(current_line);
-  if (len <= max_chars) {
-    return current_line;
-  }
-
-  return std::string(Util::Utf8SubString(current_line, 0, max_chars));
 }
 
 std::string Session::BuildZenzFeedbackContextClass(
@@ -5648,7 +5678,7 @@ void Session::RecordZenzLiveCorrectionAccepted(
     return;
   }
 
-  if (!UseZenzFeedbackLearning(context_->GetConfig())) {
+  if (!CanRecordZenzFeedback(*context_)) {
     return;
   }
 
@@ -5698,12 +5728,13 @@ void Session::RecordZenzLiveCorrectionAccepted(
 
 bool Session::MaybeLearnZenzCandidateToMozcHistory(
     absl::string_view key,
-    absl::string_view value) {
+    absl::string_view value,
+    std::vector<uint64_t>* revert_ids) {
   if (IsGrimodexSecureInput()) {
     return false;
   }
 
-  if (!UseZenzFeedbackLearning(context_->GetConfig())) {
+  if (!CanLearnZenzToMozcHistory(*context_)) {
     return false;
   }
 
@@ -5741,15 +5772,27 @@ bool Session::MaybeLearnZenzCandidateToMozcHistory(
     return false;
   }
 
-  return context_->mutable_converter()->LearnExternalConversionResult(
-      key, value, context_->client_context());
+  if (revert_ids == nullptr) {
+    return context_->mutable_converter()->LearnExternalConversionResult(
+        key, value, context_->client_context());
+  }
+
+  const uint64_t revert_id =
+      context_->mutable_converter()->LearnExternalConversionResultReversibly(
+          key, value, context_->client_context());
+  if (revert_id == 0) {
+    return false;
+  }
+  revert_ids->push_back(revert_id);
+  return true;
 }
 
 int Session::MaybeLearnZenzReverseSegmentsToMozcHistory(
-    const std::vector<std::pair<std::string, std::string>>& segments) {
+    const std::vector<std::pair<std::string, std::string>>& segments,
+    std::vector<uint64_t>* revert_ids) {
   int learned_count = 0;
   for (const auto& [key, value] : segments) {
-    if (MaybeLearnZenzCandidateToMozcHistory(key, value)) {
+    if (MaybeLearnZenzCandidateToMozcHistory(key, value, revert_ids)) {
       ++learned_count;
     }
   }
@@ -5757,15 +5800,13 @@ int Session::MaybeLearnZenzReverseSegmentsToMozcHistory(
 }
 
 int Session::MaybeLearnZenzProjectedSegmentsToMozcHistory(
-    const std::vector<ZenzProjectedLearningSegment>& segments) {
+    const std::vector<ZenzProjectedLearningSegment>& segments,
+    std::vector<uint64_t>* revert_ids) {
   if (IsGrimodexSecureInput()) {
     return 0;
   }
 
-  if (!UseZenzFeedbackLearning(context_->GetConfig())) {
-    return 0;
-  }
-  if (segments.size() < 2) {
+  if (!CanLearnZenzToMozcHistory(*context_)) {
     return 0;
   }
   if (context_->composer().GetInputFieldType() ==
@@ -5773,45 +5814,165 @@ int Session::MaybeLearnZenzProjectedSegmentsToMozcHistory(
     return 0;
   }
 
-  std::vector<ExternalConversionSegment> external_segments;
-  external_segments.reserve(segments.size());
+  int learned_count = 0;
+  std::vector<ExternalConversionSegment> external_span;
+  external_span.reserve(segments.size());
+
+  auto flush_span = [&]() {
+    if (external_span.empty()) {
+      return;
+    }
+
+    bool has_learning_signal = external_span.front().boundary_resized;
+    for (const ExternalConversionSegment& segment : external_span) {
+      has_learning_signal = has_learning_signal || segment.is_reranked;
+    }
+    if (!has_learning_signal) {
+      external_span.clear();
+      return;
+    }
+
+    bool learned_span = false;
+    if (revert_ids == nullptr) {
+      learned_span =
+          context_->mutable_converter()->LearnExternalConversionSegments(
+              external_span, context_->client_context());
+    } else {
+      const uint64_t revert_id =
+          context_->mutable_converter()
+              ->LearnExternalConversionSegmentsReversibly(
+                  external_span, context_->client_context());
+      if (revert_id != 0) {
+        revert_ids->push_back(revert_id);
+        learned_span = true;
+      }
+    }
+
+    if (learned_span) {
+      learned_count += static_cast<int>(external_span.size());
+      external_span.clear();
+      return;
+    }
+
+    // A structured commit can still fail for a local downstream reason.
+    // Preserve only explicit rerank evidence as independent single-segment
+    // learning; never synthesize boundary history from a degraded span.
+    for (const ExternalConversionSegment& segment : external_span) {
+      if (segment.is_reranked &&
+          MaybeLearnZenzCandidateToMozcHistory(
+              segment.key, segment.value, revert_ids)) {
+        ++learned_count;
+      }
+    }
+    external_span.clear();
+  };
+
+  bool span_boundary_resized = false;
   for (const ZenzProjectedLearningSegment& segment : segments) {
     const std::string& key = segment.key;
     const std::string& value = segment.value;
+
+    // An unresolved aggregate proves only its outer correspondence. Keep it as
+    // a barrier between independently safe spans, but never generalize it as a
+    // synthetic reranked segment when native resegmentation failed.
+    if (segment.needs_native_resolution) {
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz-feedback] split projected mozc history unresolved native ",
+          ZenzRedactedTextStats("key", key),
+          " ", ZenzRedactedTextStats("value", value)));
+      flush_span();
+      continue;
+    }
+
     if (key.empty() || value.empty()) {
-      return 0;
+      flush_span();
+      continue;
     }
 
     const ZenzTextPrivacyDecision key_privacy =
         EvaluateZenzLiveKeyPrivacy(key);
     if (!key_privacy.allow) {
       ZenzDebugOutput(absl::StrCat(
-          "[zenz-feedback] skip projected mozc history key_privacy reason=",
+          "[zenz-feedback] split projected mozc history key_privacy reason=",
           key_privacy.reason,
           " ",
           ZenzRedactedTextStats("key", key)));
-      return 0;
+      flush_span();
+      continue;
     }
 
     const ZenzTextPrivacyDecision value_privacy =
         EvaluateZenzLiveValuePrivacy(value);
     if (!value_privacy.allow) {
       ZenzDebugOutput(absl::StrCat(
-          "[zenz-feedback] skip projected mozc history value_privacy reason=",
+          "[zenz-feedback] split projected mozc history value_privacy reason=",
           value_privacy.reason,
           " ",
           ZenzRedactedTextStats("value", value)));
-      return 0;
+      flush_span();
+      continue;
     }
 
-    external_segments.push_back({key, value, segment.is_reranked});
+    if (!external_span.empty() &&
+        span_boundary_resized != segment.boundary_resized) {
+      flush_span();
+    }
+    if (external_span.empty()) {
+      span_boundary_resized = segment.boundary_resized;
+    }
+
+    external_span.push_back(
+        {key, value, segment.is_reranked, segment.boundary_resized});
   }
 
-  if (!context_->mutable_converter()->LearnExternalConversionSegments(
-          external_segments, context_->client_context())) {
-    return 0;
+  flush_span();
+  return learned_count;
+}
+
+void Session::ApplyPendingZenzAcceptedMozcHistoryLearning() {
+  if (!pending_zenz_feedback_.pending ||
+      pending_zenz_feedback_.action !=
+          PendingZenzFeedback::Action::kAccepted ||
+      !pending_zenz_feedback_.mozc_history_learning_requested ||
+      pending_zenz_feedback_.mozc_history_learning_applied) {
+    return;
   }
-  return static_cast<int>(external_segments.size());
+
+  // Mark this commit point exactly once. If privacy/configuration now denies
+  // learning, never re-attempt it when the rollback window later closes.
+  pending_zenz_feedback_.mozc_history_learning_applied = true;
+  if (!CanLearnZenzToMozcHistory(*context_)) {
+    return;
+  }
+  std::vector<uint64_t>* revert_ids =
+      &pending_zenz_feedback_.mozc_history_revert_ids;
+
+  const int projected_segment_learning_count =
+      MaybeLearnZenzProjectedSegmentsToMozcHistory(
+          pending_zenz_feedback_.reverse_projected_learning_segments,
+          revert_ids);
+
+  bool learned_to_mozc_history = false;
+  int reverse_segment_learning_count = 0;
+  if (projected_segment_learning_count == 0) {
+    learned_to_mozc_history =
+        MaybeLearnZenzCandidateToMozcHistory(
+            pending_zenz_feedback_.key,
+            pending_zenz_feedback_.value,
+            revert_ids);
+    reverse_segment_learning_count =
+        MaybeLearnZenzReverseSegmentsToMozcHistory(
+            pending_zenz_feedback_.reverse_learning_segments,
+            revert_ids);
+  }
+
+  ZenzDebugOutput(absl::StrCat(
+      "[zenz-feedback] commit-point mozc history applied projected=",
+      projected_segment_learning_count,
+      " fallback_full=", ZenzBool(learned_to_mozc_history),
+      " reverse_segments=", reverse_segment_learning_count,
+      " revert_handles=", revert_ids->size(),
+      " context_class=", pending_zenz_feedback_.context_class));
 }
 
 bool Session::HasVisibleZenzLiveCorrection() const {
@@ -5849,7 +6010,9 @@ void Session::SetPendingZenzFeedbackAccepted(
     return;
   }
 
-  if (!UseZenzFeedbackLearning(context_->GetConfig())) {
+  const bool record_feedback = CanRecordZenzFeedback(*context_);
+  const bool learn_mozc_history = CanLearnZenzToMozcHistory(*context_);
+  if (!record_feedback && !learn_mozc_history) {
     return;
   }
 
@@ -5888,86 +6051,595 @@ void Session::SetPendingZenzFeedbackAccepted(
   pending_zenz_feedback_.reason.clear();
   pending_zenz_feedback_.has_final_committed_value = false;
   pending_zenz_feedback_.final_committed_value.clear();
-  const ZenzReverseLearningProjection reverse_learning_projection =
+  pending_zenz_feedback_.require_final_committed_key_match = false;
+  pending_zenz_feedback_.final_committed_key.clear();
+  pending_zenz_feedback_.feedback_acceptance_write_succeeded = false;
+  pending_zenz_feedback_.mozc_history_learning_requested = learn_mozc_history;
+  pending_zenz_feedback_.mozc_history_learning_applied = false;
+  pending_zenz_feedback_.mozc_history_revert_ids.clear();
+
+  // A=ON/C=OFF records the full sequence without constructing generalized
+  // Mozc-learning segments. A=OFF/C=ON does the converse.
+  if (!learn_mozc_history) {
+    pending_zenz_feedback_.feedback_acceptance_write_succeeded =
+        zenz_feedback_store_.RecordAccepted(
+            pending_zenz_feedback_.key,
+            pending_zenz_feedback_.context_class,
+            pending_zenz_feedback_.value);
+    return;
+  }
+
+  ZenzReverseLearningProjection reverse_learning_projection =
       BuildZenzReverseLearningSegmentsFromPreedit(
           live_conversion_preedit_output_, key, value);
+
+  auto is_projected_segment_learnable =
+      [&](const ZenzProjectedLearningSegment& projected) {
+        return !projected.key.empty() && !projected.value.empty() &&
+               EvaluateZenzLiveKeyPrivacy(projected.key).allow &&
+               EvaluateZenzLiveValuePrivacy(projected.value).allow;
+      };
+
+  auto append_native_resolution =
+      [&](absl::Span<const ZenzProjectedLearningSegment> projected_span,
+          absl::string_view reason,
+          std::vector<ZenzProjectedLearningSegment>* output) -> bool {
+        if (projected_span.empty() || output == nullptr) {
+          return false;
+        }
+
+        // Prefer the exact live-Mozc boundaries whenever projection already
+        // proved them. A fixed-boundary immutable conversion is stronger
+        // evidence than reverse conversion because it does not have to infer
+        // reading boundaries from the accepted surface. Native resegmentation
+        // remains the fallback only when these known boundaries cannot
+        // reproduce the accepted surfaces.
+        bool all_boundaries_known = true;
+        std::vector<ExternalConversionSegment> fixed_boundary_segments;
+        fixed_boundary_segments.reserve(projected_span.size());
+        for (const ZenzProjectedLearningSegment& projected : projected_span) {
+          if (projected.needs_native_resolution ||
+              projected.boundary_resized) {
+            all_boundaries_known = false;
+            break;
+          }
+          fixed_boundary_segments.push_back(
+              {projected.key, projected.value, false, false});
+        }
+
+        if (all_boundaries_known) {
+          std::vector<ExternalConversionSegment> evaluated_segments;
+          if (context_->mutable_converter()->EvaluateExternalConversionSegments(
+                  fixed_boundary_segments, context_->client_context(),
+                  &evaluated_segments) &&
+              evaluated_segments.size() == projected_span.size()) {
+            bool exact_fixed_boundary_match = true;
+            for (size_t i = 0; i < evaluated_segments.size(); ++i) {
+              if (evaluated_segments[i].key != projected_span[i].key ||
+                  evaluated_segments[i].value != projected_span[i].value ||
+                  evaluated_segments[i].boundary_resized) {
+                exact_fixed_boundary_match = false;
+                break;
+              }
+            }
+
+            if (exact_fixed_boundary_match) {
+              size_t reranked_count = 0;
+              for (size_t i = 0; i < evaluated_segments.size(); ++i) {
+                const bool is_reranked =
+                    evaluated_segments[i].is_reranked ||
+                    projected_span[i].is_reranked;
+                if (is_reranked) {
+                  ++reranked_count;
+                }
+                output->push_back(
+                    {evaluated_segments[i].key, evaluated_segments[i].value,
+                     is_reranked, false, false, {}});
+              }
+
+              ZenzDebugOutput(absl::StrCat(
+                  "[zenz-feedback] fixed-boundary projection preserved ",
+                  reason, " segments=", evaluated_segments.size(),
+                  " reranked=", reranked_count));
+              return true;
+            }
+          }
+        }
+
+        std::string span_key;
+        std::string span_value;
+        std::vector<std::string> baseline_keys;
+        for (const ZenzProjectedLearningSegment& projected : projected_span) {
+          span_key.append(projected.key);
+          span_value.append(projected.value);
+          if (projected.needs_native_resolution &&
+              !projected.baseline_keys.empty()) {
+            baseline_keys.insert(baseline_keys.end(),
+                                 projected.baseline_keys.begin(),
+                                 projected.baseline_keys.end());
+          } else {
+            baseline_keys.push_back(projected.key);
+          }
+        }
+
+        std::vector<ExternalConversionSegment> native_segments;
+        if (!context_->mutable_converter()->ResolveExternalConversionSegments(
+                span_key, span_value, context_->client_context(),
+                &native_segments)) {
+          return false;
+        }
+
+        if (native_segments.empty()) {
+          return false;
+        }
+
+        bool boundary_resized =
+            native_segments.size() != baseline_keys.size();
+        if (!boundary_resized) {
+          for (size_t i = 0; i < native_segments.size(); ++i) {
+            if (native_segments[i].key != baseline_keys[i]) {
+              boundary_resized = true;
+              break;
+            }
+          }
+        }
+
+        bool one_to_one_projection =
+            native_segments.size() == projected_span.size();
+        if (one_to_one_projection) {
+          for (size_t i = 0; i < native_segments.size(); ++i) {
+            if (native_segments[i].key != projected_span[i].key ||
+                native_segments[i].value != projected_span[i].value) {
+              one_to_one_projection = false;
+              break;
+            }
+          }
+        }
+
+        size_t reranked_count = 0;
+        for (size_t i = 0; i < native_segments.size(); ++i) {
+          const ExternalConversionSegment& segment = native_segments[i];
+          const bool is_reranked =
+              segment.is_reranked ||
+              (one_to_one_projection && projected_span[i].is_reranked);
+          if (is_reranked) {
+            ++reranked_count;
+          }
+          output->push_back(
+              {segment.key, segment.value, is_reranked,
+               boundary_resized, false, {}});
+        }
+
+        ZenzDebugOutput(absl::StrCat(
+            "[zenz-feedback] native resegmentation resolved ", reason,
+            " segments=", native_segments.size(),
+            " reranked=", reranked_count,
+            " boundary_resized=", ZenzBool(boundary_resized)));
+        return true;
+      };
+
+  // Context-loss hardening is useful for reusable lexical choices such as
+  // "げんしょう -> 現象", but it is optional learning work. Bound the number
+  // of extra fixed-boundary conversions per accepted Zenz result so
+  // punctuation-heavy text cannot turn history enrichment into input latency.
+  constexpr size_t kMaxContextLossProbesPerAcceptedFeedback = 2;
+  size_t context_loss_probe_count = 0;
+
+  auto append_context_loss_hardening =
+      [&](absl::Span<const ZenzProjectedLearningSegment> evaluation_prefix,
+          absl::Span<const ZenzProjectedLearningSegment> lexical_island,
+          std::vector<ZenzProjectedLearningSegment>* output) -> bool {
+        if (evaluation_prefix.empty() || lexical_island.empty() ||
+            output == nullptr) {
+          return false;
+        }
+
+        std::vector<ExternalConversionSegment> expected_segments;
+        expected_segments.reserve(evaluation_prefix.size());
+        for (const ZenzProjectedLearningSegment& projected :
+             evaluation_prefix) {
+          if (projected.needs_native_resolution ||
+              projected.boundary_resized) {
+            return false;
+          }
+          expected_segments.push_back(
+              {projected.key, projected.value, false, false});
+        }
+
+        if (context_loss_probe_count >=
+            kMaxContextLossProbesPerAcceptedFeedback) {
+          ZenzDebugOutput(
+              "[zenz-feedback] context-loss probe budget exhausted");
+          return false;
+        }
+        ++context_loss_probe_count;
+
+        std::vector<ExternalConversionSegment> evaluated_segments;
+        if (!context_->mutable_converter()->EvaluateExternalConversionSegments(
+                expected_segments, context_->client_context(),
+                &evaluated_segments)) {
+          return false;
+        }
+
+        if (evaluated_segments.size() != evaluation_prefix.size()) {
+          return false;
+        }
+
+        for (size_t i = 0; i < evaluated_segments.size(); ++i) {
+          if (evaluated_segments[i].key != evaluation_prefix[i].key ||
+              evaluated_segments[i].value != evaluation_prefix[i].value ||
+              evaluated_segments[i].boundary_resized) {
+            return false;
+          }
+        }
+
+        // The prefix probe preserves every already-typed segment and removes
+        // only future right context. Therefore only the final lexical segment
+        // has direct evidence of context loss. Do not promote earlier non-top
+        // candidates merely because they are lower ranked in a history-free
+        // probe.
+        if (!evaluated_segments.back().is_reranked) {
+          return false;
+        }
+
+        for (size_t i = 0; i < lexical_island.size(); ++i) {
+          const ZenzProjectedLearningSegment& segment = lexical_island[i];
+          output->push_back(
+              {segment.key, segment.value,
+               i + 1 == lexical_island.size(),
+               false, false, {}});
+        }
+
+        ZenzDebugOutput(absl::StrCat(
+            "[zenz-feedback] fixed-boundary context-loss hardening prefix=",
+            evaluated_segments.size(), " island=", lexical_island.size(),
+            " reranked=1"));
+        return true;
+      };
+  // Punctuation and other non-learnable projected units divide the accepted
+  // text into lexical islands. Within each island, re-run Mozc-native
+  // resegmentation only for the smallest range that actually changed. This is
+  // important when a changed lexical item is embedded in a larger live-Mozc
+  // segment, e.g.
+  //   key:   きいたりするげんしょう(
+  //   Mozc:  聞いたりする減少（
+  //   Zenz:  聞いたりする現象（
+  // Stage 2D can peel the unchanged '(' separator. The resolver below then
+  // sees "きいたりするげんしょう" -> "聞いたりする現象" and can recover
+  // [きいたりする][げんしょう], allowing boundary history and candidate
+  // history to be learned without teaching any boundary across punctuation.
+  if (!reverse_learning_projection.projected_segments.empty()) {
+    const std::vector<ZenzProjectedLearningSegment> projected_segments =
+        reverse_learning_projection.projected_segments;
+    std::vector<ZenzProjectedLearningSegment> resolved_projection;
+    resolved_projection.reserve(projected_segments.size());
+
+    size_t island_begin = 0;
+    while (island_begin < projected_segments.size()) {
+      if (!is_projected_segment_learnable(
+              projected_segments[island_begin])) {
+        ZenzProjectedLearningSegment separator =
+            projected_segments[island_begin];
+        separator.boundary_resized = false;
+        separator.needs_native_resolution = false;
+        separator.baseline_keys.clear();
+        resolved_projection.push_back(std::move(separator));
+        ++island_begin;
+        continue;
+      }
+
+      size_t island_end = island_begin;
+      while (island_end < projected_segments.size() &&
+             is_projected_segment_learnable(
+                 projected_segments[island_end])) {
+        ++island_end;
+      }
+
+      size_t first_changed = island_end;
+      size_t last_changed = island_begin;
+      for (size_t i = island_begin; i < island_end; ++i) {
+        if (projected_segments[i].is_reranked ||
+            projected_segments[i].needs_native_resolution) {
+          if (first_changed == island_end) {
+            first_changed = i;
+          }
+          last_changed = i;
+        }
+      }
+
+      if (first_changed == island_end) {
+        const absl::Span<const ZenzProjectedLearningSegment> unchanged_island(
+            projected_segments.data() + island_begin,
+            island_end - island_begin);
+        const bool has_following_separator =
+            island_end < projected_segments.size() &&
+            !is_projected_segment_learnable(projected_segments[island_end]);
+
+        // Full-context Mozc may already show the accepted surface because of
+        // future right context that has not been typed yet. Preserve all
+        // already-typed left context in the read-only prefix probe, omit the
+        // following separator/right context, and harden only the final lexical
+        // segment when that exact surface stops being top-ranked.
+        const absl::Span<const ZenzProjectedLearningSegment> evaluation_prefix(
+            projected_segments.data(), island_end);
+        if (!has_following_separator ||
+            !append_context_loss_hardening(
+                evaluation_prefix, unchanged_island,
+                &resolved_projection)) {
+          for (size_t i = island_begin; i < island_end; ++i) {
+            resolved_projection.push_back(projected_segments[i]);
+          }
+        }
+        island_begin = island_end;
+        continue;
+      }
+
+      for (size_t i = island_begin; i < first_changed; ++i) {
+        resolved_projection.push_back(projected_segments[i]);
+      }
+
+      const absl::Span<const ZenzProjectedLearningSegment> changed_span(
+          projected_segments.data() + first_changed,
+          last_changed - first_changed + 1);
+      const bool range_resolved = append_native_resolution(
+          changed_span, "lexical island", &resolved_projection);
+
+      if (!range_resolved) {
+        for (size_t i = first_changed; i <= last_changed; ++i) {
+          ZenzProjectedLearningSegment projected = projected_segments[i];
+
+          // If the failed changed range contains several projected units, an
+          // unresolved aggregate inside it may still be independently
+          // resolvable. Preserve that narrower fallback. For a one-unit range
+          // the exact same key/value was already tried above, so do not probe
+          // it twice.
+          if (projected.needs_native_resolution &&
+              first_changed != last_changed) {
+            const absl::Span<const ZenzProjectedLearningSegment> local_span(
+                &projected_segments[i], 1);
+            if (append_native_resolution(local_span, "local span",
+                                         &resolved_projection)) {
+              continue;
+            }
+          }
+
+          if (projected.needs_native_resolution) {
+            // Native resegmentation failed, so preserve the unresolved marker.
+            // MaybeLearnZenzProjectedSegmentsToMozcHistory treats this unit as
+            // a non-learnable span barrier instead of inventing one segment.
+            projected.boundary_resized = false;
+            resolved_projection.push_back(std::move(projected));
+            continue;
+          }
+
+          projected.boundary_resized = false;
+          projected.baseline_keys.clear();
+          resolved_projection.push_back(std::move(projected));
+        }
+      }
+
+      for (size_t i = last_changed + 1; i < island_end; ++i) {
+        resolved_projection.push_back(projected_segments[i]);
+      }
+
+      island_begin = island_end;
+    }
+
+    reverse_learning_projection.projected_segments =
+        std::move(resolved_projection);
+  }
+
+  // A projection can still be unavailable when the live snapshot does not
+  // describe the accepted full key at all. Preserve the conservative
+  // whole-sequence native fallback for that case.
+  if (reverse_learning_projection.projected_segments.empty()) {
+    std::vector<ExternalConversionSegment> native_segments;
+    if (context_->mutable_converter()->ResolveExternalConversionSegments(
+            key, value, context_->client_context(), &native_segments)) {
+      size_t reranked_count = 0;
+      bool all_native_segments_privacy_valid = true;
+      for (const ExternalConversionSegment& segment : native_segments) {
+        if (segment.is_reranked) {
+          ++reranked_count;
+        }
+        if (!EvaluateZenzLiveKeyPrivacy(segment.key).allow ||
+            !EvaluateZenzLiveValuePrivacy(segment.value).allow) {
+          all_native_segments_privacy_valid = false;
+        }
+      }
+
+      if (!native_segments.empty()) {
+        bool boundary_resized = false;
+        if (all_native_segments_privacy_valid) {
+          const std::vector<ZenzBaselineSegment> live_baseline =
+              BuildZenzBaselineSegmentsFromPreedit(
+                  live_conversion_preedit_output_);
+          std::vector<ZenzBaselineSegment> reconciled_live_baseline;
+          if (ReconcileZenzBaselineKeysForRequest(
+                  live_baseline, key, &reconciled_live_baseline)) {
+            boundary_resized =
+                reconciled_live_baseline.size() != native_segments.size();
+            if (!boundary_resized) {
+              for (size_t i = 0; i < native_segments.size(); ++i) {
+                if (reconciled_live_baseline[i].key !=
+                    native_segments[i].key) {
+                  boundary_resized = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        reverse_learning_projection.projected_segments.reserve(
+            native_segments.size());
+        for (const ExternalConversionSegment& segment : native_segments) {
+          reverse_learning_projection.projected_segments.push_back(
+              {segment.key, segment.value, segment.is_reranked,
+               boundary_resized, false, {}});
+          if (segment.is_reranked &&
+              !(segment.key == key && segment.value == value)) {
+            reverse_learning_projection.changed_segments.push_back(
+                {segment.key, segment.value});
+          }
+        }
+        ZenzDebugOutput(absl::StrCat(
+            "[zenz-feedback] native resegmentation resolved full sequence"
+            " segments=",
+            native_segments.size(), " reranked=", reranked_count,
+            " boundary_resized=", ZenzBool(boundary_resized)));
+      }
+    }
+  }
+
+  // reverse_learning_projection.changed_segments was collected before native
+  // fixed-boundary evaluation / resegmentation.  Do not let that stale local
+  // evidence reappear through ConfirmPendingZenzFeedback's fallback after the
+  // resolved projection changed either the surface partition or its rerank
+  // evidence.  A local fallback pair remains valid only when the final
+  // projection still contains the exact key/value pair with explicit rerank
+  // evidence and no unresolved native-boundary question.
+  std::vector<std::pair<std::string, std::string>>
+      validated_changed_segments;
+  validated_changed_segments.reserve(
+      reverse_learning_projection.changed_segments.size());
+  for (const auto& changed_segment :
+       reverse_learning_projection.changed_segments) {
+    const auto resolved = std::find_if(
+        reverse_learning_projection.projected_segments.begin(),
+        reverse_learning_projection.projected_segments.end(),
+        [&](const ZenzProjectedLearningSegment& segment) {
+          return !segment.needs_native_resolution && segment.is_reranked &&
+                 segment.key == changed_segment.first &&
+                 segment.value == changed_segment.second;
+        });
+    if (resolved != reverse_learning_projection.projected_segments.end()) {
+      validated_changed_segments.push_back(changed_segment);
+    }
+  }
+  reverse_learning_projection.changed_segments =
+      std::move(validated_changed_segments);
+
   pending_zenz_feedback_.reverse_learning_segments =
       reverse_learning_projection.changed_segments;
   pending_zenz_feedback_.reverse_projected_learning_segments =
       reverse_learning_projection.projected_segments;
 
+  // An explicit commit is authoritative positive evidence for A, independent
+  // of whether C will add a Mozc history observation.
+  if (record_feedback) {
+    pending_zenz_feedback_.feedback_acceptance_write_succeeded =
+        zenz_feedback_store_.RecordAccepted(
+            pending_zenz_feedback_.key,
+            pending_zenz_feedback_.context_class,
+            pending_zenz_feedback_.value);
+  }
+
   ZenzDebugOutput(absl::StrCat(
-      "[zenz-feedback] pending accepted ",
+      "[zenz-feedback] accepted pending with rollback window ",
       ZenzRedactedTextStats("key", key),
       " ", ZenzRedactedTextStats("value", value),
       " context_class=", pending_zenz_feedback_.context_class));
 }
 
-void Session::SetPendingZenzFeedbackRejected(absl::string_view reason) {
+void Session::SetPendingZenzFeedbackComparison(
+    absl::string_view key,
+    absl::string_view context_class,
+    absl::string_view value,
+    absl::string_view reason,
+    bool require_final_committed_key_match) {
   if (IsGrimodexSecureInput()) {
     return;
   }
 
-  if (!UseZenzFeedbackLearning(context_->GetConfig())) {
+  if (!CanRecordZenzFeedback(*context_)) {
     return;
   }
 
-  if (!HasVisibleZenzLiveCorrection()) {
+  if (key.empty() || value.empty()) {
     return;
   }
 
-  const ZenzTextPrivacyDecision key_privacy =
-      EvaluateZenzLiveKeyPrivacy(zenz_live_key_);
+  const ZenzTextPrivacyDecision key_privacy = EvaluateZenzLiveKeyPrivacy(key);
   if (!key_privacy.allow) {
     ZenzDebugOutput(absl::StrCat(
-        "[zenz-feedback] skip pending rejected key_privacy reason=",
+        "[zenz-feedback] skip pending comparison key_privacy reason=",
         key_privacy.reason,
         " ",
-        ZenzRedactedTextStats("key", zenz_live_key_)));
+        ZenzRedactedTextStats("key", key)));
     return;
   }
 
   const ZenzTextPrivacyDecision value_privacy =
-      EvaluateZenzLiveValuePrivacy(zenz_live_value_);
+      EvaluateZenzLiveValuePrivacy(value);
   if (!value_privacy.allow) {
     ZenzDebugOutput(absl::StrCat(
-        "[zenz-feedback] skip pending rejected value_privacy reason=",
+        "[zenz-feedback] skip pending comparison value_privacy reason=",
         value_privacy.reason,
         " ",
-        ZenzRedactedTextStats("value", zenz_live_value_)));
+        ZenzRedactedTextStats("value", value)));
     return;
   }
 
   pending_zenz_feedback_.pending = true;
-  pending_zenz_feedback_.action = PendingZenzFeedback::Action::kRejected;
-  pending_zenz_feedback_.key = zenz_live_key_;
+  pending_zenz_feedback_.action =
+      PendingZenzFeedback::Action::kCompareFinalCommit;
+  pending_zenz_feedback_.key = std::string(key);
   pending_zenz_feedback_.context_class =
-      zenz_live_context_class_.empty() ? "empty" : zenz_live_context_class_;
-  pending_zenz_feedback_.value = zenz_live_value_;
+      context_class.empty() ? "empty" : std::string(context_class);
+  pending_zenz_feedback_.value = std::string(value);
   pending_zenz_feedback_.reason = std::string(reason);
   pending_zenz_feedback_.has_final_committed_value = false;
   pending_zenz_feedback_.final_committed_value.clear();
+  pending_zenz_feedback_.require_final_committed_key_match =
+      require_final_committed_key_match;
+  pending_zenz_feedback_.final_committed_key.clear();
   pending_zenz_feedback_.reverse_learning_segments.clear();
   pending_zenz_feedback_.reverse_projected_learning_segments.clear();
+  pending_zenz_feedback_.feedback_acceptance_write_succeeded = false;
+  pending_zenz_feedback_.mozc_history_learning_requested = false;
+  pending_zenz_feedback_.mozc_history_learning_applied = false;
+  pending_zenz_feedback_.mozc_history_revert_ids.clear();
 
   ZenzDebugOutput(absl::StrCat(
-      "[zenz-feedback] pending rejected ",
+      "[zenz-feedback] pending final comparison ",
       ZenzRedactedTextStats("key", pending_zenz_feedback_.key),
       " ", ZenzRedactedTextStats("value", pending_zenz_feedback_.value),
       " context_class=", pending_zenz_feedback_.context_class,
-      " reason=", pending_zenz_feedback_.reason));
+      " reason=", pending_zenz_feedback_.reason,
+      " require_key_match=",
+      ZenzBool(pending_zenz_feedback_.require_final_committed_key_match)));
+}
+
+void Session::SetPendingZenzFeedbackRejected(absl::string_view reason) {
+  if (!HasVisibleZenzLiveCorrection()) {
+    return;
+  }
+
+  SetPendingZenzFeedbackComparison(
+      zenz_live_key_,
+      zenz_live_context_class_.empty() ? "empty" : zenz_live_context_class_,
+      zenz_live_value_, reason, false);
 }
 
 void Session::ObservePendingZenzFeedbackCommittedResult(
     const commands::Command& command,
     absl::string_view reason) {
   if (!pending_zenz_feedback_.pending ||
-      pending_zenz_feedback_.action != PendingZenzFeedback::Action::kRejected) {
+      pending_zenz_feedback_.action !=
+          PendingZenzFeedback::Action::kCompareFinalCommit) {
     return;
   }
 
-  // Only a fully committed conversion/direct commit should resolve pending
-  // rejected feedback. Partial segment commits stay in CONVERSION and must not
+  // A direct-commit punctuation path may have already captured the user's
+  // suffix-free final choice before emitting a result that contains the
+  // punctuation. Do not overwrite that stronger comparison target.
+  if (pending_zenz_feedback_.has_final_committed_value) {
+    return;
+  }
+
+  // Only a fully committed conversion/direct commit should resolve a pending
+  // final comparison. Partial segment commits stay in CONVERSION and must not
   // be interpreted as the user's final full-sequence decision.
   if (context_->state() != ImeContext::PRECOMPOSITION) {
     return;
@@ -5981,6 +6653,7 @@ void Session::ObservePendingZenzFeedbackCommittedResult(
   pending_zenz_feedback_.has_final_committed_value = true;
   pending_zenz_feedback_.final_committed_value =
       command.output().result().value();
+  pending_zenz_feedback_.final_committed_key = command.output().result().key();
 
   ZenzDebugOutput(absl::StrCat(
       "[zenz-feedback] observed final committed value reason=", reason,
@@ -5988,6 +6661,8 @@ void Session::ObservePendingZenzFeedbackCommittedResult(
       " ", ZenzRedactedTextStats("zenz_value", pending_zenz_feedback_.value),
       " ", ZenzRedactedTextStats("final_value",
                                   pending_zenz_feedback_.final_committed_value),
+      " ", ZenzRedactedTextStats("final_key",
+                                  pending_zenz_feedback_.final_committed_key),
       " context_class=", pending_zenz_feedback_.context_class,
       " pending_reason=", pending_zenz_feedback_.reason));
 }
@@ -5997,7 +6672,12 @@ void Session::ConfirmPendingZenzFeedback() {
     return;
   }
 
-  if (!UseZenzFeedbackLearning(context_->GetConfig())) {
+  if (!IsZenzPersistentPersonalizationContextAllowed(*context_)) {
+    for (const uint64_t revert_id :
+         pending_zenz_feedback_.mozc_history_revert_ids) {
+      context_->mutable_converter()->ConfirmExternalConversionLearning(
+          revert_id);
+    }
     pending_zenz_feedback_ = PendingZenzFeedback();
     return;
   }
@@ -6010,74 +6690,92 @@ void Session::ConfirmPendingZenzFeedback() {
         " ", ZenzRedactedTextStats("value", pending_zenz_feedback_.value),
         " context_class=", pending_zenz_feedback_.context_class));
 
-    // Accepted feedback stored in the TSV remains full-sequence scoped.
-    // Any broader generalization is delegated to Mozc history learning below.
-    zenz_feedback_store_.RecordAccepted(
-        pending_zenz_feedback_.key,
-        pending_zenz_feedback_.context_class,
-        pending_zenz_feedback_.value);
+    if (pending_zenz_feedback_.mozc_history_learning_applied) {
+      int confirmed_count = 0;
+      for (const uint64_t revert_id :
+           pending_zenz_feedback_.mozc_history_revert_ids) {
+        if (context_->mutable_converter()->ConfirmExternalConversionLearning(
+                revert_id)) {
+          ++confirmed_count;
+        }
+      }
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz-feedback] confirm commit-point mozc history handles=",
+          confirmed_count,
+          " context_class=", pending_zenz_feedback_.context_class));
+    } else if (pending_zenz_feedback_.mozc_history_learning_requested &&
+               CanLearnZenzToMozcHistory(*context_)) {
+      // Compatibility path for callers that prepare a pending acceptance
+      // without a commit-point callback. C remains authoritative here.
+      const int projected_segment_learning_count =
+          MaybeLearnZenzProjectedSegmentsToMozcHistory(
+              pending_zenz_feedback_.reverse_projected_learning_segments);
 
-    const bool learned_to_mozc_history =
-        MaybeLearnZenzCandidateToMozcHistory(
-            pending_zenz_feedback_.key,
-            pending_zenz_feedback_.value);
+      bool learned_to_mozc_history = false;
+      int reverse_segment_learning_count = 0;
+      if (projected_segment_learning_count == 0) {
+        learned_to_mozc_history =
+            MaybeLearnZenzCandidateToMozcHistory(
+                pending_zenz_feedback_.key,
+                pending_zenz_feedback_.value);
+        reverse_segment_learning_count =
+            MaybeLearnZenzReverseSegmentsToMozcHistory(
+                pending_zenz_feedback_.reverse_learning_segments);
+      }
 
-    ZenzDebugOutput(absl::StrCat(
-        "[zenz-feedback] mozc history learning ",
-        ZenzBool(learned_to_mozc_history),
-        " ", ZenzRedactedTextStats("key", pending_zenz_feedback_.key),
-        " ", ZenzRedactedTextStats("value", pending_zenz_feedback_.value),
-        " context_class=", pending_zenz_feedback_.context_class));
-
-    const int projected_segment_learning_count =
-        MaybeLearnZenzProjectedSegmentsToMozcHistory(
-            pending_zenz_feedback_.reverse_projected_learning_segments);
-
-    ZenzDebugOutput(absl::StrCat(
-        "[zenz-feedback] projected segment mozc history learning count=",
-        projected_segment_learning_count,
-        " context_class=", pending_zenz_feedback_.context_class));
-
-    int reverse_segment_learning_count = 0;
-    if (projected_segment_learning_count == 0) {
-      reverse_segment_learning_count =
-          MaybeLearnZenzReverseSegmentsToMozcHistory(
-              pending_zenz_feedback_.reverse_learning_segments);
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz-feedback] deferred compatibility mozc history projected=",
+          projected_segment_learning_count,
+          " fallback_full=", ZenzBool(learned_to_mozc_history),
+          " reverse_segments=", reverse_segment_learning_count,
+          " context_class=", pending_zenz_feedback_.context_class));
     }
-
-    ZenzDebugOutput(absl::StrCat(
-        "[zenz-feedback] reverse segment mozc history learning count=",
-        reverse_segment_learning_count,
-        " context_class=", pending_zenz_feedback_.context_class));
   } else if (pending_zenz_feedback_.action ==
-             PendingZenzFeedback::Action::kRejected) {
-    if (!IsExplicitZenzHardRejectReason(pending_zenz_feedback_.reason) &&
-        !pending_zenz_feedback_.has_final_committed_value) {
+             PendingZenzFeedback::Action::kCompareFinalCommit &&
+             CanRecordZenzFeedback(*context_)) {
+    if (!pending_zenz_feedback_.has_final_committed_value) {
       ZenzDebugOutput(absl::StrCat(
-          "[zenz-feedback] neutralize pending rejected without final commit ",
+          "[zenz-feedback] neutralize pending comparison without final commit ",
           ZenzRedactedTextStats("key", pending_zenz_feedback_.key),
           " ", ZenzRedactedTextStats("value", pending_zenz_feedback_.value),
           " context_class=", pending_zenz_feedback_.context_class,
           " reason=", pending_zenz_feedback_.reason));
-    } else if (!IsExplicitZenzHardRejectReason(pending_zenz_feedback_.reason) &&
-               pending_zenz_feedback_.final_committed_value ==
-                   pending_zenz_feedback_.value) {
+    } else if (pending_zenz_feedback_.require_final_committed_key_match &&
+               pending_zenz_feedback_.final_committed_key !=
+                   pending_zenz_feedback_.key) {
       ZenzDebugOutput(absl::StrCat(
-          "[zenz-feedback] neutralize pending rejected same final value ",
+          "[zenz-feedback] neutralize shadow comparison key mismatch ",
+          ZenzRedactedTextStats("key", pending_zenz_feedback_.key),
+          " ", ZenzRedactedTextStats(
+                   "final_key", pending_zenz_feedback_.final_committed_key),
+          " context_class=", pending_zenz_feedback_.context_class));
+    } else if (pending_zenz_feedback_.final_committed_value ==
+               pending_zenz_feedback_.value) {
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz-feedback] confirm final comparison accepted ",
           ZenzRedactedTextStats("key", pending_zenz_feedback_.key),
           " ", ZenzRedactedTextStats("value", pending_zenz_feedback_.value),
           " context_class=", pending_zenz_feedback_.context_class,
           " reason=", pending_zenz_feedback_.reason));
+
+      // A matching normal commit is positive evidence for the Zenz correction,
+      // but it is not an explicit Zenz commit. The normal conversion path has
+      // already handled Mozc history learning, so update only the Zenz feedback
+      // full-sequence observation here.
+      zenz_feedback_store_.RecordAccepted(
+          pending_zenz_feedback_.key,
+          pending_zenz_feedback_.context_class,
+          pending_zenz_feedback_.value);
     } else {
       ZenzDebugOutput(absl::StrCat(
-          "[zenz-feedback] confirm pending rejected ",
+          "[zenz-feedback] confirm final comparison rejected ",
           ZenzRedactedTextStats("key", pending_zenz_feedback_.key),
           " ", ZenzRedactedTextStats("value", pending_zenz_feedback_.value),
           " context_class=", pending_zenz_feedback_.context_class,
           " reason=", pending_zenz_feedback_.reason));
 
-      // Rejected feedback is full-sequence scoped too.  A final mismatch after
-      // Space revert should not create segment-local negative evidence.
+      // Mismatching feedback remains full-sequence scoped and must not create
+      // segment-local negative evidence.
       zenz_feedback_store_.RecordRejected(
           pending_zenz_feedback_.key,
           pending_zenz_feedback_.context_class,
@@ -6094,6 +6792,38 @@ void Session::DiscardPendingZenzFeedback(absl::string_view reason) {
     return;
   }
 
+  // When A recorded an accepted observation, Undo/Backspace/Escape append
+  // its positive-event compensation (not a rejected event). C's independent
+  // reversible handles are reverted even if A was disabled.
+  if (pending_zenz_feedback_.action ==
+      PendingZenzFeedback::Action::kAccepted) {
+    int reverted_mozc_history_count = 0;
+    if (pending_zenz_feedback_.mozc_history_learning_applied) {
+      for (auto it = pending_zenz_feedback_.mozc_history_revert_ids.rbegin();
+           it != pending_zenz_feedback_.mozc_history_revert_ids.rend(); ++it) {
+        if (context_->mutable_converter()->RevertExternalConversionLearning(
+                *it)) {
+          ++reverted_mozc_history_count;
+        }
+      }
+    }
+
+    ZenzDebugOutput(absl::StrCat(
+        "[zenz-feedback] rollback commit-point mozc history handles=",
+        reverted_mozc_history_count,
+        " reason=", reason));
+
+    // Only compensate an acceptance successfully appended by A. A failed
+    // append must not subtract a previously accepted observation for this key.
+    // Incognito remains the exception: never write the TSV while active.
+    if (pending_zenz_feedback_.feedback_acceptance_write_succeeded &&
+        IsZenzPersistentPersonalizationContextAllowed(*context_)) {
+      zenz_feedback_store_.RecordAcceptedRollback(
+          pending_zenz_feedback_.key, pending_zenz_feedback_.context_class,
+          pending_zenz_feedback_.value, reason);
+    }
+  }
+
   ZenzDebugOutput(absl::StrCat(
       "[zenz-feedback] discard pending feedback reason=", reason,
       " ", ZenzRedactedTextStats("key", pending_zenz_feedback_.key),
@@ -6108,6 +6838,10 @@ bool Session::SetPendingDirectCommitLearning(
     absl::string_view value,
     absl::string_view reason) {
   if (key.empty() || value.empty()) {
+    return false;
+  }
+
+  if (context_->client_context().is_private_input()) {
     return false;
   }
 
@@ -6213,10 +6947,16 @@ void Session::HandlePendingDirectCommitLearningForSessionCommand(
 
   switch (type) {
     case commands::SessionCommand::REVERT:
-    case commands::SessionCommand::RESET_CONTEXT:
     case commands::SessionCommand::UNDO:
       DiscardPendingDirectCommitLearning(
           "session_command_discard_after_direct_commit");
+      break;
+    case commands::SessionCommand::RESET_CONTEXT:
+      // Context loss commonly follows a committed search/form submission. It
+      // closes the rollback window; it is not evidence that the commit was
+      // undone.
+      ConfirmPendingDirectCommitLearning(
+          "session_command_reset_context_after_direct_commit");
       break;
     default:
       break;
@@ -6257,18 +6997,178 @@ void Session::HandlePendingZenzFeedbackForSessionCommand(
     commands::SessionCommand::CommandType type) {
   switch (type) {
     case commands::SessionCommand::REVERT:
-    case commands::SessionCommand::RESET_CONTEXT:
     case commands::SessionCommand::UNDO:
       DiscardPendingZenzFeedback("session_command_discard");
+      break;
+    case commands::SessionCommand::RESET_CONTEXT:
+      // A focus/page/context transition after commit is a confirmation, not an
+      // undo. kCompareFinalCommit without an observed final value remains
+      // neutral inside ConfirmPendingZenzFeedback().
+      ConfirmPendingZenzFeedback();
       break;
     default:
       break;
   }
 }
 
+bool Session::HasDeferredZenzLivePresentation() const {
+  return deferred_zenz_live_presentation_.has_value();
+}
+
+void Session::ClearDeferredZenzLivePresentation() {
+  deferred_zenz_live_presentation_.reset();
+}
+
+void Session::OverrideOutputWithDeferredZenzLivePresentation(
+    commands::Command* command) const {
+  if (!HasDeferredZenzLivePresentation()) {
+    return;
+  }
+
+  commands::Output* output = command->mutable_output();
+  if (output->has_candidate_window() &&
+      !IsPassiveLiveSuggestionCandidateWindow(output->candidate_window())) {
+    output->clear_candidate_window();
+  }
+  *output->mutable_preedit() =
+      deferred_zenz_live_presentation_->visible_preedit;
+  output->set_live_conversion(true);
+  output->set_live_conversion_pending(false);
+  output->set_zenz_live_correction_pending(true);
+  output->set_zenz_live_correction_applied(false);
+}
+
+void Session::RestoreDeferredZenzLivePresentationForEditing() {
+  if (!HasDeferredZenzLivePresentation()) {
+    return;
+  }
+
+  DeferredZenzLivePresentation state =
+      std::move(*deferred_zenz_live_presentation_);
+  deferred_zenz_live_presentation_.reset();
+
+  ++live_conversion_generation_;
+  live_conversion_pending_ = false;
+  pending_live_conversion_generation_ = 0;
+  pending_live_conversion_key_.clear();
+  pending_live_conversion_input_.Clear();
+  pending_live_conversion_suggestion_candidate_window_.Clear();
+  pending_live_conversion_suggestion_context_.reset();
+
+  CancelPendingZenzLiveCorrection();
+
+  if (live_conversion_active_ &&
+      context_->state() == ImeContext::CONVERSION) {
+    live_conversion_active_ = false;
+    live_conversion_from_composition_ = false;
+    SetSessionState(ImeContext::COMPOSITION, context_.get());
+    context_->mutable_converter()->Cancel();
+  }
+
+  live_conversion_key_ = std::move(state.previous_live_key);
+  // The typing-corrected reading belonged to the hidden conversion that is
+  // being discarded, not to the restored visible basis.
+  live_conversion_corrected_key_.clear();
+  live_conversion_corrected_raw_.clear();
+  live_conversion_preedit_ = std::move(state.previous_live_preedit);
+  live_conversion_value_ = std::move(state.previous_live_value);
+  live_conversion_preedit_output_ =
+      std::move(state.previous_live_preedit_output);
+  live_conversion_suggestion_candidate_window_ =
+      std::move(state.previous_live_suggestion_candidate_window);
+  live_conversion_suggestion_context_ =
+      std::move(state.previous_live_suggestion_context);
+  live_conversion_protected_spans_.clear();
+}
+
+bool Session::CommitDeferredZenzLivePresentationForSubmit(
+    commands::Command* command) {
+  if (!HasDeferredZenzLivePresentation()) {
+    return false;
+  }
+
+  PendingLiveConversionPresentation visible_presentation;
+  visible_presentation.key = deferred_zenz_live_presentation_->visible_key;
+  visible_presentation.raw_preedit =
+      deferred_zenz_live_presentation_->visible_raw_preedit;
+  visible_presentation.value =
+      deferred_zenz_live_presentation_->visible_value;
+  visible_presentation.preedit_output =
+      deferred_zenz_live_presentation_->visible_preedit;
+  if (deferred_zenz_live_presentation_->continued_input_presentation
+          .has_value()) {
+    visible_presentation.stable_spans =
+        deferred_zenz_live_presentation_->continued_input_presentation
+            ->stable_spans;
+  }
+
+  const std::string visible_key = visible_presentation.key;
+  const std::string visible_value = visible_presentation.value;
+
+  RestoreDeferredZenzLivePresentationForEditing();
+
+  if (visible_key.empty() || visible_value.empty()) {
+    return CommitInternal(
+        command, context_->GetRequest().zero_query_suggestion());
+  }
+
+  // Model this as the same visible-pending state used by delayed live
+  // conversion so Undo restores exactly what the user saw before Enter.
+  ++live_conversion_generation_;
+  live_conversion_pending_ = true;
+  pending_live_conversion_generation_ = live_conversion_generation_;
+  pending_live_conversion_key_ =
+      context_->composer().GetQueryForConversion();
+  pending_live_conversion_input_ = command->input();
+  pending_live_conversion_presentation_ = std::move(visible_presentation);
+
+  PushDirectCommitUndoContext();
+  ClearPendingRerankedPreeditCommitAfterConvertCancel();
+  ClearLiveConversionState();
+  CommitStringDirectly(visible_key, visible_value, command);
+  *context_->mutable_output() = command->output();
+  return true;
+}
+
+bool Session::RevealDeferredZenzLiveConversion(
+    commands::Command* command) {
+  if (!HasDeferredZenzLivePresentation() || !live_conversion_active_ ||
+      context_->state() != ImeContext::CONVERSION) {
+    return false;
+  }
+
+  const commands::Preedit live_preedit = live_conversion_preedit_output_;
+  const std::string live_value = live_conversion_value_;
+
+  CancelPendingZenzLiveCorrection();
+  ClearLiveConversionState();
+  context_->mutable_converter()->SetCandidateListVisible(false);
+
+  command->mutable_output()->set_consumed(true);
+  OutputMode(command);
+
+  commands::Output* output = command->mutable_output();
+  output->clear_candidate_window();
+  if (live_preedit.segment_size() > 0) {
+    *output->mutable_preedit() = live_preedit;
+    output->mutable_preedit()->set_cursor(Util::CharsLen(live_value));
+  } else {
+    Output(command);
+    output = command->mutable_output();
+    output->clear_candidate_window();
+  }
+
+  output->set_live_conversion(false);
+  output->set_live_conversion_pending(false);
+  output->set_zenz_live_correction_pending(false);
+  output->set_zenz_live_correction_applied(false);
+  return true;
+}
+
 void Session::CancelPendingZenzLiveCorrection() {
   ++zenz_live_generation_;
   pending_zenz_live_ = PendingZenzLiveCorrection();
+  ClearDeferredZenzLivePresentation();
 
   if (zenz_live_corrector_ != nullptr) {
     zenz_live_corrector_->CancelPending();
@@ -6278,6 +7178,7 @@ void Session::CancelPendingZenzLiveCorrection() {
 void Session::ClearZenzLiveCorrectionState() {
   ++zenz_live_generation_;
   pending_zenz_live_ = PendingZenzLiveCorrection();
+  ClearDeferredZenzLivePresentation();
 
   if (zenz_live_corrector_ != nullptr) {
     zenz_live_corrector_->CancelPending();
@@ -6291,13 +7192,14 @@ void Session::ClearZenzLiveCorrectionState() {
   zenz_live_context_class_.clear();
   zenz_live_left_context_.clear();
   zenz_live_preedit_output_.Clear();
+  zenz_live_stable_spans_.clear();
 }
 
 bool Session::MaybeApplyZenzFeedbackLiveCorrection(
     commands::Command* command) {
   const config::Config& config = context_->GetConfig();
 
-  if (!UseZenzFeedbackLearning(config)) {
+  if (!CanReuseZenzFeedbackAutomatically(*context_)) {
     return false;
   }
 
@@ -6369,34 +7271,53 @@ bool Session::MaybeApplyZenzFeedbackLiveCorrection(
   const uint32_t left_context_len =
       GetZenzLiveCorrectionLeftContextLength(config);
 
+  // Hand only the current line to the assembler; see
+  // ExtractZenzLeftContext().
   const std::string raw_left_context =
       ExtractZenzLeftContext(left_context_len);
-  const ZenzContextSanitizationResult context_result =
-      zenz_context_sanitizer_.SanitizeForZenz(
-          raw_left_context, left_context_len);
+  ZenzContextAssemblyInput context_input;
+  context_input.preceding_text = raw_left_context;
+  context_input.left_max_chars = left_context_len;
 
-  const std::string left_context_for_validation =
-      context_result.allowed_for_prompt
-          ? context_result.sanitized_context
-          : std::string();
+  const ZenzContextAssemblyResult assembled_context =
+      zenz_context_assembler_.Assemble(context_input);
+
+  const std::string& left_context_for_validation =
+      assembled_context.left.prompt_context;
 
   const std::string context_class =
-      context_result.context_class.empty()
+      assembled_context.left.context_class.empty()
           ? std::string("empty")
-          : context_result.context_class;
+          : assembled_context.left.context_class;
 
   const std::vector<ZenzFeedbackCandidate> feedback_candidates =
       zenz_feedback_store_.GetAcceptedCandidates(
           zenz_key, context_class,
-          GetZenzFeedbackAutoBlockPolicy(config));
+          GetZenzFeedbackReusePolicy(config));
 
   if (feedback_candidates.empty()) {
     return false;
   }
 
+  const absl::string_view feedback_symbol_style_source =
+      live_conversion_preedit_.empty() ? live_conversion_key_
+                                       : live_conversion_preedit_;
+
+  ZenzStrictReadingCache strict_reading_cache;
   for (const ZenzFeedbackCandidate& feedback_candidate :
        feedback_candidates) {
-    const std::string& feedback_value = feedback_candidate.value;
+    const std::string feedback_value =
+        ZenzOutputValidator::RepairUserControlledSymbols(
+            feedback_symbol_style_source, live_conversion_value_,
+            feedback_candidate.value);
+
+    if (feedback_value != feedback_candidate.value) {
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz-feedback] repaired user-controlled symbols ",
+          ZenzRedactedTextStats("value", feedback_value),
+          " ", ZenzRedactedTextStats("raw_value", feedback_candidate.value),
+          " context_class=", context_class));
+    }
 
     const ZenzTextPrivacyDecision feedback_value_privacy =
         EvaluateZenzLiveValuePrivacy(feedback_value);
@@ -6443,6 +7364,8 @@ bool Session::MaybeApplyZenzFeedbackLiveCorrection(
     adoption_input.mozc_value = live_conversion_value_;
     adoption_input.zenz_value = feedback_value;
     adoption_input.protected_spans = live_conversion_protected_spans_;
+    adoption_input.baseline_segments = BuildZenzAdoptionBaselineSegments(
+        live_conversion_preedit_output_, zenz_key, live_conversion_value_);
 
     const ZenzAdoptionResult adoption =
         zenz_adoption_policy_.Decide(adoption_input);
@@ -6459,6 +7382,35 @@ bool Session::MaybeApplyZenzFeedbackLiveCorrection(
     }
 
     const std::string adopted_feedback_value = adoption.value;
+
+    // Adoption may safely repair a learned Zenz candidate back to the exact
+    // normal Mozc surface. Such a result has no presentation value and must not
+    // create visible Zenz state. Keep scanning in case a later feedback
+    // candidate still provides a meaningful correction.
+    if (adopted_feedback_value == live_conversion_value_) {
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz-feedback] fast path candidate skipped "
+          "reason=same_as_mozc_after_adoption ",
+          ZenzRedactedTextStats("key", zenz_key),
+          " ", ZenzRedactedTextStats("value", adopted_feedback_value),
+          " context_class=", context_class,
+          " adoption=", adoption.reason,
+          " accepted_count=", feedback_candidate.accepted_count,
+          " rejected_count=", feedback_candidate.rejected_count));
+      continue;
+    }
+
+    if (config.use_zenz_strict_reading_preservation()) {
+      const ZenzValidationResult reading_validation = ValidateZenzStrictReading(
+          context_->mutable_converter(), zenz_key,
+          adopted_feedback_value, &strict_reading_cache);
+      if (!reading_validation.accept) {
+        ZenzDebugOutput(absl::StrCat(
+            "[zenz-feedback] fast path rejected reason=",
+            reading_validation.reason));
+        continue;
+      }
+    }
 
     ++zenz_live_generation_;
     pending_zenz_live_ = PendingZenzLiveCorrection();
@@ -6489,14 +7441,124 @@ bool Session::MaybeApplyZenzFeedbackLiveCorrection(
   return false;
 }
 
-bool Session::MaybeScheduleZenzLiveCorrection(commands::Command* command) {
+bool Session::ForceZenzLiveCorrection(
+    commands::Command* command, const bool bypass_automatic_feedback) {
+  // Explicit user action. Build a regular Mozc conversion as the baseline,
+  // then run the existing asynchronous Zenz validation/adoption pipeline.
+  // A manual request must never convert or export a password preedit.
+  if (IsGrimodexSecureInput() ||
+      context_->composer().GetInputFieldType() == commands::Context::PASSWORD) {
+    return DoNothing(command);
+  }
+  const bool previously_live = live_conversion_active_;
+  const bool originally_live_composition =
+      (live_conversion_active_ && live_conversion_from_composition_) ||
+      (live_conversion_pending_ && context_->GetConfig().use_live_conversion());
+  // True when this request rebuilds the Mozc baseline from the composer
+  // reading as typed.  Otherwise the converter still holds the segments of
+  // the current live conversion, including a typing-corrected reading.
+  bool reconverted = false;
+  if (context_->state() == ImeContext::COMPOSITION ||
+      (bypass_automatic_feedback &&
+       context_->state() == ImeContext::CONVERSION)) {
+    if (context_->composer().GetQueryForConversion().empty()) {
+      return DoNothing(command);
+    }
+    reconverted = true;
+    // A feedback-free invocation must regenerate even an existing
+    // conversion baseline; it may already contain feedback-ranked text.
+    engine::ConversionPreferences preferences =
+        context_->converter().conversion_preferences();
+    preferences.ignore_zenz_feedback = bypass_automatic_feedback;
+    if (context_->state() == ImeContext::CONVERSION) {
+      // Re-convert on a detached session context. StartConversion() resets
+      // EngineConverter's state on failure, so touching the active converter
+      // could strand the session in CONVERSION with no conversion result.
+      auto tentative_context = std::make_unique<ImeContext>(*context_);
+      if (!tentative_context->mutable_converter()->Convert(
+              tentative_context->composer(),
+              tentative_context->client_context(), preferences)) {
+        return DoNothing(command);
+      }
+      // Clone() deliberately drops external-learning rollback ownership.
+      // Now that conversion succeeded, transfer the original handles
+      // rather than losing them when replacing the session context.
+      // A failed handoff leaves the original context untouched.
+      if (!context_->mutable_converter()
+               ->TransferExternalConversionLearningOwnershipTo(
+                   tentative_context->mutable_converter())) {
+        return DoNothing(command);
+      }
+      // Discard superseded callbacks only when the replacement succeeded.
+      // The composer was already in CONVERSION: do not call SetSessionState,
+      // which resets the active input mode and can split a pending romaji chunk.
+      CancelPendingLiveConversion();
+      context_ = std::move(tentative_context);
+    } else {
+      // Preserve the established composition -> conversion transition.
+      CancelPendingLiveConversion();
+      if (!context_->mutable_converter()->Convert(
+              context_->composer(), context_->client_context(), preferences)) {
+        return DoNothing(command);
+      }
+      SetSessionState(ImeContext::CONVERSION, context_.get());
+    }
+  } else if (context_->state() != ImeContext::CONVERSION) {
+    return DoNothing(command);
+  }
+
+  command->mutable_output()->set_consumed(true);
+  Output(command);
+  const std::string key = context_->composer().GetQueryForConversion();
+  if (key.empty() || !command->output().has_preedit()) {
+    return true;
+  }
+  std::string unused_key;
+  std::string mozc_value;
+  ExtractPreeditKeyAndValue(command->output().preedit(), &unused_key,
+                            &mozc_value);
+  if (mozc_value.empty()) return true;
+
+  // Clear any earlier auto request before creating the explicit generation.
+  ClearZenzLiveCorrectionState();
+  live_conversion_active_ = true;
+  live_conversion_from_composition_ = originally_live_composition;
+  // A fresh conversion uses the composer reading as typed.  When the visible
+  // live conversion is reused unchanged, its typing-corrected reading still
+  // describes |mozc_value| and must remain the key handed to Zenz.
+  const bool keep_typing_corrected_key =
+      !reconverted && previously_live && live_conversion_key_ == key;
+  live_conversion_key_ = key;
+  if (!keep_typing_corrected_key) {
+    live_conversion_corrected_key_.clear();
+    live_conversion_corrected_raw_.clear();
+  }
+  live_conversion_preedit_ = context_->composer().GetStringForPreedit();
+  live_conversion_value_ = mozc_value;
+  live_conversion_preedit_output_ = command->output().preedit();
+  live_conversion_protected_spans_ = BuildZenzProtectedConversionSpans(
+      context_->converter(), command->output(), LiveConversionKeyForZenz(),
+      mozc_value);
+  if (!MaybeScheduleZenzLiveCorrection(
+          command, /*forced=*/true, bypass_automatic_feedback) &&
+      !previously_live) {
+    // Rejected by the regular privacy/eligibility gates. Preserve ordinary
+    // conversion semantics rather than leaving a spurious live-conversion mode.
+    ClearLiveConversionState();
+  }
+  return true;
+}
+
+bool Session::MaybeScheduleZenzLiveCorrection(
+    commands::Command* command, const bool forced,
+    const bool bypass_automatic_feedback) {
   const config::Config& config = context_->GetConfig();
 
-  if (!config.use_zenz_live_correction()) {
+  if (!forced && !config.use_zenz_live_correction()) {
     return false;
   }
 
-  if (!config.use_live_conversion()) {
+  if (!forced && !config.use_live_conversion()) {
     return false;
   }
 
@@ -6541,7 +7603,7 @@ bool Session::MaybeScheduleZenzLiveCorrection(commands::Command* command) {
   }
 
   const uint32_t min_key_len = GetZenzLiveCorrectionMinKeyLength(config);
-  if (Util::CharsLen(zenz_key) < min_key_len) {
+  if (!forced && Util::CharsLen(zenz_key) < min_key_len) {
     return false;
   }
 
@@ -6550,27 +7612,39 @@ bool Session::MaybeScheduleZenzLiveCorrection(commands::Command* command) {
   const uint32_t right_context_len =
       GetZenzLiveCorrectionRightContextLength(config);
 
+  const ZenzClientContextView zenz_client_context =
+      GetZenzClientContextView(context_->client_context());
+  // Hand only the current line to the assembler; see
+  // ExtractZenzLeftContext().
   const std::string raw_left_context =
       ExtractZenzLeftContext(left_context_len);
-  const ZenzContextSanitizationResult context_result =
-      zenz_context_sanitizer_.SanitizeForZenz(
-          raw_left_context, left_context_len);
-
-  const std::string left_context_for_prompt =
-      context_result.allowed_for_prompt
-          ? context_result.sanitized_context
-          : std::string();
-
+  // Right context is likewise limited to the rest of the current line.  The
+  // prompt builder deletes line feeds, so text from following lines would be
+  // concatenated to the current line without any separator.
+  absl::string_view following_text = zenz_client_context.following_text;
+  if (const size_t line_break_pos = following_text.find_first_of("\r\n");
+      line_break_pos != absl::string_view::npos) {
+    following_text = following_text.substr(0, line_break_pos);
+  }
+  // The selected right context is recorded only for diagnostic replay.
   const std::string raw_right_context =
-      ExtractZenzRightContext(right_context_len);
-  const ZenzContextSanitizationResult right_context_result =
-      zenz_context_sanitizer_.SanitizeForZenz(
-          raw_right_context, right_context_len);
-
-  const std::string right_context_for_prompt =
-      right_context_result.allowed_for_prompt
-          ? right_context_result.sanitized_context
+      ZenzDiagnosticCapture::IsEnabled()
+          ? ZenzContextSelector().SelectRight(following_text,
+                                              right_context_len)
           : std::string();
+  ZenzContextAssemblyInput context_input;
+  context_input.preceding_text = raw_left_context;
+  context_input.following_text = following_text;
+  context_input.left_max_chars = left_context_len;
+  context_input.right_max_chars = right_context_len;
+
+  const ZenzContextAssemblyResult assembled_context =
+      zenz_context_assembler_.Assemble(context_input);
+
+  const std::string& left_context_for_prompt =
+      assembled_context.left.prompt_context;
+  const std::string& right_context_for_prompt =
+      assembled_context.right.prompt_context;
 
   ZenzPromptOptions prompt_options;
   prompt_options.left_context = left_context_for_prompt;
@@ -6617,7 +7691,7 @@ bool Session::MaybeScheduleZenzLiveCorrection(commands::Command* command) {
   pending_zenz_live_.left_context = left_context_for_prompt;
   pending_zenz_live_.raw_right_context = raw_right_context;
   pending_zenz_live_.right_context = right_context_for_prompt;
-  pending_zenz_live_.context_class = context_result.context_class;
+  pending_zenz_live_.context_class = assembled_context.left.context_class;
   pending_zenz_live_.mozc_value = live_conversion_value_;
   pending_zenz_live_.symbol_style_source =
       live_conversion_preedit_.empty() ? std::string(zenz_key)
@@ -6628,25 +7702,32 @@ bool Session::MaybeScheduleZenzLiveCorrection(commands::Command* command) {
   pending_zenz_live_.settings = prompt_options.settings;
   pending_zenz_live_.prompt = prompt;
   pending_zenz_live_.protected_spans = protected_prompt.protected_spans;
+  pending_zenz_live_.baseline_segments = BuildZenzAdoptionBaselineSegments(
+      live_conversion_preedit_output_, zenz_key, live_conversion_value_);
   pending_zenz_live_.issued_at = Clock::GetAbslTime();
   pending_zenz_live_.pending = true;
   pending_zenz_live_.submitted = false;
+  pending_zenz_live_.forced = forced;
+  pending_zenz_live_.bypass_automatic_feedback =
+      bypass_automatic_feedback;
   pending_zenz_live_.poll_count = 0;
 
   ZenzDebugOutput(absl::StrCat(
       "[zenz] scheduled ",
       ZenzRedactedTextStats("key", zenz_key),
       " ", ZenzRedactedTextStats("mozc_value", live_conversion_value_),
-      " context_class=", context_result.context_class,
-      " context_allowed=", ZenzBool(context_result.allowed_for_prompt),
-      " context_reason=", context_result.reason,
+      " context_class=", assembled_context.left.context_class,
+      " context_allowed=",
+      ZenzBool(assembled_context.left.allowed_for_prompt),
+      " context_reason=", assembled_context.left.reason,
       " right_context_allowed=",
-      ZenzBool(right_context_result.allowed_for_prompt),
-      " right_context_reason=", right_context_result.reason,
+      ZenzBool(assembled_context.right.allowed_for_prompt),
+      " right_context_reason=", assembled_context.right.reason,
       " protected_prompt_replacements=",
       protected_prompt.placeholder_count));
 
-  const uint32_t delay_msec = GetZenzLiveCorrectionDelayMsec(config);
+  const uint32_t delay_msec =
+      forced ? 0 : GetZenzLiveCorrectionDelayMsec(config);
   if (delay_msec == 0) {
     ZenzDebugOutput("[zenz] start immediately");
     // The current command already contains the freshly generated live
@@ -6851,6 +7932,7 @@ bool Session::OutputCurrentLiveConversionWithZenzPending(
     output->set_live_conversion_pending(false);
     output->set_zenz_live_correction_pending(true);
     AttachCachedLiveConversionSuggestionCandidateWindow(output);
+    OverrideOutputWithDeferredZenzLivePresentation(command);
     return true;
   }
 
@@ -6895,8 +7977,8 @@ bool Session::OutputCurrentLiveConversionAfterZenzStop(
 
 ZenzLiveCorrector* Session::EnsureZenzLiveCorrector() {
   if (zenz_live_corrector_ == nullptr) {
-    zenz_live_corrector_ = std::make_unique<ZenzLiveCorrector>(
-        std::make_unique<ZenzNamedPipeClient>());
+    zenz_live_corrector_ =
+        std::make_unique<ZenzLiveCorrector>(CreateZenzClient());
   }
   return zenz_live_corrector_.get();
 }
@@ -6922,6 +8004,8 @@ bool Session::AdvancePendingZenzLiveCorrection(
   const config::Config& config = context_->GetConfig();
   const absl::Time now = Clock::GetAbslTime();
   const uint32_t timeout_msec = GetZenzLiveCorrectionTimeoutMsec(config);
+  const uint32_t deferred_presentation_timeout_msec =
+      GetZenzDeferredPresentationTimeoutMsec(config);
 
   if (!pending_zenz_live_.submitted) {
     pending_zenz_live_.issued_at = now;
@@ -7009,6 +8093,24 @@ bool Session::AdvancePendingZenzLiveCorrection(
         command, "zenz_async_corrector_missing");
   }
 
+  if (config.defer_live_conversion_display_until_zenz_result() &&
+      now - pending_zenz_live_.issued_at >=
+          absl::Milliseconds(deferred_presentation_timeout_msec)) {
+    ZenzDebugOutput(absl::StrCat(
+        "[zenz] deferred presentation timeout generation=",
+        pending_zenz_live_.generation,
+        " presentation_timeout_msec=",
+        deferred_presentation_timeout_msec,
+        " ", ZenzRedactedTextStats("key", pending_zenz_live_.key),
+        " ", ZenzRedactedTextStats("mozc_value",
+                                    pending_zenz_live_.mozc_value),
+        " context_class=", pending_zenz_live_.context_class));
+
+    CancelPendingZenzLiveCorrection();
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, "zenz_deferred_presentation_timeout");
+  }
+
   std::optional<ZenzLiveResponse> response =
       zenz_live_corrector_->TakeResult(pending_zenz_live_.generation);
 
@@ -7085,33 +8187,29 @@ bool Session::ApplyZenzLiveCorrectionResult(
         generation, "response", false, debug, response.value);
 
     CancelPendingZenzLiveCorrection();
-    Output(command);
-
-    if (command->output().has_preedit()) {
-      RestorePreeditSegmentKeysForSymbolStyle(
-          live_conversion_preedit_.empty()
-              ? live_conversion_key_
-              : live_conversion_preedit_,
-          command->mutable_output()->mutable_preedit());
-    }
-
-    command->mutable_output()->set_live_conversion(true);
-    command->mutable_output()->set_live_conversion_pending(false);
-    command->mutable_output()->set_zenz_live_correction_pending(false);
-    command->mutable_output()->set_zenz_live_correction_debug(debug);
-    return true;
+    return OutputCurrentLiveConversionAfterZenzStop(command, debug);
   }
 
-  std::string zenz_value = response.value;
-
-  // zenz sometimes returns the sanitized left context together with the current
-  // conversion result. The preedit should contain only the current composition
-  // result, so strip the already-known context prefix.
-  if (!pending_zenz_live_.left_context.empty() &&
-      StartsWithString(zenz_value, pending_zenz_live_.left_context)) {
-    zenz_value.erase(0, pending_zenz_live_.left_context.size());
+  // Do not erase a matching left-context prefix blindly: it can be part of
+  // the user's own reading.  Only strip an echo if the entire remainder is
+  // exactly the already-computed Mozc conversion; otherwise fail closed.
+  const ZenzContextPrefixDecision prefix =
+      ZenzOutputValidator::ResolveLeftContextPrefix(
+          response.value, pending_zenz_live_.left_context,
+          pending_zenz_live_.mozc_value);
+  if (!prefix.safe) {
+    ZenzDebugOutput("[zenz] ambiguous left_context prefix; fallback to Mozc");
+    CaptureZenzSessionDecision(generation, "left_context_prefix", false,
+                               "ambiguous_left_context_prefix",
+                               response.value);
+    CancelPendingZenzLiveCorrection();
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, "ambiguous_left_context_prefix");
+  }
+  std::string zenz_value = prefix.value;
+  if (prefix.stripped) {
     ZenzDebugOutput(absl::StrCat(
-        "[zenz] stripped left_context prefix ",
+        "[zenz] stripped verified left_context prefix ",
         ZenzRedactedTextStats("value", zenz_value),
         " context_class=", pending_zenz_live_.context_class));
   }
@@ -7135,8 +8233,8 @@ bool Session::ApplyZenzLiveCorrectionResult(
           ? pending_zenz_live_.key
           : pending_zenz_live_.symbol_style_source;
 
-  const std::string zenz_value_before_symbol_restore = zenz_value;
-  zenz_value = ZenzOutputValidator::RestoreUserVisibleSymbolStyle(
+  const std::string zenz_value_before_symbol_repair = zenz_value;
+  zenz_value = ZenzOutputValidator::RepairUserControlledSymbols(
       zenz_symbol_style_source, pending_zenz_live_.mozc_value, zenz_value);
 
   const std::string zenz_display_key =
@@ -7145,12 +8243,12 @@ bool Session::ApplyZenzLiveCorrectionResult(
           pending_zenz_live_.mozc_value,
           pending_zenz_live_.key);
 
-  if (zenz_value != zenz_value_before_symbol_restore) {
+  if (zenz_value != zenz_value_before_symbol_repair) {
     ZenzDebugOutput(absl::StrCat(
-        "[zenz] restored symbol style ",
+        "[zenz] repaired user-controlled symbols ",
         ZenzRedactedTextStats("value", zenz_value),
         " ", ZenzRedactedTextStats("raw_value",
-                                   zenz_value_before_symbol_restore),
+                                   zenz_value_before_symbol_repair),
         " context_class=", pending_zenz_live_.context_class));
   }
   CaptureZenzSessionStage(generation, "after_symbol_style_restore", zenz_value);
@@ -7165,7 +8263,10 @@ bool Session::ApplyZenzLiveCorrectionResult(
   validation_input.mozc_value = pending_zenz_live_.mozc_value;
   validation_input.zenz_value = zenz_value;
   validation_input.left_context = pending_zenz_live_.left_context;
-  validation_input.min_key_length = GetZenzLiveCorrectionMinKeyLength(config);
+  // The minimum reading length is an automatic-execution threshold, not
+  // a validity constraint for an explicit manual invocation.
+  validation_input.min_key_length =
+      pending_zenz_live_.forced ? 0 : GetZenzLiveCorrectionMinKeyLength(config);
   validation_input.allow_synthetic_candidate =
       config.use_zenz_synthetic_candidate();
 
@@ -7184,22 +8285,8 @@ bool Session::ApplyZenzLiveCorrectionResult(
         " context_class=", context_class));
 
     CancelPendingZenzLiveCorrection();
-    Output(command);
-
-    if (command->output().has_preedit()) {
-      RestorePreeditSegmentKeysForSymbolStyle(
-          live_conversion_preedit_.empty()
-              ? live_conversion_key_
-              : live_conversion_preedit_,
-          command->mutable_output()->mutable_preedit());
-    }
-
-    command->mutable_output()->set_live_conversion(true);
-    command->mutable_output()->set_live_conversion_pending(false);
-    command->mutable_output()->set_zenz_live_correction_pending(false);
-    command->mutable_output()->set_zenz_live_correction_debug(
-        validation.reason);
-    return true;
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, validation.reason);
   }
 
   const ZenzTextPrivacyDecision key_privacy =
@@ -7220,22 +8307,8 @@ bool Session::ApplyZenzLiveCorrectionResult(
         absl::StrCat("key_privacy_", key_privacy.reason), zenz_value);
 
     CancelPendingZenzLiveCorrection();
-    Output(command);
-
-    if (command->output().has_preedit()) {
-      RestorePreeditSegmentKeysForSymbolStyle(
-          live_conversion_preedit_.empty()
-              ? live_conversion_key_
-              : live_conversion_preedit_,
-          command->mutable_output()->mutable_preedit());
-    }
-
-    command->mutable_output()->set_live_conversion(true);
-    command->mutable_output()->set_live_conversion_pending(false);
-    command->mutable_output()->set_zenz_live_correction_pending(false);
-    command->mutable_output()->set_zenz_live_correction_debug(
-        absl::StrCat("key_privacy_", key_privacy.reason));
-    return true;
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, absl::StrCat("key_privacy_", key_privacy.reason));
   }
 
   const ZenzTextPrivacyDecision value_privacy =
@@ -7256,22 +8329,8 @@ bool Session::ApplyZenzLiveCorrectionResult(
         absl::StrCat("value_privacy_", value_privacy.reason), zenz_value);
 
     CancelPendingZenzLiveCorrection();
-    Output(command);
-
-    if (command->output().has_preedit()) {
-      RestorePreeditSegmentKeysForSymbolStyle(
-          live_conversion_preedit_.empty()
-              ? live_conversion_key_
-              : live_conversion_preedit_,
-          command->mutable_output()->mutable_preedit());
-    }
-
-    command->mutable_output()->set_live_conversion(true);
-    command->mutable_output()->set_live_conversion_pending(false);
-    command->mutable_output()->set_zenz_live_correction_pending(false);
-    command->mutable_output()->set_zenz_live_correction_debug(
-        absl::StrCat("value_privacy_", value_privacy.reason));
-    return true;
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, absl::StrCat("value_privacy_", value_privacy.reason));
   }
 
   ZenzAdoptionInput adoption_input;
@@ -7279,6 +8338,7 @@ bool Session::ApplyZenzLiveCorrectionResult(
   adoption_input.mozc_value = pending_zenz_live_.mozc_value;
   adoption_input.zenz_value = zenz_value;
   adoption_input.protected_spans = pending_zenz_live_.protected_spans;
+  adoption_input.baseline_segments = pending_zenz_live_.baseline_segments;
 
   const ZenzAdoptionResult adoption =
       zenz_adoption_policy_.Decide(adoption_input);
@@ -7295,24 +8355,28 @@ bool Session::ApplyZenzLiveCorrectionResult(
         " context_class=", context_class));
 
     CancelPendingZenzLiveCorrection();
-    Output(command);
-
-    if (command->output().has_preedit()) {
-      RestorePreeditSegmentKeysForSymbolStyle(
-          live_conversion_preedit_.empty()
-              ? live_conversion_key_
-              : live_conversion_preedit_,
-          command->mutable_output()->mutable_preedit());
-    }
-
-    command->mutable_output()->set_live_conversion(true);
-    command->mutable_output()->set_live_conversion_pending(false);
-    command->mutable_output()->set_zenz_live_correction_pending(false);
-    command->mutable_output()->set_zenz_live_correction_debug(adoption.reason);
-    return true;
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, adoption.reason);
   }
 
   zenz_value = adoption.value;
+
+  // Validation already rejects a raw Zenz value that is identical to Mozc, but
+  // adoption can repair an initially different candidate back to the exact
+  // baseline surface. Treat that final no-op exactly like same_as_mozc: do not
+  // expose it as a Zenz correction and do not feed it into feedback learning.
+  if (zenz_value == pending_zenz_live_.mozc_value) {
+    ZenzDebugOutput(absl::StrCat(
+        "[zenz] adoption produced no-op "
+        "reason=same_as_mozc_after_adoption ",
+        ZenzRedactedTextStats("value", zenz_value),
+        " context_class=", context_class,
+        " adoption=", adoption.reason));
+
+    CancelPendingZenzLiveCorrection();
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, "same_as_mozc_after_adoption");
+  }
 
   const ZenzTextPrivacyDecision adopted_value_privacy =
       EvaluateZenzLiveValuePrivacy(zenz_value);
@@ -7330,23 +8394,56 @@ bool Session::ApplyZenzLiveCorrectionResult(
         zenz_value);
 
     CancelPendingZenzLiveCorrection();
-    Output(command);
-    command->mutable_output()->set_live_conversion(true);
-    command->mutable_output()->set_live_conversion_pending(false);
-    command->mutable_output()->set_zenz_live_correction_pending(false);
-    command->mutable_output()->set_zenz_live_correction_debug(
-        absl::StrCat("adopted_value_privacy_",
-                     adopted_value_privacy.reason));
-    return true;
+    return OutputCurrentLiveConversionAfterZenzStop(
+        command, absl::StrCat("adopted_value_privacy_",
+                              adopted_value_privacy.reason));
   }
 
-  std::string feedback_reason = "feedback_learning_disabled";
+  if (config.use_zenz_strict_reading_preservation()) {
+    const ZenzValidationResult reading_validation = ValidateZenzStrictReading(
+        context_->mutable_converter(), pending_zenz_live_.key, zenz_value);
+    if (!reading_validation.accept) {
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz] strict reading rejected reason=", reading_validation.reason,
+          " ", ZenzRedactedTextStats("value", zenz_value),
+          " context_class=", context_class));
+      CancelPendingZenzLiveCorrection();
+      return OutputCurrentLiveConversionAfterZenzStop(
+          command, reading_validation.reason);
+    }
+  }
 
-  if (UseZenzFeedbackLearning(config)) {
-    const ZenzFeedbackDecision feedback_decision =
-        zenz_feedback_store_.Decide(
-            pending_zenz_live_.key, context_class, zenz_value,
-            GetZenzFeedbackAutoBlockPolicy(config));
+  std::string feedback_reason = "feedback_reuse_disabled";
+
+  // An explicit hard reject is a user instruction, not statistical reuse.
+  // It remains effective even with B=OFF, including for short readings.
+  // Incognito must not read persistent feedback of either kind.
+  if (!config.incognito_mode() &&
+      !context_->GetRequest().is_incognito_mode()) {
+    ZenzFeedbackDecision feedback_decision;
+    if (pending_zenz_live_.bypass_automatic_feedback) {
+      // Preserve explicit user hard-blocks, but do not consult statistical
+      // ranking or automatic rejection history on this invocation.
+      if (zenz_feedback_store_.IsManuallyBlocked(
+              pending_zenz_live_.key, context_class, zenz_value)) {
+        feedback_decision.action = ZenzFeedbackAction::kReject;
+        feedback_decision.reason = "feedback_hard_rejected";
+        feedback_decision.hard_rejected = true;
+      } else {
+        feedback_decision.reason = "feedback_bypassed";
+      }
+    } else if (config.use_zenz_feedback_reuse()) {
+      feedback_decision = zenz_feedback_store_.Decide(
+          pending_zenz_live_.key, context_class, zenz_value,
+          GetZenzFeedbackReusePolicy(config));
+    } else if (zenz_feedback_store_.IsManuallyBlocked(
+                   pending_zenz_live_.key, context_class, zenz_value)) {
+      feedback_decision.action = ZenzFeedbackAction::kReject;
+      feedback_decision.reason = "feedback_hard_rejected";
+      feedback_decision.hard_rejected = true;
+    } else {
+      feedback_decision.reason = "feedback_reuse_disabled";
+    }
 
     feedback_reason = feedback_decision.reason;
 
@@ -7361,14 +8458,19 @@ bool Session::ApplyZenzLiveCorrectionResult(
       CaptureZenzSessionDecision(
           generation, "feedback", false, feedback_decision.reason, zenz_value);
 
+      // Auto-block suppresses presentation, not inference. Keep the validated,
+      // adopted full-sequence result as a shadow observation and compare it
+      // with the user's eventual normal commit. Manual hard rejects remain
+      // absolute and do not self-recover through shadow feedback.
+      if (feedback_decision.auto_blocked) {
+        SetPendingZenzFeedbackComparison(
+            pending_zenz_live_.key, context_class, zenz_value,
+            "auto_block_shadow_compare", true);
+      }
+
       CancelPendingZenzLiveCorrection();
-      Output(command);
-      command->mutable_output()->set_live_conversion(true);
-      command->mutable_output()->set_live_conversion_pending(false);
-      command->mutable_output()->set_zenz_live_correction_pending(false);
-      command->mutable_output()->set_zenz_live_correction_debug(
-          feedback_decision.reason);
-      return true;
+      return OutputCurrentLiveConversionAfterZenzStop(
+          command, feedback_decision.reason);
     }
   }
 
@@ -7389,6 +8491,47 @@ bool Session::ApplyZenzLiveCorrectionResult(
   zenz_live_context_class_ = context_class.empty() ? "empty" : context_class;
   zenz_live_left_context_ = pending_zenz_live_.left_context;
   pending_zenz_live_.pending = false;
+
+  // Preserve previously proven reading/value boundaries across Zenz rounds.
+  // A newly computed Mozc result is allowed to extend this prefix, but its
+  // current segmentation must not coarsen an unchanged old boundary.
+  const std::vector<StablePresentationSpan>* previous_stable_spans = nullptr;
+  if (HasDeferredZenzLivePresentation() &&
+      deferred_zenz_live_presentation_->continued_input_presentation
+          .has_value()) {
+    previous_stable_spans =
+        &deferred_zenz_live_presentation_->continued_input_presentation
+             ->stable_spans;
+  } else if (pending_live_conversion_presentation_.has_value()) {
+    previous_stable_spans =
+        &pending_live_conversion_presentation_->stable_spans;
+  }
+
+  if (previous_stable_spans != nullptr) {
+    zenz_live_stable_spans_ =
+        MergeStablePresentationSpans(zenz_value, *previous_stable_spans);
+  } else {
+    zenz_live_stable_spans_ = BuildStablePresentationSpans(zenz_value);
+  }
+
+  // A Zenz response can arrive while the composer still ends in unresolved
+  // romaji.  Keep the stable presentation basis from before that suffix so the
+  // next key can rewrite the suffix (for example, "s" -> "す") without
+  // falling back to the hidden Mozc surface.  Once the query is fully resolved,
+  // the newly adopted Zenz result becomes the next stable visible basis.
+  const bool has_transient_trailing_alphabet =
+      context_->composer().GetQueryForPrediction() !=
+      context_->composer().GetQueryForConversion();
+  if (has_transient_trailing_alphabet &&
+      HasDeferredZenzLivePresentation() &&
+      deferred_zenz_live_presentation_->continued_input_presentation
+          .has_value()) {
+    pending_live_conversion_presentation_ =
+        deferred_zenz_live_presentation_->continued_input_presentation;
+  } else {
+    pending_live_conversion_presentation_.reset();
+  }
+  ClearDeferredZenzLivePresentation();
 
   return OutputZenzLiveCorrection(zenz_value, command);
 }
@@ -7417,6 +8560,7 @@ bool Session::OutputZenzLiveCorrection(
       commands::Preedit::Segment::HIGHLIGHT,
       preedit);
 
+  MarkPendingRomanTailOnPreedit(context_->composer(), preedit);
   preedit->set_cursor(Util::CharsLen(value));
 
   ZenzDebugOutput(absl::StrCat(
@@ -7454,12 +8598,22 @@ bool Session::RevertZenzLiveCorrectionToNormalConversion(
   const commands::Preedit live_preedit = live_conversion_preedit_output_;
   const std::string live_value = live_conversion_value_;
 
-  // This Space is already a conversion operation.  After peeling off the zenz
-  // layer, keep the converter's current segments but leave live conversion
-  // mode.  This makes the next character input follow normal conversion
-  // semantics: commit the restored Mozc result first, then start a new
-  // composition.
-  ClearLiveConversionState();
+  // Reverting the Zenz presentation does not inherently terminate live
+  // composition.  Preserve the live Mozc snapshot when the user selected
+  // live conversion; manual Zenz used with live conversion disabled retains
+  // the original ordinary-conversion behavior.
+  const bool keep_live_conversion =
+      context_->GetConfig().use_live_conversion() &&
+      live_conversion_active_ && live_conversion_from_composition_;
+  if (keep_live_conversion) {
+    // Cancel stale asynchronous results but retain live Mozc key/value/preedit
+    // and the converter's existing segments for continued input or Backspace.
+    CancelPendingLiveConversion();
+    ClearZenzLiveCorrectionState();
+    live_conversion_protected_spans_.clear();
+  } else {
+    ClearLiveConversionState();
+  }
   context_->mutable_converter()->SetCandidateListVisible(false);
 
   command->mutable_output()->set_consumed(true);
@@ -7477,7 +8631,7 @@ bool Session::RevertZenzLiveCorrectionToNormalConversion(
     output->clear_candidate_window();
   }
 
-  output->set_live_conversion(false);
+  output->set_live_conversion(keep_live_conversion);
   output->set_live_conversion_pending(false);
   output->set_zenz_live_correction_pending(false);
   output->set_zenz_live_correction_applied(false);
@@ -7515,6 +8669,7 @@ bool Session::CommitZenzLiveCorrectionResult(commands::Command* command) {
 
   ClearLiveConversionState();
   CommitStringDirectly(key, value, command);
+  ApplyPendingZenzAcceptedMozcHistoryLearning();
   return true;
 }
 
@@ -7564,12 +8719,26 @@ bool Session::CommitLiveConversionResult(
   return true;
 }
 
-bool Session::CommitPendingLiveConversionDisplayDirectly(
-    commands::Command* command) {
-  const std::string key = context_->composer().GetQueryForConversion();
-  const std::string raw_preedit = context_->composer().GetStringForPreedit();
+std::pair<std::string, std::string>
+Session::GetPendingLiveConversionDisplayCommitStrings() const {
+  const std::string key =
+      context_->composer().GetQueryForConversion();
+  const std::string raw_preedit =
+      context_->composer().GetStringForPreedit();
 
-  std::string value;
+  if (pending_live_conversion_presentation_.has_value()) {
+    const PendingLiveConversionPresentation& presentation =
+        *pending_live_conversion_presentation_;
+    if (!presentation.key.empty() && !presentation.raw_preedit.empty() &&
+        !presentation.value.empty() &&
+        presentation.preedit_output.segment_size() > 0 &&
+        StartsWithString(key, presentation.key) &&
+        StartsWithString(raw_preedit, presentation.raw_preedit)) {
+      std::string value = presentation.value;
+      value.append(raw_preedit.substr(presentation.raw_preedit.size()));
+      return {key, std::move(value)};
+    }
+  }
 
   const bool has_stable_live_conversion =
       !live_conversion_key_.empty() &&
@@ -7580,17 +8749,49 @@ bool Session::CommitPendingLiveConversionDisplayDirectly(
   if (has_stable_live_conversion &&
       StartsWithString(key, live_conversion_key_) &&
       StartsWithString(raw_preedit, live_conversion_preedit_)) {
-    const std::string suffix_value =
-        raw_preedit.substr(live_conversion_preedit_.size());
-
-    value = live_conversion_value_;
-    value.append(suffix_value);
-  } else {
-    value = context_->composer().GetStringForSubmission();
+    std::string value = live_conversion_value_;
+    value.append(raw_preedit.substr(live_conversion_preedit_.size()));
+    return {key, std::move(value)};
   }
+
+  return {key, context_->composer().GetStringForSubmission()};
+}
+
+bool Session::CommitPendingLiveConversionDisplayDirectly(
+    commands::Command* command) {
+  auto [key, value] =
+      GetPendingLiveConversionDisplayCommitStrings();
 
   ClearLiveConversionState();
   CommitStringDirectly(key, value, command);
+  return true;
+}
+
+bool Session::CommitPendingLiveConversionDisplayForSubmit(
+    commands::Command* command) {
+  if (!live_conversion_pending_ ||
+      context_->state() != ImeContext::COMPOSITION) {
+    return false;
+  }
+
+  auto [key, value] =
+      GetPendingLiveConversionDisplayCommitStrings();
+  if (key.empty() || value.empty()) {
+    CancelPendingLiveConversion();
+    return false;
+  }
+
+  // Enter accepts only the preedit already visible to the user. The pending
+  // converter result is speculative and must not be materialized, committed,
+  // or learned. Unlike direct-commit punctuation, Enter preserves Mozc Undo.
+  PushDirectCommitUndoContext();
+  ClearPendingRerankedPreeditCommitAfterConvertCancel();
+  ClearLiveConversionState();
+  CommitStringDirectly(key, value, command);
+
+  // Undo() reads the committed result from context_->output() to build the
+  // deletion range before restoring the pending preedit snapshot.
+  *context_->mutable_output() = command->output();
   return true;
 }
 
@@ -7723,14 +8924,56 @@ bool Session::InsertCharacter(commands::Command* command) {
 
   const commands::KeyEvent& key = command->input().key();
 
+  // A cancel-to-composition Zenz comparison normally treats the next inserted
+  // character as continued editing and neutralizes it. A configured
+  // direct-commit punctuation/symbol is different: it finalizes the restored
+  // preedit. Defer feedback confirmation until after insertion so the
+  // suffix-free preedit can be captured as the user's final choice.
+  const bool defer_pending_zenz_comparison_for_direct_commit =
+      pending_zenz_feedback_.pending &&
+      pending_zenz_feedback_.action ==
+          PendingZenzFeedback::Action::kCompareFinalCommit &&
+      pending_zenz_feedback_.require_final_committed_key_match &&
+      !pending_zenz_feedback_.has_final_committed_value &&
+      context_->state() == ImeContext::COMPOSITION &&
+      context_->composer().GetQueryForConversion() ==
+          pending_zenz_feedback_.key &&
+      CanDirectCommitPendingLiveConversionBeforeInsert(key);
+
+  // Space may have peeled a visible Zenz correction back to normal conversion.
+  // If the next inserted key is configured as a direct-commit trigger, the
+  // restored Mozc conversion is the commit produced by that same user action.
+  // Capture its final value, but keep the comparison pending until the short
+  // rollback window closes so Backspace/Escape/Ctrl+Z can still neutralize it.
+  const config::Config& config = context_->GetConfig();
+  const bool
+      defer_pending_zenz_comparison_for_conversion_direct_commit =
+          pending_zenz_feedback_.pending &&
+          pending_zenz_feedback_.action ==
+              PendingZenzFeedback::Action::kCompareFinalCommit &&
+          !pending_zenz_feedback_.has_final_committed_value &&
+          context_->state() == ImeContext::CONVERSION &&
+          config.use_direct_commit() &&
+          !config.use_auto_conversion() &&
+          key.input_style() == commands::KeyEvent::FOLLOW_MODE &&
+          key.mode() != commands::HALF_ASCII &&
+          key.mode() != commands::FULL_ASCII &&
+          context_->composer().GetLength() > 0 &&
+          context_->composer().GetLength() ==
+              context_->composer().GetCursor() &&
+          IsValidDirectCommitTriggerKey(config, key);
+
   // A pending direct-commit learning entry is finalized only when the next real
   // text input starts. If the next key is Backspace/Escape, it is discarded.
   HandlePendingDirectCommitLearningForKeyEvent(key);
 
-  // A pending zenz feedback entry is finalized only when the next real text
-  // input starts. This prevents learning immediately on Enter/Space, while still
-  // learning once the user continues typing after the committed result.
-  HandlePendingZenzFeedbackForKeyEvent(key);
+  // Exact kAccepted Zenz feedback and reversible generalized Mozc history are
+  // already applied at commit time. The next real text input only closes that
+  // rollback window. kCompareFinalCommit remains genuinely deferred until the
+  // user's final committed value is known.
+  if (!defer_pending_zenz_comparison_for_direct_commit) {
+    HandlePendingZenzFeedbackForKeyEvent(key);
+  }
 
   if (key.input_style() == commands::KeyEvent::DIRECT_INPUT &&
       context_->state() == ImeContext::PRECOMPOSITION) {
@@ -7814,6 +9057,8 @@ bool Session::InsertCharacter(commands::Command* command) {
   const bool was_pending_live_conversion = live_conversion_pending_;
   const std::string live_conversion_corrected_key_before_edit =
       live_conversion_corrected_key_;
+  const bool was_deferred_zenz_live_presentation =
+      HasDeferredZenzLivePresentation();
 
   // Preserve the visible zenz correction before editing cancels the temporary
   // live conversion state.
@@ -7836,6 +9081,10 @@ bool Session::InsertCharacter(commands::Command* command) {
     ClearPendingRerankedPreeditCommitAfterConvertCancel();
     if (had_visible_zenz_correction) {
       CommitZenzLiveCorrectionResult(command);
+    } else if (was_deferred_zenz_live_presentation) {
+      if (!CommitDeferredZenzLivePresentationForSubmit(command)) {
+        return false;
+      }
     } else if (live_conversion_active_) {
       const std::string live_key =
           live_conversion_corrected_key_.empty()
@@ -7861,10 +9110,74 @@ bool Session::InsertCharacter(commands::Command* command) {
     return true;
   }
 
+  // Decide whether this key would extend the trailing unresolved Roman input
+  // beyond the refresh budget before live-conversion editing tears down the
+  // currently visible passive-suggestion context. Composer is copyable, so the
+  // table-aware dry run does not mutate the real composition.
+  PassiveSuggestionSnapshot held_pending_roman_suggestion;
+  bool should_hold_pending_roman_suggestion = false;
+  // Special Romanji tables are software/mobile keyboard state machines
+  // (12-key, flick, mobile QWERTY, GODAN, NOTOUCH, etc.).  Their key_code
+  // streams are table commands rather than physical desktop Roman input and
+  // must retain the existing per-key suggestion/transliteration behavior.
+  const bool uses_standard_romanji_table =
+      context_->GetRequest().special_romanji_table() ==
+      commands::Request::DEFAULT_TABLE;
+
+  if ((context_->state() == ImeContext::COMPOSITION ||
+       live_conversion_active_ || live_conversion_pending_) &&
+      uses_standard_romanji_table &&
+      IsPendingRomanSuggestionHoldKey(key)) {
+    composer::Composer composer_after_insert_for_suggestion =
+        context_->composer();
+    composer_after_insert_for_suggestion.InsertCharacterKeyEvent(key);
+
+    // Shift-triggered temporary alphanumeric input also stores its raw ASCII
+    // sequence in CharChunk::pending_.  That state is not unresolved Roman
+    // input and must keep refreshing suggestion for every character.
+    const transliteration::TransliterationType input_mode_after_insert =
+        composer_after_insert_for_suggestion.GetInputMode();
+    const bool is_ascii_input_mode =
+        input_mode_after_insert == transliteration::HALF_ASCII ||
+        input_mode_after_insert == transliteration::FULL_ASCII;
+
+    if (!is_ascii_input_mode) {
+      should_hold_pending_roman_suggestion =
+          ShouldHoldSuggestionForPendingRoman(
+              composer_after_insert_for_suggestion);
+
+      // An ambiguous Roman prefix can already represent a usable reading.
+      // Refresh when DisplayAmbiguousResult changes the prediction query,
+      // even if the Roman input is still pending (e.g. am -> ams).
+      // Keep HOLD for raw incomplete Roman input such as a -> am, or
+      // for long alphabet-only prefixes such as lt -> lts.
+      if (should_hold_pending_roman_suggestion &&
+          composer_after_insert_for_suggestion
+              .HasTrailingDisplayedAmbiguousRomanResult() &&
+          context_->composer().GetQueryForPrediction() !=
+              composer_after_insert_for_suggestion.GetQueryForPrediction()) {
+        should_hold_pending_roman_suggestion = false;
+      }
+    }
+    if (should_hold_pending_roman_suggestion) {
+      CaptureVisiblePassiveSuggestionSnapshot(
+          &held_pending_roman_suggestion);
+    }
+  }
+
   // If the current conversion was started by live conversion, ordinary
-  // character input should continue editing the composition.  So cancel
-  // the temporary conversion before handling candidate shortcuts.
+  // character input should continue editing the composition. Preserve the
+  // exact presentation the user saw before canceling the temporary converter
+  // state. This is especially important after an adopted Zenz result: pending
+  // romaji such as a trailing consonant must extend the Zenz surface, not the
+  // hidden Mozc baseline.
+  std::optional<PendingLiveConversionPresentation> continued_presentation =
+      CapturePendingLiveConversionPresentationForContinuedInput();
   CancelLiveConversionForEditing();
+  if (continued_presentation.has_value()) {
+    pending_live_conversion_presentation_ =
+        std::move(*continued_presentation);
+  }
 
   // Handle shortcut keys selecting a candidate from a list.
   if (MaybeSelectCandidate(command)) {
@@ -7892,10 +9205,17 @@ bool Session::InsertCharacter(commands::Command* command) {
 
     // HandlePendingZenzFeedbackForKeyEvent() intentionally does not confirm
     // feedback while the session is still in CONVERSION, because conversion
-    // keys may still be part of selecting the result.  An ordinary text input
-    // that reaches this point has already committed the current conversion, so
-    // it is now the next real text input after the zenz decision.
-    ConfirmPendingZenzFeedback();
+    // keys may still be part of selecting the result. An ordinary text input
+    // normally closes the rollback window after committing the conversion.
+    //
+    // Direct-commit punctuation is different: the conversion commit and the
+    // punctuation commit are one user action, so keep kCompareFinalCommit
+    // pending through that action. Output() above has already captured the
+    // suffix-free final Mozc value. A following rollback key can therefore
+    // neutralize the observation before it is persisted as rejected feedback.
+    if (!defer_pending_zenz_comparison_for_conversion_direct_commit) {
+      ConfirmPendingZenzFeedback();
+    }
 
     if (key.input_style() == commands::KeyEvent::DIRECT_INPUT) {
       // Do ClearUndoContext() because it is a direct input.
@@ -7928,6 +9248,25 @@ bool Session::InsertCharacter(commands::Command* command) {
     const auto [direct_commit_key, direct_commit_value] =
         GetDirectCommitStringsWithDirectCommitSuffixFallback(
             composer_before_insert, key);
+
+    if (defer_pending_zenz_comparison_for_direct_commit) {
+      pending_zenz_feedback_.has_final_committed_value = true;
+      pending_zenz_feedback_.final_committed_key =
+          composer_before_insert.GetQueryForConversion();
+      pending_zenz_feedback_.final_committed_value =
+          composer_before_insert.GetStringForSubmission();
+
+      ZenzDebugOutput(absl::StrCat(
+          "[zenz-feedback] captured suffix-free final choice before direct "
+          "commit ",
+          ZenzRedactedTextStats(
+              "key", pending_zenz_feedback_.final_committed_key),
+          " ",
+          ZenzRedactedTextStats(
+              "value", pending_zenz_feedback_.final_committed_value),
+          " pending_reason=", pending_zenz_feedback_.reason));
+    }
+
     const bool learned_reranked_preedit_after_cancel =
         CommitPendingRerankedPreeditAfterConvertCancelForDirectCommit(
             composer_before_insert, command->input().context(),
@@ -7949,9 +9288,10 @@ bool Session::InsertCharacter(commands::Command* command) {
           " ", ZenzRedactedTextStats("value", zenz_value_before_edit),
           " suffix_chars=", Util::CharsLen(last_char)));
 
-      // Direct-commit punctuation is an explicit commit path, but keep the
-      // feedback pending until the next real text input.  If the next action is
-      // Backspace/Escape, the feedback is discarded.
+      // Direct-commit punctuation is an explicit commit point. The exact Zenz
+      // acceptance is persisted immediately. Generalized Mozc history is
+      // applied immediately after the direct commit and kept reversible during
+      // the same rollback window. Backspace/Escape/Ctrl+Z rolls back both.
       SetPendingZenzFeedbackAccepted(
           zenz_key_before_edit,
           zenz_context_class_before_edit,
@@ -7959,11 +9299,13 @@ bool Session::InsertCharacter(commands::Command* command) {
 
       ClearLiveConversionState();
       CommitStringDirectly(commit_key, commit_value, command);
+      ApplyPendingZenzAcceptedMozcHistoryLearning();
       return true;
     }
 
     if (!learned_reranked_preedit_after_cancel &&
-        (live_conversion_pending_ || was_pending_live_conversion)) {
+        (live_conversion_pending_ || was_pending_live_conversion ||
+         was_deferred_zenz_live_presentation)) {
       return CommitPendingLiveConversionDisplayDirectly(command);
     }
 
@@ -8001,6 +9343,17 @@ bool Session::InsertCharacter(commands::Command* command) {
     return true;
   }
 
+  if (defer_pending_zenz_comparison_for_direct_commit ||
+      defer_pending_zenz_comparison_for_conversion_direct_commit) {
+    // The physical key looked like a configured direct-commit trigger, but
+    // insertion did not produce a direct commit (for example because a custom
+    // roman rule transformed it). This is ordinary editing. A cancel-to-
+    // composition comparison remains neutral without a final commit, while a
+    // conversion comparison already has its final Mozc value and can now be
+    // finalized normally.
+    ConfirmPendingZenzFeedback();
+  }
+
   ClearPendingRerankedPreeditCommitAfterConvertCancel();
 
   if (context_->mutable_composer()->ShouldCommit()) {
@@ -8018,7 +9371,22 @@ bool Session::InsertCharacter(commands::Command* command) {
     return Convert(command);
   }
 
-  if (MaybeScheduleLiveConversion(command)) {
+  composition_holds_passive_suggestion_ = false;
+
+  if (MaybeScheduleLiveConversion(
+          command,
+          should_hold_pending_roman_suggestion
+              ? &held_pending_roman_suggestion
+              : nullptr)) {
+    return true;
+  }
+
+  if (should_hold_pending_roman_suggestion) {
+    // Keep the converter's existing suggestion state. Output() refreshes the
+    // preedit from the current Composer while avoiding StartPrediction().
+    composition_holds_passive_suggestion_ =
+        context_->converter().CheckState(EngineConverterInterface::SUGGESTION);
+    Output(command);
     return true;
   }
 
@@ -8106,7 +9474,8 @@ bool Session::InsertSpaceToggled(commands::Command* command) {
   }
 }
 
-bool Session::InsertSpaceHalfWidth(commands::Command* command) {
+bool Session::InsertSpaceHalfWidth(commands::Command* command,
+                                   bool allow_pass_through) {
   if (!(context_->state() &
         (ImeContext::PRECOMPOSITION | ImeContext::COMPOSITION |
          ImeContext::CONVERSION))) {
@@ -8116,7 +9485,7 @@ bool Session::InsertSpaceHalfWidth(commands::Command* command) {
   if (context_->state() == ImeContext::PRECOMPOSITION) {
     // TODO(komatsu): This is a hack to work around the problem with
     // the inconsistency between TestSendKey and SendKey.
-    if (IsPureSpaceKey(command->input().key())) {
+    if (allow_pass_through && IsPureSpaceKey(command->input().key())) {
       return EchoBackAndClearUndoContext(command);
     }
     // UndoContext will be cleared in |InsertCharacter| in this case.
@@ -8316,29 +9685,16 @@ bool Session::Commit(commands::Command* command) {
     return CommitInternal(command, /*trigger_zero_query_suggest=*/false);
   }
 
+  if (CommitDeferredZenzLivePresentationForSubmit(command)) {
+    return true;
+  }
+
   if (CommitZenzLiveCorrectionResult(command)) {
     return true;
   }
 
-  // Enter confirms what the user can currently see.  A pending delayed live
-  // conversion has not been shown yet, so do not materialize it just before
-  // committing.  Preserve any stable converted prefix and append the visible
-  // unconverted suffix instead.
-  if (live_conversion_pending_) {
-    // Keep Enter consistent with the ordinary CommitInternal() path: the
-    // committed result must remain undoable, even though this path commits the
-    // session-owned visible live-conversion overlay directly.  The ImeContext
-    // snapshot intentionally restores the underlying editable reading on
-    // Undo; the temporary converted-prefix display is not converter state.
-    PushUndoContext();
-
-    const bool committed =
-        CommitPendingLiveConversionDisplayDirectly(command);
-    if (committed && command->output().has_result()) {
-      // Undo calculates the deletion range from the previous committed output.
-      *context_->mutable_output() = command->output();
-    }
-    return committed;
+  if (CommitPendingLiveConversionDisplayForSubmit(command)) {
+    return true;
   }
 
   return CommitInternal(command,
@@ -8372,6 +9728,35 @@ bool Session::CommitFirstSuggestion(commands::Command* command) {
         context_->state() == ImeContext::PRECOMPOSITION)) {
     return DoNothing(command);
   }
+
+  // A delayed live conversion displays suggestions from a cloned context,
+  // while the real converter may still own suggestions for an older reading.
+  // Commit the exact displayed first suggestion, or fail closed.
+  if (live_conversion_pending_) {
+    const commands::CandidateWindow& window =
+        pending_live_conversion_suggestion_candidate_window_;
+    const ImeContext* suggestion_context =
+        pending_live_conversion_suggestion_context_.get();
+    if (!IsPassiveLiveSuggestionCandidateWindow(window) ||
+        suggestion_context == nullptr ||
+        suggestion_context->composer().GetQueryForConversion() !=
+            context_->composer().GetQueryForConversion()) {
+      return DoNothing(command);
+    }
+    commands::Output snapshot_output;
+    suggestion_context->converter().FillOutput(
+        suggestion_context->composer(), &snapshot_output);
+    if (!snapshot_output.has_candidate_window() ||
+        !HaveSamePassiveSuggestionCandidates(
+            window, snapshot_output.candidate_window())) {
+      return DoNothing(command);
+    }
+
+    auto displayed_context = std::make_unique<ImeContext>(*suggestion_context);
+    ClearLiveConversionState();
+    context_ = std::move(displayed_context);
+  }
+
   if (!context_->converter().IsActive()) {
     return DoNothing(command);
   }
@@ -8569,6 +9954,8 @@ bool ShouldSuppressShiftedAsciiAutoSuggestion(
 }  // namespace
 
 bool Session::Suggest(const commands::Input& input) {
+  composition_holds_passive_suggestion_ = false;
+
   if (IsGrimodexSecureInput()) {
     return false;
   }
@@ -8581,13 +9968,15 @@ bool Session::Suggest(const commands::Input& input) {
                                                context_->composer())) {
     live_conversion_suggestion_candidate_window_.Clear();
     pending_live_conversion_suggestion_candidate_window_.Clear();
+    live_conversion_suggestion_context_.reset();
+    pending_live_conversion_suggestion_context_.reset();
     return false;
   }
 
   // |request_suggestion| is not supposed to always ensure suppressing
   // suggestion since this field is used for performance improvement
   // by skipping interim suggestions.  However, the implementation of
-  // EngineConverter::SuggestWithPreferences does not perform suggest
+  // EngineConverter::Suggest does not perform suggest
   // whenever this flag is on.  So the caller should consider whether
   // this flag should be set or not.  Because the original logic was
   // implemented in Session::InserCharacter, we check the input.type()
@@ -8600,12 +9989,219 @@ bool Session::Suggest(const commands::Input& input) {
     ConversionPreferences conversion_preferences =
         context_->converter().conversion_preferences();
     conversion_preferences.request_suggestion = input.request_suggestion();
-    return context_->mutable_converter()->SuggestWithPreferences(
+    return context_->mutable_converter()->Suggest(
         context_->composer(), input.context(), conversion_preferences);
   }
 
   return context_->mutable_converter()->Suggest(context_->composer(),
                                                 input.context());
+}
+
+bool Session::CaptureVisiblePassiveSuggestionSnapshot(
+    PassiveSuggestionSnapshot* snapshot) const {
+  DCHECK(snapshot);
+
+  snapshot->candidate_window.Clear();
+  snapshot->context.reset();
+
+  auto capture_live_snapshot =
+      [&](const commands::CandidateWindow& candidate_window,
+          const ImeContext* suggestion_context) {
+        if (!IsPassiveLiveSuggestionCandidateWindow(candidate_window) ||
+            suggestion_context == nullptr ||
+            suggestion_context->composer().GetQueryForConversion() !=
+                context_->composer().GetQueryForConversion()) {
+          return false;
+        }
+
+        commands::Output suggestion_output;
+        suggestion_context->converter().FillOutput(
+            suggestion_context->composer(), &suggestion_output);
+        if (!suggestion_output.has_candidate_window() ||
+            !HaveSamePassiveSuggestionCandidates(
+                candidate_window, suggestion_output.candidate_window())) {
+          return false;
+        }
+
+        snapshot->candidate_window = candidate_window;
+        snapshot->context =
+            std::make_unique<ImeContext>(*suggestion_context);
+        return true;
+      };
+
+  if (live_conversion_active_ &&
+      capture_live_snapshot(
+          live_conversion_suggestion_candidate_window_,
+          live_conversion_suggestion_context_.get())) {
+    return true;
+  }
+
+  if (live_conversion_pending_ &&
+      capture_live_snapshot(
+          pending_live_conversion_suggestion_candidate_window_,
+          pending_live_conversion_suggestion_context_.get())) {
+    return true;
+  }
+
+  // While live conversion is active or pending, only a live suggestion
+  // snapshot can be visible.  The real converter may still retain a suggestion
+  // for an earlier reading, which must NEVER be resurrected as a HOLD result.
+  if (live_conversion_active_ || live_conversion_pending_) {
+    return false;
+  }
+
+  commands::Output current_output;
+  context_->converter().FillOutput(context_->composer(), &current_output);
+  if (!current_output.has_candidate_window() ||
+      !IsPassiveLiveSuggestionCandidateWindow(
+          current_output.candidate_window())) {
+    return false;
+  }
+
+  snapshot->candidate_window = current_output.candidate_window();
+  snapshot->context = std::make_unique<ImeContext>(*context_);
+  return true;
+}
+
+bool Session::AttachPassiveSuggestionSnapshot(
+    const commands::Input& input,
+    PassiveSuggestionSnapshot* snapshot,
+    commands::Output* output) {
+  DCHECK(snapshot);
+  DCHECK(output);
+
+  output->clear_candidate_window();
+
+  if (!IsPassiveLiveSuggestionCandidateWindow(snapshot->candidate_window) ||
+      snapshot->context == nullptr) {
+    return false;
+  }
+
+  if (SuppressSuggestion(input) ||
+      ShouldSuppressShiftedAsciiAutoSuggestion(
+          context_->GetConfig(), context_->composer())) {
+    snapshot->candidate_window.Clear();
+    snapshot->context.reset();
+    return false;
+  }
+
+  // The converter candidate state remains the exact state that produced the
+  // displayed IDs. Only Composer follows the user's newer unresolved Roman
+  // input. This lets FillOutput and candidate submission use the current
+  // composition without running prediction again.
+  *snapshot->context->mutable_composer() = context_->composer();
+  snapshot->context->set_state(ImeContext::COMPOSITION);
+
+  commands::Output suggestion_output;
+  snapshot->context->converter().FillOutput(
+      snapshot->context->composer(), &suggestion_output);
+  if (!suggestion_output.has_candidate_window() ||
+      !HaveSamePassiveSuggestionCandidates(
+          snapshot->candidate_window,
+          suggestion_output.candidate_window())) {
+    snapshot->candidate_window.Clear();
+    snapshot->context.reset();
+    return false;
+  }
+
+  *output->mutable_candidate_window() = snapshot->candidate_window;
+  return true;
+}
+
+bool Session::FocusDisplayedPassiveSuggestion(commands::Command* command) {
+  DCHECK(command);
+
+  // Ordinary (non-live) HOLD keeps the real converter in SUGGESTION state.
+  // Promote that exact list directly instead of calling Predict() with the
+  // newer pending-Roman composer.
+  if (composition_holds_passive_suggestion_ &&
+      context_->state() == ImeContext::COMPOSITION &&
+      context_->converter().CheckState(EngineConverterInterface::SUGGESTION)) {
+    commands::Output current_output;
+    context_->converter().FillOutput(context_->composer(), &current_output);
+    if (current_output.has_candidate_window() &&
+        IsPassiveLiveSuggestionCandidateWindow(
+            current_output.candidate_window()) &&
+        current_output.candidate_window().candidate_size() > 0 &&
+        current_output.candidate_window().candidate(0).has_id()) {
+      const int first_id =
+          current_output.candidate_window().candidate(0).id();
+      if (context_->mutable_converter()
+              ->FocusSuggestionCandidateWithoutPrediction(first_id)) {
+        composition_holds_passive_suggestion_ = false;
+        command->mutable_output()->set_consumed(true);
+        SetSessionState(ImeContext::CONVERSION, context_.get());
+        Output(command);
+        return true;
+      }
+    }
+
+    // If the held state is no longer internally serviceable, fail open to the
+    // ordinary prediction path instead of repeatedly treating it as held.
+    composition_holds_passive_suggestion_ = false;
+  }
+
+  const commands::CandidateWindow* candidate_window = nullptr;
+  const ImeContext* suggestion_context = nullptr;
+
+  // A newly generated live suggestion is just as authoritative as a held one.
+  // Both must focus the same candidate list that was actually displayed.
+  if (live_conversion_active_ &&
+      IsPassiveLiveSuggestionCandidateWindow(
+          live_conversion_suggestion_candidate_window_)) {
+    candidate_window = &live_conversion_suggestion_candidate_window_;
+    suggestion_context = live_conversion_suggestion_context_.get();
+  } else if (
+      live_conversion_pending_ &&
+      IsPassiveLiveSuggestionCandidateWindow(
+          pending_live_conversion_suggestion_candidate_window_)) {
+    candidate_window =
+        &pending_live_conversion_suggestion_candidate_window_;
+    suggestion_context =
+        pending_live_conversion_suggestion_context_.get();
+  }
+
+  if (candidate_window == nullptr || suggestion_context == nullptr ||
+      candidate_window->candidate_size() == 0 ||
+      !candidate_window->candidate(0).has_id() ||
+      !suggestion_context->converter().CheckState(
+          EngineConverterInterface::SUGGESTION) ||
+      suggestion_context->composer().GetQueryForConversion() !=
+          context_->composer().GetQueryForConversion()) {
+    return false;
+  }
+
+  commands::Output snapshot_output;
+  suggestion_context->converter().FillOutput(
+      suggestion_context->composer(), &snapshot_output);
+  if (!snapshot_output.has_candidate_window() ||
+      !HaveSamePassiveSuggestionCandidates(
+          *candidate_window, snapshot_output.candidate_window())) {
+    return false;
+  }
+
+  const int first_id = candidate_window->candidate(0).id();
+  auto focused_context = std::make_unique<ImeContext>(*suggestion_context);
+  if (!focused_context->mutable_converter()
+           ->FocusSuggestionCandidateWithoutPrediction(first_id)) {
+    return false;
+  }
+
+  // AttachPassiveSuggestionSnapshot() has already advanced the snapshot
+  // Composer to the user's current composition, including the unresolved Roman
+  // suffix.  Therefore Cancel can still return to the current input rather than
+  // rolling the Composer back to the older suggestion query.
+  if (HasVisibleZenzLiveCorrection()) {
+    SetPendingZenzFeedbackRejected("predict_held_suggestion_after_zenz");
+  }
+
+  command->mutable_output()->set_consumed(true);
+  composition_holds_passive_suggestion_ = false;
+  ClearLiveConversionState();
+  context_ = std::move(focused_context);
+  SetSessionState(ImeContext::CONVERSION, context_.get());
+  Output(command);
+  return true;
 }
 
 bool Session::AttachLiveConversionSuggestionCandidateWindow(
@@ -8617,6 +10213,7 @@ bool Session::AttachLiveConversionSuggestionCandidateWindow(
   // remain on live-conversion output; otherwise the renderer would show the
   // ordinary conversion candidate list without an explicit Space/Down action.
   live_conversion_suggestion_candidate_window_.Clear();
+  live_conversion_suggestion_context_.reset();
   output->clear_candidate_window();
 
   if (SuppressSuggestion(input)) {
@@ -8627,6 +10224,8 @@ bool Session::AttachLiveConversionSuggestionCandidateWindow(
                                                context_->composer())) {
     live_conversion_suggestion_candidate_window_.Clear();
     pending_live_conversion_suggestion_candidate_window_.Clear();
+    live_conversion_suggestion_context_.reset();
+    pending_live_conversion_suggestion_context_.reset();
     return false;
   }
 
@@ -8638,25 +10237,25 @@ bool Session::AttachLiveConversionSuggestionCandidateWindow(
   // copy only candidate_window to the live-conversion output.  The real
   // converter state, live_conversion_active_, selected segment, and Zenz state
   // are left untouched.
-  ImeContext suggestion_context(*context_);
-  if (suggestion_context.converter().IsActive()) {
-    suggestion_context.mutable_converter()->Cancel();
+  auto suggestion_context = std::make_unique<ImeContext>(*context_);
+  if (suggestion_context->converter().IsActive()) {
+    suggestion_context->mutable_converter()->Cancel();
   }
-  suggestion_context.set_state(ImeContext::COMPOSITION);
+  suggestion_context->set_state(ImeContext::COMPOSITION);
 
   bool has_suggestion = false;
   if (input.has_request_suggestion() &&
       input.type() == commands::Input::SEND_KEY) {
     ConversionPreferences conversion_preferences =
-        suggestion_context.converter().conversion_preferences();
+        suggestion_context->converter().conversion_preferences();
     conversion_preferences.request_suggestion = input.request_suggestion();
     has_suggestion =
-        suggestion_context.mutable_converter()->SuggestWithPreferences(
-            suggestion_context.composer(), input.context(),
+        suggestion_context->mutable_converter()->SuggestWithPreferences(
+            suggestion_context->composer(), input.context(),
             conversion_preferences);
   } else {
-    has_suggestion = suggestion_context.mutable_converter()->Suggest(
-        suggestion_context.composer(), input.context());
+    has_suggestion = suggestion_context->mutable_converter()->Suggest(
+        suggestion_context->composer(), input.context());
   }
 
   if (!has_suggestion) {
@@ -8664,8 +10263,8 @@ bool Session::AttachLiveConversionSuggestionCandidateWindow(
   }
 
   commands::Output suggestion_output;
-  suggestion_context.mutable_converter()->PopOutput(
-      suggestion_context.composer(), &suggestion_output);
+  suggestion_context->mutable_converter()->PopOutput(
+      suggestion_context->composer(), &suggestion_output);
 
   if (!suggestion_output.has_candidate_window() ||
       suggestion_output.candidate_window().candidate_size() == 0) {
@@ -8674,6 +10273,7 @@ bool Session::AttachLiveConversionSuggestionCandidateWindow(
 
   live_conversion_suggestion_candidate_window_ =
       suggestion_output.candidate_window();
+  live_conversion_suggestion_context_ = std::move(suggestion_context);
   *output->mutable_candidate_window() =
       live_conversion_suggestion_candidate_window_;
   return true;
@@ -8689,28 +10289,61 @@ bool Session::AttachCachedLiveConversionSuggestionCandidateWindow(
                                                context_->composer())) {
     live_conversion_suggestion_candidate_window_.Clear();
     pending_live_conversion_suggestion_candidate_window_.Clear();
+    live_conversion_suggestion_context_.reset();
+    pending_live_conversion_suggestion_context_.reset();
     return false;
   }
 
   const commands::CandidateWindow* candidate_window = nullptr;
-  if (live_conversion_suggestion_candidate_window_.has_category() &&
-      live_conversion_suggestion_candidate_window_.category() ==
-          commands::SUGGESTION &&
-      live_conversion_suggestion_candidate_window_.candidate_size() > 0 &&
-      !live_conversion_suggestion_candidate_window_.has_focused_index()) {
+  ImeContext* suggestion_context = nullptr;
+
+  if (live_conversion_active_ &&
+      IsPassiveLiveSuggestionCandidateWindow(
+          live_conversion_suggestion_candidate_window_)) {
     candidate_window = &live_conversion_suggestion_candidate_window_;
+    suggestion_context = live_conversion_suggestion_context_.get();
   } else if (
-      pending_live_conversion_suggestion_candidate_window_.has_category() &&
-      pending_live_conversion_suggestion_candidate_window_.category() ==
-          commands::SUGGESTION &&
-      pending_live_conversion_suggestion_candidate_window_.candidate_size() >
-          0 &&
-      !pending_live_conversion_suggestion_candidate_window_
-           .has_focused_index()) {
-    candidate_window = &pending_live_conversion_suggestion_candidate_window_;
+      live_conversion_pending_ &&
+      IsPassiveLiveSuggestionCandidateWindow(
+          pending_live_conversion_suggestion_candidate_window_)) {
+    candidate_window =
+        &pending_live_conversion_suggestion_candidate_window_;
+    suggestion_context =
+        pending_live_conversion_suggestion_context_.get();
   }
 
   if (candidate_window == nullptr) {
+    return false;
+  }
+
+  if (suggestion_context == nullptr ||
+      suggestion_context->composer().GetQueryForConversion() !=
+          context_->composer().GetQueryForConversion()) {
+    if (live_conversion_active_) {
+      live_conversion_suggestion_candidate_window_.Clear();
+      live_conversion_suggestion_context_.reset();
+    }
+    if (live_conversion_pending_) {
+      pending_live_conversion_suggestion_candidate_window_.Clear();
+      pending_live_conversion_suggestion_context_.reset();
+    }
+    return false;
+  }
+
+  commands::Output suggestion_snapshot;
+  suggestion_context->converter().FillOutput(
+      suggestion_context->composer(), &suggestion_snapshot);
+  if (!suggestion_snapshot.has_candidate_window() ||
+      !HaveSamePassiveSuggestionCandidates(
+          *candidate_window, suggestion_snapshot.candidate_window())) {
+    if (live_conversion_active_) {
+      live_conversion_suggestion_candidate_window_.Clear();
+      live_conversion_suggestion_context_.reset();
+    }
+    if (live_conversion_pending_) {
+      pending_live_conversion_suggestion_candidate_window_.Clear();
+      pending_live_conversion_suggestion_context_.reset();
+    }
     return false;
   }
 
@@ -9052,6 +10685,21 @@ bool Session::DeleteCandidateFromHistory(commands::Command* command) {
   return ConvertCancel(command);
 }
 
+bool Session::DeleteSelectedCandidate(commands::Command* command) {
+  if (IsGrimodexSecureInput()) {
+    return DoNothing(command);
+  }
+
+  std::optional<int> id = std::nullopt;
+  if (command->input().has_command() && command->input().command().has_id()) {
+    id = command->input().command().id();
+  }
+  if (!context_->mutable_converter()->DeleteOrSuppressCandidate(id)) {
+    return DoNothing(command);
+  }
+  return ConvertCancel(command);
+}
+
 bool Session::Convert(commands::Command* command) {
   if (IsGrimodexSecureInput()) {
     return DoNothing(command);
@@ -9062,8 +10710,12 @@ bool Session::Convert(commands::Command* command) {
   const std::string composition = context_->composer().GetQueryForConversion();
   const bool should_show_candidate_window_on_initial_conversion =
       context_->state() == ImeContext::COMPOSITION &&
-      context_->GetConfig().show_candidate_window_on_initial_conversion() &&
-      !context_->GetConfig().use_live_conversion();
+      ((context_->GetConfig().show_candidate_window_on_initial_conversion() &&
+        !context_->GetConfig().use_live_conversion()) ||
+       (context_->GetConfig().use_live_conversion() &&
+        context_->GetConfig().use_zip_code_conversion() &&
+        (composition.size() == 7 || composition.size() == 8) &&
+        HasExplicitPostalCodeToken(composition)));
 
   // TODO(komatsu): Make a function like ConvertOrSpace.
   // Handle a space key on the ASCII composition mode.
@@ -9101,7 +10753,13 @@ bool Session::Convert(commands::Command* command) {
     }
   }
 
-  if (!context_->mutable_converter()->Convert(context_->composer())) {
+  ConversionPreferences explicit_preferences =
+      context_->converter().conversion_preferences();
+  explicit_preferences.prefer_zipcode_literal_top =
+      context_->GetConfig().use_live_conversion();
+  if (!context_->mutable_converter()->Convert(
+          context_->composer(), context_->client_context(),
+          explicit_preferences)) {
     LOG(ERROR) << "Conversion failed for some reasons.";
     OutputComposition(command);
     return true;
@@ -9126,8 +10784,10 @@ bool Session::ConvertWithoutHistory(commands::Command* command) {
   ConversionPreferences preferences =
       context_->converter().conversion_preferences();
   preferences.use_history = false;
-  if (!context_->mutable_converter()->ConvertWithPreferences(
-          context_->composer(), preferences)) {
+  preferences.prefer_zipcode_literal_top =
+      context_->GetConfig().use_live_conversion();
+  if (!context_->mutable_converter()->Convert(
+          context_->composer(), context_->client_context(), preferences)) {
     LOG(ERROR) << "Conversion failed for some reasons.";
     OutputComposition(command);
     return true;
@@ -9294,7 +10954,7 @@ bool Session::Delete(commands::Command* command) {
   if (context_->mutable_composer()->Empty()) {
     SetStateToPredompositionAndCancel(context_.get());
     Output(command);
-  } else if (MaybeStartLiveConversion(command)) {
+  } else if (MaybeStartLiveConversionAfterEditing(command)) {
     return true;
   } else if (Suggest(command->input())) {
     Output(command);
@@ -9317,7 +10977,7 @@ bool Session::Backspace(commands::Command* command) {
   if (context_->mutable_composer()->Empty()) {
     SetStateToPredompositionAndCancel(context_.get());
     Output(command);
-  } else if (MaybeStartLiveConversion(command)) {
+  } else if (MaybeStartLiveConversionAfterEditing(command)) {
     return true;
   } else if (Suggest(command->input())) {
     Output(command);
@@ -9464,6 +11124,10 @@ bool Session::ConvertCancel(commands::Command* command) {
 bool Session::PredictAndConvertFromLiveConversion(commands::Command* command) {
   DCHECK(command);
 
+  if (FocusDisplayedPassiveSuggestion(command)) {
+    return true;
+  }
+
   CancelPendingLiveConversion();
   command->mutable_output()->set_consumed(true);
 
@@ -9504,14 +11168,28 @@ bool Session::PredictAndConvert(commands::Command* command) {
     return DoNothing(command);
   }
 
+  if (FocusDisplayedPassiveSuggestion(command)) {
+    return true;
+  }
+
+  const bool was_pending_live_conversion = live_conversion_pending_;
   CancelPendingLiveConversion();
+
+  // Do not seed a fresh prediction with stale real-converter suggestions that
+  // belonged to an earlier reading and were not displayed during pending live
+  // conversion.  Only the validated visible snapshot may be promoted above.
+  if (was_pending_live_conversion &&
+      context_->converter().CheckState(EngineConverterInterface::SUGGESTION)) {
+    context_->mutable_converter()->Cancel();
+  }
 
   if (context_->state() == ImeContext::CONVERSION) {
     return ConvertNext(command);
   }
 
   command->mutable_output()->set_consumed(true);
-  if (context_->mutable_converter()->Predict(context_->composer())) {
+  if (context_->mutable_converter()->Predict(context_->composer(),
+                                             context_->client_context())) {
     SetSessionState(ImeContext::CONVERSION, context_.get());
     Output(command);
   } else {
@@ -9532,7 +11210,90 @@ void Session::Output(commands::Command* command) {
   OutputMode(command);
   context_->mutable_converter()->PopOutput(context_->composer(),
                                            command->mutable_output());
+  MaybeUpdateCandidateActionFooter(command->mutable_output());
+
+  // Once live conversion materializes, EngineConverter::FillConversion()
+  // rebuilds the preedit from converter segments and therefore no longer passes
+  // through output::FillPreedit(), where pending roman metadata is normally
+  // attached. Restore only the presentation metadata here; key/value text and
+  // converter state remain unchanged.
+  if (context_->state() == ImeContext::CONVERSION &&
+      command->output().has_preedit()) {
+    MarkPendingRomanTailOnPreedit(
+        context_->composer(), command->mutable_output()->mutable_preedit());
+  }
+
+  command->mutable_output()->set_pre_live_conversion_reading(
+      command->output().has_preedit() &&
+      ShouldExposePreLiveConversionReading(*context_));
+
   ObservePendingZenzFeedbackCommittedResult(*command, "output_result");
+}
+
+void Session::MaybeUpdateCandidateActionFooter(
+    commands::Output* output) const {
+  if (output == nullptr || !output->has_candidate_window()) {
+    return;
+  }
+
+  commands::CandidateWindow* candidate_window =
+      output->mutable_candidate_window();
+  if (!candidate_window->has_focused_index()) {
+    return;
+  }
+
+  const commands::CandidateWindow_Candidate* focused_candidate = nullptr;
+  for (const commands::CandidateWindow_Candidate& candidate :
+       candidate_window->candidate()) {
+    if (candidate.index() == candidate_window->focused_index()) {
+      focused_candidate = &candidate;
+      break;
+    }
+  }
+  if (focused_candidate == nullptr || !focused_candidate->has_annotation()) {
+    return;
+  }
+
+  const commands::Annotation& annotation = focused_candidate->annotation();
+  const bool deletable = annotation.deletable();
+  const bool suppressible = annotation.suppressible();
+  if (!deletable && !suppressible) {
+    return;
+  }
+
+  const keymap::KeyMapManager& keymap = context_->GetKeyMapManager();
+  constexpr keymap::ConversionState::Commands kCommand =
+      keymap::ConversionState::DELETE_SELECTED_CANDIDATE;
+
+  std::vector<std::string> bindings;
+  switch (candidate_window->category()) {
+    case commands::PREDICTION:
+      bindings = keymap.GetKeyBindingsForPredictionCommand(kCommand);
+      break;
+    case commands::CONVERSION:
+      bindings = keymap.GetKeyBindingsForConversionCommand(kCommand);
+      break;
+    default:
+      bindings.clear();
+      break;
+  }
+
+  commands::Footer* footer = candidate_window->mutable_footer();
+  // Keep the compact action footer free of the legacy logo area.
+  footer->set_logo_visible(false);
+  if (bindings.empty()) {
+    // EngineOutput historically emits a fixed Ctrl+Del instruction.  The
+    // final Session output must not advertise an action that is unreachable
+    // in the active keymap.
+    footer->clear_label();
+    return;
+  }
+
+  const std::string key_label =
+      FormatCandidateActionKeyLabel(bindings.front());
+  footer->set_label(
+      absl::StrCat(key_label,
+                   deletable ? "で履歴削除" : "で候補非表示"));
 }
 
 void Session::OutputMode(commands::Command* command) const {
@@ -9556,8 +11317,12 @@ void Session::OutputMode(commands::Command* command) const {
 
 void Session::OutputComposition(commands::Command* command) const {
   OutputMode(command);
+  commands::Output* output = command->mutable_output();
   context_->converter().FillPreedit(
-      context_->composer(), command->mutable_output()->mutable_preedit());
+      context_->composer(), output->mutable_preedit());
+  output->set_pre_live_conversion_reading(
+      output->has_preedit() &&
+      ShouldExposePreLiveConversionReading(*context_));
 }
 
 void Session::OutputKey(commands::Command* command) const {
@@ -9729,6 +11494,27 @@ bool IsValidDirectCommitTriggerKey(const config::Config& config,
                             {"/", "／"}))) &&
           (config.direct_commit_key() &
            config::Config::DIRECT_COMMIT_MIDDLE_DOT));
+}
+
+bool IsKutenOrToutenChar(absl::string_view ch) {
+  absl::string_view rest;
+  char32_t codepoint = 0;
+  if (!Util::SplitLastChar32(ch, &rest, &codepoint) || !rest.empty()) {
+    return false;
+  }
+  switch (codepoint) {
+    case 0x002E:  // ASCII full stop
+    case 0xFF0E:  // Fullwidth full stop
+    case 0x3002:  // Ideographic full stop
+    case 0xFF61:  // Halfwidth ideographic full stop
+    case 0x002C:  // ASCII comma
+    case 0xFF0C:  // Fullwidth comma
+    case 0x3001:  // Ideographic comma
+    case 0xFF64:  // Halfwidth ideographic comma
+      return true;
+    default:
+      return false;
+  }
 }
 
 bool IsValidDirectCommitChar(const config::Config& config,
@@ -9931,11 +11717,23 @@ bool Session::CanDirectCommitAfterPunctuation(
   const std::string preedit = context_->composer().GetStringForPreedit();
   const absl::string_view last_char =
       Util::Utf8SubString(preedit, length - 1, 1);
-  if (last_char.empty()) {
+  if (last_char.empty() || !IsValidDirectCommitChar(config, last_char)) {
     return false;
   }
 
-  return IsValidDirectCommitChar(config, last_char);
+  // Keep numeric punctuation in the composition. Mozc normalizes Japanese
+  // punctuation after a number to decimal/grouping punctuation, so committing
+  // here would split inputs such as "3.14" and "1,000" at the punctuation.
+  if (length >= 2 && IsKutenOrToutenChar(last_char)) {
+    const absl::string_view last_prev_char =
+        Util::Utf8SubString(preedit, length - 2, 1);
+    if (!last_prev_char.empty() &&
+        Util::GetScriptType(last_prev_char) == Util::NUMBER) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 void Session::UpdateTime() {
@@ -9943,9 +11741,30 @@ void Session::UpdateTime() {
 }
 
 void Session::TransformInput(commands::Input* input) {
-  if (input->has_key()) {
-    context_->key_event_transformer().TransformKeyEvent(input->mutable_key());
+  if (!input->has_key()) {
+    return;
   }
+
+  context_->key_event_transformer().TransformKeyEvent(input->mutable_key());
+
+  if (!input->has_context() || !input->context().vertical_writing()) {
+    return;
+  }
+
+  VerticalWritingKeyState vertical_key_state = VerticalWritingKeyState::kOther;
+  if (context_->state() == ImeContext::COMPOSITION &&
+      context_->converter().CheckState(EngineConverterInterface::SUGGESTION)) {
+    vertical_key_state = VerticalWritingKeyState::kSuggestion;
+  } else if (context_->state() == ImeContext::CONVERSION) {
+    vertical_key_state =
+        context_->converter().CheckState(EngineConverterInterface::PREDICTION)
+            ? VerticalWritingKeyState::kPrediction
+            : VerticalWritingKeyState::kConversion;
+  }
+
+  TransformVerticalWritingCandidateArrowKey(
+      /*vertical_writing=*/true, vertical_key_state,
+      context_->GetKeyMapManager(), input->mutable_key());
 }
 
 bool Session::SwitchInputFieldType(commands::Command* command) {

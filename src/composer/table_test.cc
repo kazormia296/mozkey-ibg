@@ -304,40 +304,92 @@ TEST_F(TableTest, InvalidEntryTest) {
     EXPECT_EQ(table.LookUp("a"), nullptr);
   }
 
-  // Too long input
+  // Input and pending strings are limited to less than 300 bytes.
   {
     Table table;
-    std::string too_long;
-    // Maximum size is 300 now.
-    for (int i = 0; i < 1024; ++i) {
-      too_long += 'a';
-    }
-    table.AddRule(too_long, "test", "test");
-    EXPECT_EQ(table.LookUp(too_long), nullptr);
+    const std::string max_input(299, 'a');
+    EXPECT_NE(table.AddRule(max_input, "test", ""), nullptr);
 
-    table.AddRule("a", too_long, "test");
-    EXPECT_EQ(table.LookUp("a"), nullptr);
+    const std::string too_long_input(300, 'a');
+    EXPECT_EQ(table.AddRule(too_long_input, "test", ""), nullptr);
+  }
+  {
+    Table table;
+    const std::string max_pending(299, 'a');
+    EXPECT_NE(table.AddRule("b", "test", max_pending), nullptr);
 
-    table.AddRule("a", "test", too_long);
-    EXPECT_EQ(table.LookUp("a"), nullptr);
+    const std::string too_long_pending(300, 'a');
+    EXPECT_EQ(table.AddRule("c", "test", too_long_pending), nullptr);
   }
 
-  // reasonably long
+  // Output strings are limited to less than 1024 bytes.
   {
     Table table;
-    std::string reasonably_long;
-    // Maximum size is 300 now.
-    for (int i = 0; i < 200; ++i) {
-      reasonably_long += 'a';
+    const std::string max_output(1023, 'a');
+    EXPECT_NE(table.AddRule("a", max_output, ""), nullptr);
+
+    const std::string too_long_output(1024, 'a');
+    EXPECT_EQ(table.AddRule("b", too_long_output, ""), nullptr);
+  }
+}
+
+TEST_F(TableTest, CustomPunctuationSymbolAttributesSurviveOverrides) {
+  // A short rule can coexist with longer prefix-matching rules.  Rewriting
+  // punctuation/symbol output must not discard DisplayAmbiguousResult.
+  config_.set_custom_roman_table(
+      ".\t。\t\tDisplayAmbiguousResult\n"
+      "..\t。。\t\tDisplayAmbiguousResult\n"
+      "...\t…\t\tDisplayAmbiguousResult\n"
+      ",\t、\t\tDisplayAmbiguousResult EndChunk\n"
+      ",,\t、、\t\tDisplayAmbiguousResult\n"
+      "/\t・\t\tDisplayAmbiguousResult\n"
+      "//\t・・\t\tDisplayAmbiguousResult\n"
+      "[\t「\t\tDisplayAmbiguousResult\n"
+      "[[\t『\t\tDisplayAmbiguousResult\n"
+      "]\t」\t\tDisplayAmbiguousResult\n"
+      "]]\t』\t\tDisplayAmbiguousResult\n");
+
+  struct TestCase {
+    Config::PunctuationMethod punctuation;
+    Config::SymbolMethod symbol;
+    absl::string_view dot;
+    absl::string_view comma;
+    absl::string_view slash;
+    absl::string_view open;
+    absl::string_view close;
+  };
+  constexpr TestCase cases[] = {
+      {Config::TOUTEN_KUTEN, Config::CORNER_BRACKET_MIDDLE_DOT,
+       "。", "、", "・", "「", "」"},
+      {Config::COMMA_PERIOD, Config::SQUARE_BRACKET_SLASH,
+       "．", "，", "／", "[", "]"},
+      {Config::COMMA_KUTEN, Config::CORNER_BRACKET_SLASH,
+       "。", "，", "／", "「", "」"},
+      {Config::TOUTEN_PERIOD, Config::SQUARE_BRACKET_MIDDLE_DOT,
+       "．", "、", "・", "[", "]"},
+  };
+
+  commands::Request request;
+  for (const auto& test : cases) {
+    config_.set_punctuation_method(test.punctuation);
+    config_.set_symbol_method(test.symbol);
+    Table table;
+    ASSERT_TRUE(table.InitializeWithRequestAndConfig(request, config_));
+
+    const absl::string_view keys[] = {
+        ".", ",", "/", "[", "]", "..", "...", ",,", "//", "[[", "]]"};
+    const absl::string_view expected[] = {
+        test.dot, test.comma, test.slash, test.open, test.close,
+        "。。", "…", "、、", "・・", "『", "』"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+      const Entry* entry = table.LookUp(keys[i]);
+      ASSERT_NE(entry, nullptr) << keys[i];
+      EXPECT_EQ(entry->result(), expected[i]) << keys[i];
+      const TableAttributes expected_attributes =
+          keys[i] == "," ? (DISPLAY_AMBIGUOUS_RESULT | END_CHUNK)
+                         : DISPLAY_AMBIGUOUS_RESULT;
+      EXPECT_EQ(entry->attributes(), expected_attributes) << keys[i];
     }
-    table.AddRule(reasonably_long, "test", "test");
-    EXPECT_NE(table.LookUp(reasonably_long), nullptr);
-
-    table.AddRule("a", reasonably_long, "test");
-    EXPECT_NE(table.LookUp("a"), nullptr);
-
-    table.AddRule("a", "test", reasonably_long);
-    EXPECT_NE(table.LookUp("a"), nullptr);
   }
 }
 

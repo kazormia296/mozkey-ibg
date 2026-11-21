@@ -72,6 +72,8 @@ inline constexpr wchar_t kMessageReceiverMessageName[] =
     L"googlejapaneseinput.renderer.message";
 inline constexpr wchar_t kMessageReceiverHighlightMessageName[] =
     L"googlejapaneseinput.renderer.highlight.message";
+inline constexpr wchar_t kMessageReceiverSubmitMessageName[] =
+    L"googlejapaneseinput.renderer.submit.message";
 inline constexpr wchar_t kMessageReceiverClassName[] =
     L"googlejapaneseinput.renderer.window";
 inline constexpr wchar_t kCandidateWindowClassName[] =
@@ -127,6 +129,8 @@ inline constexpr wchar_t kMessageReceiverMessageName[] =
     L"mozkeyibg.renderer.message";
 inline constexpr wchar_t kMessageReceiverHighlightMessageName[] =
     L"mozkeyibg.renderer.highlight.message";
+inline constexpr wchar_t kMessageReceiverSubmitMessageName[] =
+    L"mozkeyibg.renderer.submit.message";
 inline constexpr wchar_t kMessageReceiverClassName[] =
     L"mozkeyibg.renderer.window";
 inline constexpr wchar_t kCandidateWindowClassName[] =

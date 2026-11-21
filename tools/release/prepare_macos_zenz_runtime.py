@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Build and stage the pinned arm64 macOS Zenz runtime.
+"""Shared llama.cpp pins and helpers for the Mozkey IbG Zenz runtime tooling.
 
-The generated files are intentionally not checked in.  A macOS package build
-must run this tool first; Bazel then fails closed if any staged input is absent.
+prepare_linux_zenz_runtime.py and preflight_release_inputs.py import the pinned
+llama.cpp source identity and the build helpers from this module.
+
+Its own entry point builds the former fork-specific arm64 macOS runtime
+(unpatched llama.cpp plus the normalized GGUF) into
+src/mac/zenz_runtime/generated.  Since the sync to upstream Mozkey v1.0.0 the
+macOS package no longer consumes that tree: //mac:package ships upstream's
+Universal runtime, built and staged by
+src/mac/installer/zenz_runtime/build_universal_runtime.zsh and
+stage_runtime_assets.zsh (see docs/build_mozc_in_osx.md).
 """
 
 from __future__ import annotations

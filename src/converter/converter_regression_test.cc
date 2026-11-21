@@ -37,6 +37,7 @@
 #include "engine/engine.h"
 #include "engine/engine_factory.h"
 #include "protocol/commands.pb.h"
+#include "protocol/config.pb.h"
 #include "request/conversion_request.h"
 #include "testing/gunit.h"
 #include "testing/mozctest.h"
@@ -91,6 +92,138 @@ TEST_F(ConverterRegressionTest, Regression3323108) {
   EXPECT_TRUE(converter->ResizeSegment(&segments, default_request, 1, 2));
   EXPECT_EQ(segments.conversion_segments_size(), 2);
   EXPECT_EQ(segments.conversion_segment(1).key(), "きものをぬぐ");
+}
+
+TEST_F(ConverterRegressionTest, HyphenlessZipcodeConversion) {
+  std::unique_ptr<Engine> engine = EngineFactory::Create().value();
+  std::shared_ptr<const ConverterInterface> converter = engine->GetConverter();
+  ASSERT_TRUE(converter);
+
+  config::Config config;
+  config.set_use_zip_code_conversion(true);
+  config.set_space_character_form(config::Config::FUNDAMENTAL_HALF_WIDTH);
+
+  for (const absl::string_view input : {"1000000", "１００００００"}) {
+    composer::Composer composer;
+    composer.SetPreeditTextForTestOnly(input);
+    const ConversionRequest request = ConversionRequestBuilder()
+                                          .SetComposer(composer)
+                                          .SetConfig(config)
+                                          .Build();
+    EXPECT_EQ(request.key(), "1000000");
+    EXPECT_TRUE(request.options().enable_hyphenless_zipcode_alias);
+
+    Segments segments;
+    ASSERT_TRUE(converter->StartConversion(request, &segments)) << input;
+
+    bool found_address = false;
+    bool found_combined = false;
+    for (const Segment& segment : segments.conversion_segments()) {
+      for (const auto& candidate : segment.candidates()) {
+        if (candidate->key == "1000000" &&
+            candidate->value == "東京都千代田区") {
+          found_address = true;
+        }
+        if (candidate->key == "1000000" &&
+            candidate->description == "郵便番号と住所" &&
+            candidate->value == "1000000 東京都千代田区") {
+          found_combined = true;
+        }
+      }
+    }
+    EXPECT_TRUE(found_address) << input;
+    EXPECT_TRUE(found_combined) << input;
+  }
+}
+
+TEST_F(ConverterRegressionTest, HyphenlessZipcodeInExplicitSentence) {
+  std::unique_ptr<Engine> engine = EngineFactory::Create().value();
+  std::shared_ptr<const ConverterInterface> converter = engine->GetConverter();
+  ASSERT_TRUE(converter);
+  config::Config config;
+  config.set_use_zip_code_conversion(true);
+
+  composer::Composer composer;
+  composer.SetPreeditTextForTestOnly("きょうは1000000です");
+  const ConversionRequest request = ConversionRequestBuilder()
+                                        .SetComposer(composer)
+                                        .SetConfig(config)
+                                        .Build();
+  ASSERT_TRUE(request.options().enable_hyphenless_zipcode_alias);
+  Segments segments;
+  ASSERT_TRUE(converter->StartConversion(request, &segments));
+  bool found_postal_address = false;
+  for (const Segment& segment : segments.conversion_segments()) {
+    for (const converter::Candidate* candidate : segment.candidates()) {
+      if (candidate->key == "1000000" &&
+          candidate->value == "東京都千代田区") {
+        found_postal_address = true;
+      }
+    }
+  }
+  EXPECT_TRUE(found_postal_address) << segments.DebugString();
+}
+
+// An alias at an internal lattice offset must respect the preceding ASCII
+// letter, and prefix lookup must respect the following ASCII letter.
+TEST_F(ConverterRegressionTest, HyphenlessZipcodeRejectsAsciiIdentifiers) {
+  std::unique_ptr<Engine> engine = EngineFactory::Create().value();
+  std::shared_ptr<const ConverterInterface> converter = engine->GetConverter();
+  ASSERT_TRUE(converter);
+  config::Config config;
+  config.set_use_zip_code_conversion(true);
+
+  for (const absl::string_view input : {
+           "ID1000000", "1000000ABC", "x1000000y", "1231000000"}) {
+    SCOPED_TRACE(input);
+    composer::Composer composer;
+    composer.SetPreeditTextForTestOnly(input);
+    const ConversionRequest request = ConversionRequestBuilder()
+                                          .SetComposer(composer)
+                                          .SetConfig(config)
+                                          .Build();
+    ASSERT_TRUE(request.options().enable_hyphenless_zipcode_alias);
+    Segments segments;
+    ASSERT_TRUE(converter->StartConversion(request, &segments));
+    for (const Segment& segment : segments.conversion_segments()) {
+      for (const auto& candidate : segment.candidates()) {
+        EXPECT_FALSE(candidate->key == "1000000" &&
+                     candidate->value == "東京都千代田区")
+            << input << ": " << segments.DebugString();
+      }
+    }
+  }
+}
+
+TEST_F(ConverterRegressionTest, HyphenlessZipcodeAliasRequestScope) {
+  config::Config config;
+  config.set_use_zip_code_conversion(true);
+  for (const absl::string_view input : {
+           "10000000", "1231000000", "1000000です", "きょうは1000000", "100-0000"}) {
+    composer::Composer composer;
+    composer.SetPreeditTextForTestOnly(input);
+    const ConversionRequest request = ConversionRequestBuilder()
+                                          .SetComposer(composer)
+                                          .SetConfig(config)
+                                          .Build();
+    EXPECT_TRUE(request.options().enable_hyphenless_zipcode_alias) << input;
+  }
+  composer::Composer composer;
+  composer.SetPreeditTextForTestOnly("1000000");
+  const ConversionRequest suggestion = ConversionRequestBuilder()
+                                           .SetComposer(composer)
+                                           .SetConfig(config)
+                                           .SetRequestType(RequestType::SUGGESTION)
+                                           .Build();
+  EXPECT_FALSE(suggestion.options().enable_hyphenless_zipcode_alias);
+  ConversionOptions realtime_options;
+  realtime_options.used_in_predictor_realtime_conversion = true;
+  const ConversionRequest realtime = ConversionRequestBuilder()
+                                         .SetComposer(composer)
+                                         .SetConfig(config)
+                                         .SetOptions(realtime_options)
+                                         .Build();
+  EXPECT_FALSE(realtime.options().enable_hyphenless_zipcode_alias);
 }
 
 }  // namespace

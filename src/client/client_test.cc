@@ -44,6 +44,7 @@
 #include "base/number_util.h"
 #include "base/strings/assign.h"
 #include "base/version.h"
+#include "client/character_renderability.h"
 #include "client/client_interface.h"
 #include "composer/key_parser.h"
 #include "config/config_handler.h"
@@ -289,6 +290,7 @@ TEST_F(ClientTest, SendKeyWithContext) {
   context.set_preceding_text(kPrecedingText);
   context.set_following_text(kFollowingText);
   context.set_suppress_suggestion(kSuppressSuggestion);
+  context.set_vertical_writing(true);
 
   commands::Output mock_output;
   mock_output.set_id(mock_id);
@@ -306,6 +308,7 @@ TEST_F(ClientTest, SendKeyWithContext) {
   EXPECT_EQ(input.context().preceding_text(), kPrecedingText);
   EXPECT_EQ(input.context().following_text(), kFollowingText);
   EXPECT_EQ(input.context().suppress_suggestion(), kSuppressSuggestion);
+  EXPECT_TRUE(input.context().vertical_writing());
 }
 
 TEST_F(ClientTest, TestSendKey) {
@@ -342,6 +345,7 @@ TEST_F(ClientTest, TestSendKeyWithContext) {
   context.set_preceding_text(kPrecedingText);
   context.set_following_text(kFollowingText);
   context.set_suppress_suggestion(kSuppressSuggestion);
+  context.set_vertical_writing(true);
 
   commands::Output mock_output;
   mock_output.Clear();
@@ -360,6 +364,7 @@ TEST_F(ClientTest, TestSendKeyWithContext) {
   EXPECT_EQ(input.context().preceding_text(), kPrecedingText);
   EXPECT_EQ(input.context().following_text(), kFollowingText);
   EXPECT_EQ(input.context().suppress_suggestion(), kSuppressSuggestion);
+  EXPECT_TRUE(input.context().vertical_writing());
 }
 
 TEST_F(ClientTest, SendCommand) {
@@ -394,6 +399,7 @@ TEST_F(ClientTest, SendCommandWithContext) {
   context.set_preceding_text(kPrecedingText);
   context.set_following_text(kFollowingText);
   context.set_suppress_suggestion(kSuppressSuggestion);
+  context.set_vertical_writing(true);
 
   commands::Output mock_output;
   mock_output.Clear();
@@ -411,6 +417,7 @@ TEST_F(ClientTest, SendCommandWithContext) {
   EXPECT_EQ(input.context().preceding_text(), kPrecedingText);
   EXPECT_EQ(input.context().following_text(), kFollowingText);
   EXPECT_EQ(input.context().suppress_suggestion(), kSuppressSuggestion);
+  EXPECT_TRUE(input.context().vertical_writing());
 }
 
 TEST_F(ClientTest, IsDirectModeCommandPresetTest) {
@@ -864,6 +871,18 @@ TEST_F(ClientTest, TranslateProtoBufToMozcToolArgTest) {
   output.set_launch_tool_mode(commands::Output::WORD_REGISTER_DIALOG);
   EXPECT_TRUE(client::Client::TranslateProtoBufToMozcToolArg(output, &mode));
   EXPECT_EQ(mode, "word_register_dialog");
+}
+
+TEST_F(ClientTest, DefaultRequestHasRenderableCharacterGroupsTest) {
+  const int mock_id = 1;
+  EXPECT_TRUE(SetupConnection(mock_id));
+  EXPECT_TRUE(client_->EnsureSession());
+
+  commands::Input input;
+  GetGeneratedInput(&input);
+  EXPECT_TRUE(input.has_request());
+  EXPECT_EQ(input.request().additional_renderable_character_groups_size(),
+            CharacterRenderability::GetSupportedGroups().size());
 }
 
 TEST_F(ClientTest, InitRequestForSvsJapaneseTest) {

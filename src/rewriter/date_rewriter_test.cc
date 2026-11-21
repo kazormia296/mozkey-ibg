@@ -52,6 +52,7 @@
 #include "protocol/commands.pb.h"
 #include "protocol/config.pb.h"
 #include "request/conversion_request.h"
+#include "request/options.h"
 #include "rewriter/rewriter_interface.h"
 #include "testing/gmock.h"
 #include "testing/gunit.h"
@@ -99,6 +100,15 @@ void InsertCandidate(const absl::string_view key, const absl::string_view value,
   cand->content_value = std::string(value);
 }
 
+bool HasCandidate(const Segment& segment, absl::string_view value) {
+  for (size_t i = 0; i < segment.candidates_size(); ++i) {
+    if (segment.candidate(i).value == value) {
+      return true;
+    }
+  }
+  return false;
+}
+
 Matcher<const converter::Candidate*> ValueIs(absl::string_view value) {
   return Field(&converter::Candidate::value, value);
 }
@@ -113,7 +123,7 @@ Matcher<const converter::Candidate*> ValueAndDescAre(absl::string_view value,
 // An action that invokes a DictionaryInterface::Callback with the token whose
 // value is set to the given one.
 struct InvokeCallbackWithUserDictionaryToken {
-  void operator()(absl::string_view key, const ConversionRequest& convreq,
+  void operator()(absl::string_view key, const ConversionOptions& options,
                   DictionaryInterface::Callback* callback) {
     for (absl::string_view value : values) {
       const Token token(key, value, MockDictionary::kDefaultCost,
@@ -154,7 +164,37 @@ TEST_F(DateRewriterTest, DateRewriteTest) {
                 }));
   }
   {
+    InitSegment("ほんじつ", "本日", &segments);
+    EXPECT_TRUE(rewriter.Rewrite(request, &segments));
+    constexpr absl::string_view kDesc = "今日の日付";
+    ASSERT_EQ(segments.segments_size(), 1);
+    EXPECT_THAT(segments.segment(0),
+                CandidatesAreArray({
+                    ValueAndDescAre("本日", ""),
+                    ValueAndDescAre("2011/04/18", kDesc),
+                    ValueAndDescAre("2011-04-18", kDesc),
+                    ValueAndDescAre("2011年4月18日", kDesc),
+                    ValueAndDescAre("平成23年4月18日", kDesc),
+                    ValueAndDescAre("月曜日", kDesc),
+                }));
+  }
+  {
     InitSegment("あした", "明日", &segments);
+    EXPECT_TRUE(rewriter.Rewrite(request, &segments));
+    constexpr absl::string_view kDesc = "明日の日付";
+    ASSERT_EQ(segments.segments_size(), 1);
+    EXPECT_THAT(segments.segment(0),
+                CandidatesAreArray({
+                    ValueAndDescAre("明日", ""),
+                    ValueAndDescAre("2011/04/19", kDesc),
+                    ValueAndDescAre("2011-04-19", kDesc),
+                    ValueAndDescAre("2011年4月19日", kDesc),
+                    ValueAndDescAre("平成23年4月19日", kDesc),
+                    ValueAndDescAre("火曜日", kDesc),
+                }));
+  }
+  {
+    InitSegment("みょうにち", "明日", &segments);
     EXPECT_TRUE(rewriter.Rewrite(request, &segments));
     constexpr absl::string_view kDesc = "明日の日付";
     ASSERT_EQ(segments.segments_size(), 1);
@@ -288,6 +328,69 @@ TEST_F(DateRewriterTest, DateRewriteTest) {
                     ValueAndDescAre("Candidate1", ""),
                 }));
   }
+
+  // "日付" is a generic noun, not a deictic expression meaning "today".
+  InitSegment("ひづけ", "日付", &segments);
+  EXPECT_FALSE(rewriter.Rewrite(request, &segments));
+
+  Clock::SetClockForUnitTest(nullptr);
+}
+
+TEST_F(DateRewriterTest, WeekdayRewriteKeepsLexicalCandidateFirst) {
+  ClockMock mock_clock(ParseTimeOrDie("2026-09-25T12:00:00Z"));
+  Clock::SetClockForUnitTest(&mock_clock);
+
+  DateRewriter rewriter;
+  const ConversionRequest request;
+  Segments segments;
+  const std::pair<absl::string_view, absl::string_view> inputs[] = {
+      {"きんよう", "金曜"},
+      {"きんようび", "金曜日"},
+  };
+
+  for (const auto& [key, value] : inputs) {
+    InitSegment(key, value, &segments);
+    ASSERT_TRUE(rewriter.Rewrite(request, &segments)) << key;
+    ASSERT_EQ(segments.segments_size(), 1);
+    const Segment& segment = segments.segment(0);
+    ASSERT_EQ(segment.candidates_size(), 13);
+
+    EXPECT_EQ(segment.candidate(0).value, std::string(value));
+
+    EXPECT_EQ(segment.candidate(1).value, "2026/09/25");
+    EXPECT_EQ(segment.candidate(1).description, "今週の日付");
+    EXPECT_EQ(segment.candidate(5).value, "2026/10/02");
+    EXPECT_EQ(segment.candidate(5).description, "来週の日付");
+    EXPECT_EQ(segment.candidate(9).value, "2026/09/18");
+    EXPECT_EQ(segment.candidate(9).description, "先週の日付");
+
+    for (size_t i = 1; i < segment.candidates_size(); ++i) {
+      EXPECT_NE(segment.candidate(i).value, value);
+    }
+  }
+
+  Clock::SetClockForUnitTest(nullptr);
+}
+
+TEST_F(DateRewriterTest, WeekdayRewriteCrossesYearBoundary) {
+  ClockMock mock_clock(ParseTimeOrDie("2026-12-31T12:00:00Z"));
+  Clock::SetClockForUnitTest(&mock_clock);
+
+  DateRewriter rewriter;
+  const ConversionRequest request;
+  Segments segments;
+  InitSegment("げつようび", "月曜日", &segments);
+
+  ASSERT_TRUE(rewriter.Rewrite(request, &segments));
+  const Segment& segment = segments.segment(0);
+  ASSERT_EQ(segment.candidates_size(), 13);
+  EXPECT_EQ(segment.candidate(0).value, "月曜日");
+  EXPECT_EQ(segment.candidate(1).value, "2026/12/28");
+  EXPECT_EQ(segment.candidate(1).description, "今週の日付");
+  EXPECT_EQ(segment.candidate(5).value, "2027/01/04");
+  EXPECT_EQ(segment.candidate(5).description, "来週の日付");
+  EXPECT_EQ(segment.candidate(9).value, "2026/12/21");
+  EXPECT_EQ(segment.candidate(9).description, "先週の日付");
 
   Clock::SetClockForUnitTest(nullptr);
 }
@@ -964,6 +1067,157 @@ TEST_F(DateRewriterTest, NumberRewriterFromRawInputTest) {
   }
 }
 
+TEST_F(DateRewriterTest, CompactEightDigitDateRewrite) {
+  auto table = std::make_shared<composer::Table>();
+  const commands::Request command_request;
+  const config::Config config;
+  const composer::Composer composer(table, command_request, config);
+  const ConversionRequest request =
+      ConversionRequestBuilder().SetComposer(composer).Build();
+
+  DateRewriter rewriter;
+  Segments segments;
+
+  InitSegment("20260908", "20260908", &segments);
+  ASSERT_TRUE(rewriter.Rewrite(request, &segments));
+  EXPECT_THAT(segments.segment(0),
+              CandidatesAreArray({
+                  ValueAndDescAre("20260908", ""),
+                  ValueAndDescAre("2026/09/08", "日付"),
+                  ValueAndDescAre("2026-09-08", "日付"),
+                  ValueAndDescAre("2026年9月8日", "日付"),
+                  ValueAndDescAre("2026/09/08(火)", "日付"),
+                  ValueAndDescAre("2026年9月8日(火)", "日付"),
+                  ValueAndDescAre("令和8年9月8日", "日付"),
+                  ValueAndDescAre("令和8年9月8日(火)", "日付"),
+              }));
+
+  InitSegment("２０２６０９０８", "２０２６０９０８", &segments);
+  ASSERT_TRUE(rewriter.Rewrite(request, &segments));
+  EXPECT_EQ(segments.segment(0).candidate(0).value, "２０２６０９０８");
+  EXPECT_EQ(segments.segment(0).candidate(1).value, "2026/09/08");
+
+  InitSegment("20240229", "20240229", &segments);
+  EXPECT_TRUE(rewriter.Rewrite(request, &segments));
+
+  for (const absl::string_view input :
+       {"20260229", "20261301", "20260001", "00000000"}) {
+    InitSegment(input, input, &segments);
+    EXPECT_FALSE(rewriter.Rewrite(request, &segments)) << input;
+  }
+}
+
+TEST_F(DateRewriterTest, SeparatedDateRewriteAndRawInputPreservation) {
+  ClockMock mock_clock(ParseTimeOrDie("2026-09-08T12:00:00Z"));
+  Clock::SetClockForUnitTest(&mock_clock);
+
+  auto table = std::make_shared<composer::Table>();
+  const commands::Request command_request;
+  const config::Config config;
+  DateRewriter rewriter;
+  Segments segments;
+
+  for (const absl::string_view input :
+       {"9/8", "9-8", "9.8", "09/08", "９／８"}) {
+    composer::Composer composer(table, command_request, config);
+    composer.InsertCharacter(std::string(input));
+    const ConversionRequest request =
+        ConversionRequestBuilder().SetComposer(composer).Build();
+
+    InitSegment(input, input, &segments);
+    ASSERT_TRUE(rewriter.Rewrite(request, &segments)) << input;
+    const Segment& segment = segments.segment(0);
+    EXPECT_EQ(segment.candidate(0).value, std::string(input)) << input;
+    EXPECT_EQ(segment.candidate(1).value, "9月8日") << input;
+    if (input != "09/08") {
+      EXPECT_EQ(segment.candidate(2).value, "09/08") << input;
+    }
+  }
+
+  {
+    constexpr absl::string_view kInput = "2026-9-8";
+    composer::Composer composer(table, command_request, config);
+    composer.InsertCharacter(std::string(kInput));
+    const ConversionRequest request =
+        ConversionRequestBuilder().SetComposer(composer).Build();
+
+    InitSegment(kInput, kInput, &segments);
+    ASSERT_TRUE(rewriter.Rewrite(request, &segments));
+    EXPECT_EQ(segments.segment(0).candidate(0).value, kInput);
+    EXPECT_EQ(segments.segment(0).candidate(1).value, "2026/09/08");
+    EXPECT_EQ(segments.segment(0).candidate(2).value, "2026-09-08");
+    EXPECT_EQ(segments.segment(0).candidate(3).value, "2026年9月8日");
+  }
+
+  for (const absl::string_view input :
+       {"13/1", "9/32", "2/29", "2026/2/29", "2026//8", "2026-9/8"}) {
+    composer::Composer composer(table, command_request, config);
+    composer.InsertCharacter(std::string(input));
+    const ConversionRequest request =
+        ConversionRequestBuilder().SetComposer(composer).Build();
+
+    InitSegment(input, input, &segments);
+    EXPECT_FALSE(rewriter.Rewrite(request, &segments)) << input;
+  }
+
+  // The converter may normalize '/' to '・'.  The raw input must still win.
+  composer::Composer raw_composer(table, command_request, config);
+  raw_composer.InsertCharacter("9/8");
+  const ConversionRequest raw_request =
+      ConversionRequestBuilder().SetComposer(raw_composer).Build();
+
+  InitSegment("9・8", "9・8", &segments);
+  ASSERT_TRUE(rewriter.Rewrite(raw_request, &segments));
+  EXPECT_EQ(segments.segment(0).candidate(0).value, "9/8");
+  EXPECT_EQ(segments.segment(0).candidate(1).value, "9月8日");
+
+  // Do not duplicate an exact literal candidate already produced by converter.
+  InitSegment("9・8", "9/8", &segments);
+  ASSERT_TRUE(rewriter.Rewrite(raw_request, &segments));
+  EXPECT_EQ(segments.segment(0).candidate(0).value, "9/8");
+  EXPECT_EQ(segments.segment(0).candidate(1).value, "9月8日");
+  int literal_count = 0;
+  for (size_t i = 0; i < segments.segment(0).candidates_size(); ++i) {
+    if (segments.segment(0).candidate(i).value == "9/8") {
+      ++literal_count;
+    }
+  }
+  EXPECT_EQ(literal_count, 1);
+
+  Clock::SetClockForUnitTest(nullptr);
+}
+
+TEST_F(DateRewriterTest, SeparatedDateResizeWorksWithMultiSegmentCandidates) {
+  ClockMock mock_clock(ParseTimeOrDie("2026-09-08T12:00:00Z"));
+  Clock::SetClockForUnitTest(&mock_clock);
+
+  Segments segments;
+  AppendSegment("9", "9", &segments);
+  AppendSegment("・", "・", &segments);
+  AppendSegment("8", "8", &segments);
+
+  auto table = std::make_shared<composer::Table>();
+  commands::Request command_request;
+  command_request.mutable_decoder_experiment_params()
+      ->set_enable_multi_segment_candidate(true);
+  const config::Config config;
+  composer::Composer composer(table, command_request, config);
+  composer.InsertCharacter("9/8");
+  const ConversionRequest request = ConversionRequestBuilder()
+                                        .SetComposer(composer)
+                                        .SetRequest(command_request)
+                                        .Build();
+
+  DateRewriter rewriter;
+  const auto resize_request =
+      rewriter.CheckResizeSegmentsRequest(request, segments);
+  ASSERT_TRUE(resize_request.has_value());
+  EXPECT_EQ(resize_request->segment_index, 0);
+  EXPECT_EQ(resize_request->segment_sizes[0], 3);
+
+  Clock::SetClockForUnitTest(nullptr);
+}
+
 TEST_F(DateRewriterTest, MobileEnvironmentTest) {
   commands::Request request;
   DateRewriter rewriter;
@@ -1305,11 +1559,28 @@ TEST_F(DateRewriterTest, ExtraFormatSyntaxTest) {
   Clock::SetClockForUnitTest(nullptr);
 }
 
+struct RewriteAdSegment {
+  std::string key;
+  std::string value;
+  std::string content_key;
+  std::string content_value;
+
+  RewriteAdSegment(std::string k, std::string v)
+      : key(std::move(k)),
+        value(std::move(v)),
+        content_key(key),
+        content_value(value) {}
+  RewriteAdSegment(std::string k, std::string v, std::string ck, std::string cv)
+      : key(std::move(k)),
+        value(std::move(v)),
+        content_key(std::move(ck)),
+        content_value(std::move(cv)) {}
+};
+
 struct RewriteAdData {
-  std::vector<std::pair<std::string, std::string>> segments;
+  std::vector<RewriteAdSegment> segments;
   size_t segment_index = 0;
   std::string candidate;
-  std::string resized_key;
 };
 
 class RewriteAdTest : public DateRewriterTest,
@@ -1337,9 +1608,10 @@ INSTANTIATE_TEST_SUITE_P(
             {{"きょうは", "今日は"}, {"2011ねん", "2011年"}, {"です", "です"}},
             1,
             "平成23年"},
-        // The "年" suffix in the following segment. They don't need resizing,
-        // and the result shouldn't contain the "年" suffix.
-        RewriteAdData{{{"へいせい23", "平成23"}, {"ねん", "年"}}, 0, "2011"},
+        // The "年" suffix in the following segment.
+        // In multi-segment mode, era-to-AD merges both segments into "2011年",
+        // while AD-to-era ("2011" + "ねん") produces "平成23".
+        RewriteAdData{{{"へいせい23", "平成23"}, {"ねん", "年"}}, 0, "2011年"},
         RewriteAdData{{{"2011", "2011"}, {"ねん", "年"}}, 0, "平成23"},
         RewriteAdData{{{"2011", "二千十一"}, {"ねん", "年"}}, 0, "平成23"},
         RewriteAdData{{{"きょうは", "今日は"},
@@ -1347,7 +1619,7 @@ INSTANTIATE_TEST_SUITE_P(
                        {"ねん", "年"},
                        {"です", "です"}},
                       1,
-                      "2011"},
+                      "2011年"},
         RewriteAdData{{{"きょうは", "今日は"},
                        {"2011", "2011"},
                        {"ねん", "年"},
@@ -1355,22 +1627,24 @@ INSTANTIATE_TEST_SUITE_P(
                       1,
                       "平成23"},
         // Multiple segments.
-        RewriteAdData{{{"へいせい", "平成"}, {"23ねん", "23年"}},
-                      0,
-                      "",
-                      "へいせい23ねん"},
-        RewriteAdData{{{"へいせい", "平成"}, {"23", "23"}, {"ねん", "年"}},
-                      0,
-                      "",
-                      "へいせい23ねん"},
-        // Reject more than 3 segments.
+        RewriteAdData{{{"へいせい", "平成"}, {"23ねん", "23年"}}, 0, "2011年"},
         RewriteAdData{
-            {{"へい", "平"}, {"せい", "成"}, {"23", "23"}, {"ねん", "年"}}},
+            {{"へいせい", "平成"}, {"23", "23"}, {"ねん", "年"}}, 0, "2011年"},
+        // 4 segments.
+        RewriteAdData{
+            {{"へい", "平"}, {"せい", "成"}, {"23", "23"}, {"ねん", "年"}},
+            0,
+            "2011年"},
+        // Reject more than 6 segments.
+        RewriteAdData{{{"へ", "へ"},
+                       {"い", "い"},
+                       {"せ", "せ"},
+                       {"い", "い"},
+                       {"2", "2"},
+                       {"3", "3"},
+                       {"ねん", "年"}}},
         // The `value` should be ignored when merging too.
-        RewriteAdData{{{"へいせい", "兵勢"}, {"23ねん", "23年"}},
-                      0,
-                      "",
-                      "へいせい23ねん"},
+        RewriteAdData{{{"へいせい", "兵勢"}, {"23ねん", "23年"}}, 0, "2011年"},
         // Multiple segments with preceding and following segments.
         RewriteAdData{{{"きょうは", "今日は"},
                        {"へいせい", "平成"},
@@ -1378,57 +1652,69 @@ INSTANTIATE_TEST_SUITE_P(
                        {"ねん", "年"},
                        {"です", "です"}},
                       1,
-                      "",
-                      "へいせい23ねん"},
+                      "2011年"},
         // Extra characters in the segment of "nen".
-        RewriteAdData{
-            {{"へいせい23ねんです", "平成23年です"}}, 0, "", "へいせい23ねん"},
-        RewriteAdData{
-            {{"きょうは", "今日は"}, {"へいせい23ねんです", "平成23年です"}},
-            1,
-            "",
-            "へいせい23ねん"},
+        RewriteAdData{{{"へいせい23ねんです", "平成23年です", "へいせい23ねん",
+                        "平成23年"}},
+                      0,
+                      "2011年です"},
+        RewriteAdData{{{"きょうは", "今日は"},
+                       {"へいせい23ねんです", "平成23年です", "へいせい23ねん",
+                        "平成23年"}},
+                      1,
+                      "2011年です"},
         RewriteAdData{{{"きょうは", "今日は"},
                        {"へいせい", "平成"},
                        {"23", "23"},
-                       {"ねんです", "年です"}},
+                       {"ねんです", "年です", "ねん", "年"}},
                       1,
-                      "",
-                      "へいせい23ねん"}));
+                      "2011年です"},
+        RewriteAdData{
+            {{"れいわ8ねんの", "令和8年の", "れいわ8ねん", "令和8年"}},
+            0,
+            "2026年の"},
+        RewriteAdData{
+            {{"れいわ3ねんの", "令和3年の", "れいわ3ねん", "令和3年"}},
+            0,
+            "2021年の"},
+        RewriteAdData{{{"れいわ8ねんの", "令和8年の"}}, 0, "2026年の"},
+        RewriteAdData{{{"れいわ8ねんの", "れいわ8ねんの"}}, 0, "2026年の"},
+        RewriteAdData{{{"れいわ", "令和"}, {"8ねん", "8年"}}, 0, "2026年"},
+        RewriteAdData{{{"れいわ", "令和"}, {"3ねん", "3年"}}, 0, "2021年"},
+        RewriteAdData{
+            {{"れいわ8", "令和8"}, {"ねんの", "年の"}}, 0, "2026年の"},
+        RewriteAdData{{{"れいわ", "令和"}, {"8", "8"}, {"ねんの", "年の"}},
+                      0,
+                      "2026年の"}));
 
 TEST_P(RewriteAdTest, MockConverter) {
   const RewriteAdData& data = GetParam();
   MockDictionary dictionary;
   DateRewriter rewriter(dictionary);
   Segments segments;
-  for (const auto& [key, value] : data.segments) {
-    AppendSegment(key, value, &segments);
+  for (const RewriteAdSegment& s : data.segments) {
+    Segment* seg = segments.add_segment();
+    seg->set_key(s.key);
+    converter::Candidate* cand = seg->add_candidate();
+    cand->key = s.key;
+    cand->value = s.value;
+    cand->content_key = s.content_key;
+    cand->content_value = s.content_value;
   }
-  const ConversionRequest request;
+  commands::Request request_proto;
+  request_proto.mutable_decoder_experiment_params()
+      ->set_enable_multi_segment_candidate(true);
+  const ConversionRequest request =
+      ConversionRequestBuilder().SetRequest(request_proto).Build();
 
-  std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
-      rewriter.CheckResizeSegmentsRequest(request, segments);
-
-  if (data.resized_key.empty()) {
-    // Resize is not expected.
-    EXPECT_FALSE(resize_request.has_value());
-
-    if (data.candidate.empty()) {
-      // Rewrite is not expected.
-      EXPECT_FALSE(rewriter.Rewrite(request, &segments));
-    } else {
-      // Rewrite is expected.
-      EXPECT_TRUE(rewriter.Rewrite(request, &segments));
-      const Segment& segment = segments.segment(data.segment_index);
-      EXPECT_THAT(segment, ContainsCandidate(ValueIs(data.candidate)));
-    }
-
+  if (data.candidate.empty()) {
+    // Rewrite is not expected.
+    EXPECT_FALSE(rewriter.Rewrite(request, &segments));
   } else {
-    // Resize is expected.
-    EXPECT_TRUE(resize_request.has_value());
-    EXPECT_EQ(resize_request->segment_index, data.segment_index);
-    EXPECT_EQ(resize_request->segment_sizes[0],
-              Util::CharsLen(data.resized_key));
+    // Rewrite is expected.
+    EXPECT_TRUE(rewriter.Rewrite(request, &segments));
+    const Segment& segment = segments.segment(data.segment_index);
+    EXPECT_THAT(segment, ContainsCandidate(ValueIs(data.candidate)));
   }
 }
 
@@ -1450,6 +1736,64 @@ TEST_F(DateRewriterTest, RewriteAdResizedSegments) {
   segments.set_resized(false);
   resize_request = rewriter.CheckResizeSegmentsRequest(request, segments);
   EXPECT_TRUE(resize_request.has_value());
+}
+
+TEST_F(DateRewriterTest, RewriteAdLegacyBranch) {
+  MockDictionary dictionary;
+  DateRewriter rewriter(dictionary);
+  {
+    // When enable_multi_segment_candidate is false (default):
+    // Multi-segment input is resized via CheckResizeSegmentsRequest.
+    Segments segments;
+    InitSegment("へいせい", "平成", &segments);
+    AppendSegment("23", "23", &segments);
+    AppendSegment("ねん", "年", &segments);
+    const ConversionRequest request;
+
+    std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
+        rewriter.CheckResizeSegmentsRequest(request, segments);
+    ASSERT_TRUE(resize_request.has_value());
+    EXPECT_EQ(resize_request->segment_index, 0);
+    EXPECT_EQ(resize_request->segment_sizes[0],
+              Util::CharsLen("へいせい23ねん"));
+  }
+
+  {
+    // When enable_multi_segment_candidate is true:
+    // CheckResizeSegmentsRequest returns std::nullopt.
+    Segments segments;
+    InitSegment("へいせい", "平成", &segments);
+    AppendSegment("23", "23", &segments);
+    AppendSegment("ねん", "年", &segments);
+    commands::Request request_proto;
+    request_proto.mutable_decoder_experiment_params()
+        ->set_enable_multi_segment_candidate(true);
+    const ConversionRequest request =
+        ConversionRequestBuilder().SetRequest(request_proto).Build();
+
+    std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
+        rewriter.CheckResizeSegmentsRequest(request, segments);
+    EXPECT_FALSE(resize_request.has_value());
+  }
+
+  {
+    // Legacy rewrite on single (or resized) segment:
+    Segments segments;
+    InitSegment("へいせい23ねん", "平成23年", &segments);
+    const ConversionRequest request;
+    EXPECT_TRUE(rewriter.Rewrite(request, &segments));
+    EXPECT_TRUE(HasCandidate(segments.segment(0), "2011年"));
+  }
+
+  {
+    // Legacy rewrite when following segment starts with "ねん":
+    Segments segments;
+    InitSegment("へいせい23", "平成23", &segments);
+    AppendSegment("ねん", "年", &segments);
+    const ConversionRequest request;
+    EXPECT_TRUE(rewriter.Rewrite(request, &segments));
+    EXPECT_TRUE(HasCandidate(segments.segment(0), "2011"));
+  }
 }
 
 }  // namespace mozc

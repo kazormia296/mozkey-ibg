@@ -1,0 +1,112 @@
+#include "session/zenz_client_factory.h"
+
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <string>
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#include <sys/types.h>
+#include <sys/wait.h>
+
+#include <cerrno>
+#include <system_error>
+#include <thread>
+
+#include "absl/log/log.h"
+#include "base/file_util.h"
+#include "base/process.h"
+#include "base/system_util.h"
+#endif  // TARGET_OS_OSX
+#endif  // __APPLE__
+
+#include "session/zenz_live_corrector.h"
+#include "session/zenz_named_pipe_client.h"
+#include "session/zenz_unix_socket_client.h"
+#include "zenz/zenz_unix_socket_path.h"
+
+namespace mozc {
+namespace session {
+
+#if defined(__APPLE__) && TARGET_OS_OSX
+// Testable implementation shared by the production scorer launcher and the
+// macOS regression test. Do not alter child ownership or SIGCHLD handling.
+namespace internal {
+// MozcConverter is the scorer's parent and lives for the whole login session.
+// The scorer can exit on its own (startup failure, losing the singleton lock
+// to an already running scorer, or a crash), so it must be reaped here or it
+// lingers as a zombie child of the converter.
+void ReapScorerAsync(pid_t pid) {
+  try {
+    std::thread([pid] {
+      int status = 0;
+      while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+      }
+    }).detach();
+  } catch (const std::system_error& e) {
+    LOG(ERROR) << "Failed to start the Zenz scorer reaper: " << e.what();
+  }
+}
+
+}  // namespace internal
+#endif  // __APPLE__ && TARGET_OS_OSX
+
+namespace {
+
+#if defined(__APPLE__) && TARGET_OS_OSX
+
+constexpr char kZenzRuntimeDirectory[] = "ZenzRuntime";
+constexpr char kZenzScorerExecutable[] = "mozc_zenz_scorer";
+constexpr auto kScorerLaunchThrottle = std::chrono::seconds(2);
+
+bool LaunchMacZenzScorer() {
+  // MozcConverter is normally a singleton, but several Zenz worker requests
+  // can observe the same cold start. Serialize the short spawn operation and
+  // treat a recent successful launch as one already in progress.
+  static std::mutex launch_mutex;
+  static std::chrono::steady_clock::time_point last_launch;
+  static bool has_launched = false;
+
+  const std::lock_guard<std::mutex> lock(launch_mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (has_launched && now - last_launch < kScorerLaunchThrottle) {
+    return true;
+  }
+
+  const std::string scorer_path = FileUtil::JoinPath({
+      SystemUtil::GetServerDirectory(),
+      kZenzRuntimeDirectory,
+      kZenzScorerExecutable,
+  });
+
+  size_t pid = 0;
+  if (!Process::SpawnProcess(scorer_path, "", &pid)) {
+    LOG(ERROR) << "Failed to launch the bundled Zenz scorer";
+    return false;
+  }
+  if (pid > 0) {
+    internal::ReapScorerAsync(static_cast<pid_t>(pid));
+  }
+
+  has_launched = true;
+  last_launch = now;
+  return true;
+}
+
+#endif  // __APPLE__ && TARGET_OS_OSX
+
+}  // namespace
+
+std::unique_ptr<ZenzClient> CreateZenzClient() {
+#if defined(__APPLE__) && TARGET_OS_OSX
+  return std::make_unique<ZenzUnixSocketClient>(
+      ::mozc::zenz::GetZenzUnixSocketPath(), &LaunchMacZenzScorer);
+#else
+  return std::make_unique<ZenzNamedPipeClient>();
+#endif  // __APPLE__ && TARGET_OS_OSX
+}
+
+}  // namespace session
+}  // namespace mozc

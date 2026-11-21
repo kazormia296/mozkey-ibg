@@ -50,6 +50,7 @@
 #include "dictionary/user_pos.h"
 #include "protocol/config.pb.h"
 #include "request/conversion_request.h"
+#include "request/options.h"
 #include "testing/gunit.h"
 
 namespace mozc {
@@ -102,7 +103,9 @@ class DictionaryImplTest : public ::testing::Test {
 
     ResultType OnToken(absl::string_view /* key */,
                        absl::string_view /* actual_key */,
-                       const Token& token) override {
+                       Token token) override {
+      // Read-only inspection; std::move is not used because token is only
+      // checked and not stored.
       if (token.key == key_ && token.value == value_) {
         found_ = true;
         return TRAVERSE_DONE;
@@ -125,7 +128,9 @@ class DictionaryImplTest : public ::testing::Test {
 
     ResultType OnToken(absl::string_view /* key */,
                        absl::string_view /* actual_key */,
-                       const Token& token) override {
+                       Token token) override {
+      // Read-only inspection; std::move is not used because token is only
+      // checked and not stored.
       if (token.key == key_ && token.value == value_ &&
           (token.attributes & Token::SPELLING_CORRECTION)) {
         found_ = true;
@@ -150,7 +155,9 @@ class DictionaryImplTest : public ::testing::Test {
 
     ResultType OnToken(absl::string_view /* key */,
                        absl::string_view /* actual_key */,
-                       const Token& token) override {
+                       Token token) override {
+      // Read-only inspection; std::move is not used because token is only
+      // checked and not stored.
       if (token.key == key_ && token.value == value_ &&
           pos_matcher_.IsZipcode(token.lid)) {
         found_ = true;
@@ -174,7 +181,9 @@ class DictionaryImplTest : public ::testing::Test {
 
     ResultType OnToken(absl::string_view /* key */,
                        absl::string_view /* actual_key */,
-                       const Token& token) override {
+                       Token token) override {
+      // Read-only inspection; std::move is not used because token is only
+      // checked and not stored.
       if (token.key == key_ && token.value == value_ &&
           Util::IsEnglishTransliteration(token.value)) {
         found_ = true;
@@ -193,7 +202,7 @@ class DictionaryImplTest : public ::testing::Test {
   // Pair of DictionaryInterface's lookup method and query text.
   struct LookupMethodAndQuery {
     void (DictionaryInterface::*lookup_method)(
-        absl::string_view, const ConversionRequest&,
+        absl::string_view, const ConversionOptions&,
         DictionaryInterface::Callback*) const;
     const char* query;
   };
@@ -233,7 +242,8 @@ TEST_F(DictionaryImplTest, WordSuppressionTest) {
   const ConversionRequest convreq1 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckKeyValueExistenceCallback callback(kKey, kValue);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1.options(),
+                                     &callback);
     EXPECT_FALSE(callback.found());
   }
 
@@ -246,7 +256,8 @@ TEST_F(DictionaryImplTest, WordSuppressionTest) {
   const ConversionRequest convreq2 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckKeyValueExistenceCallback callback(kKey, kValue);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2.options(),
+                                     &callback);
     EXPECT_TRUE(callback.found());
   }
 }
@@ -270,7 +281,8 @@ TEST_F(DictionaryImplTest, DisableSpellingCorrectionTest) {
   const ConversionRequest convreq1 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckSpellingExistenceCallback callback(kKey, kValue);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1.options(),
+                                     &callback);
     EXPECT_TRUE(callback.found());
   }
 
@@ -279,7 +291,8 @@ TEST_F(DictionaryImplTest, DisableSpellingCorrectionTest) {
   const ConversionRequest convreq2 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckSpellingExistenceCallback callback(kKey, kValue);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2.options(),
+                                     &callback);
     EXPECT_FALSE(callback.found());
   }
 }
@@ -303,7 +316,8 @@ TEST_F(DictionaryImplTest, DisableZipCodeConversionTest) {
   const ConversionRequest convreq1 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckZipCodeExistenceCallback callback(kKey, kValue, *data->pos_matcher);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1.options(),
+                                     &callback);
     EXPECT_TRUE(callback.found());
   }
 
@@ -312,8 +326,76 @@ TEST_F(DictionaryImplTest, DisableZipCodeConversionTest) {
   const ConversionRequest convreq2 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckZipCodeExistenceCallback callback(kKey, kValue, *data->pos_matcher);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2.options(),
+                                     &callback);
     EXPECT_FALSE(callback.found());
+  }
+}
+
+TEST_F(DictionaryImplTest, HyphenlessZipcodeLookup) {
+  std::unique_ptr<DictionaryData> data = CreateDictionaryData();
+  DictionaryInterface* dictionary = data->dictionary.get();
+
+  // The mock dictionary only contains "100-0000", not "1000000".
+  constexpr char kOriginalKey[] = "1000000";
+  constexpr char kAddress[] = "東京都千代田区";
+  const LookupMethodAndQuery kPositiveCases[] = {
+      {&DictionaryInterface::LookupPrefix, kOriginalKey},
+      {&DictionaryInterface::LookupPrefix, "1000000です"},
+      {&DictionaryInterface::LookupPredictive, kOriginalKey},
+      {&DictionaryInterface::LookupExact, kOriginalKey},
+  };
+
+  config_.set_use_zip_code_conversion(true);
+  const ConversionRequest enabled = ConversionRequestBuilder()
+                                        .SetConfig(config_)
+                                        .SetKey(kOriginalKey)
+                                        .Build();
+  ASSERT_TRUE(enabled.options().enable_hyphenless_zipcode_alias);
+  for (const auto& test_case : kPositiveCases) {
+    CheckZipCodeExistenceCallback callback(kOriginalKey, kAddress,
+                                           *data->pos_matcher);
+    (dictionary->*test_case.lookup_method)(test_case.query, enabled.options(),
+                                           &callback);
+    EXPECT_TRUE(callback.found()) << test_case.query;
+  }
+
+  // Do not match partial or overlong numeric keys, even in prefix lookup.
+  constexpr absl::string_view kNonZipcodeKeys[] = {
+      "100000", "10000000", "10000000です", "x1000000", "100000x",
+      "1000000A", "1000000ABC", "1000000x", "1000000aです"};
+  for (const absl::string_view query : kNonZipcodeKeys) {
+    CheckZipCodeExistenceCallback callback(kOriginalKey, kAddress,
+                                           *data->pos_matcher);
+    dictionary->LookupPrefix(query, enabled.options(), &callback);
+    EXPECT_FALSE(callback.found()) << query;
+  }
+
+  // Sentence conversion now permits the alias. The caller that knows the
+  // lattice offset, not DictionaryImpl, checks the preceding digit boundary.
+  const ConversionRequest embedded = ConversionRequestBuilder()
+                                         .SetConfig(config_)
+                                         .SetKey("文中1000000")
+                                         .Build();
+  EXPECT_TRUE(embedded.options().enable_hyphenless_zipcode_alias);
+  {
+    CheckZipCodeExistenceCallback callback(kOriginalKey, kAddress,
+                                           *data->pos_matcher);
+    dictionary->LookupPrefix(kOriginalKey, embedded.options(), &callback);
+    EXPECT_TRUE(callback.found());
+  }
+
+  config_.set_use_zip_code_conversion(false);
+  const ConversionRequest disabled = ConversionRequestBuilder()
+                                         .SetConfig(config_)
+                                         .SetKey(kOriginalKey)
+                                         .Build();
+  for (const auto& test_case : kPositiveCases) {
+    CheckZipCodeExistenceCallback callback(kOriginalKey, kAddress,
+                                           *data->pos_matcher);
+    (dictionary->*test_case.lookup_method)(test_case.query, disabled.options(),
+                                           &callback);
+    EXPECT_FALSE(callback.found()) << test_case.query;
   }
 }
 
@@ -335,7 +417,8 @@ TEST_F(DictionaryImplTest, DisableT13nConversionTest) {
   const ConversionRequest convreq1 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckEnglishT13nCallback callback(kKey, kValue);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq1.options(),
+                                     &callback);
     EXPECT_TRUE(callback.found());
   }
 
@@ -344,7 +427,8 @@ TEST_F(DictionaryImplTest, DisableT13nConversionTest) {
   const ConversionRequest convreq2 = ConvReq(config_);
   for (size_t i = 0; i < std::size(kTestPair); ++i) {
     CheckEnglishT13nCallback callback(kKey, kValue);
-    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2, &callback);
+    (d->*kTestPair[i].lookup_method)(kTestPair[i].query, convreq2.options(),
+                                     &callback);
     EXPECT_FALSE(callback.found());
   }
 }
@@ -365,12 +449,12 @@ TEST_F(DictionaryImplTest, LookupComment) {
 
   std::string comment;
   const ConversionRequest convreq = ConvReq(config_);
-  EXPECT_FALSE(d->LookupComment("key", "value", convreq, &comment));
+  EXPECT_FALSE(d->LookupComment("key", "value", convreq.options(), &comment));
   EXPECT_TRUE(comment.empty());
 
   // If key or value is "comment", UserDictionaryStub returns
   // "UserDictionaryStub" as comment.
-  EXPECT_TRUE(d->LookupComment("key", "comment", convreq, &comment));
+  EXPECT_TRUE(d->LookupComment("key", "comment", convreq.options(), &comment));
   EXPECT_EQ(comment, "UserDictionaryStub");
 }
 
@@ -407,14 +491,14 @@ TEST_F(DictionaryImplTest, RequestScopedProjectDictionaryOverlay) {
           .Build();
   CheckKeyValueExistenceCallback exact_callback("こーでっくすじしょ",
                                                 "Codex辞書");
-  dictionary->LookupExact("こーでっくすじしょ", with_project,
+  dictionary->LookupExact("こーでっくすじしょ", with_project.options(),
                           &exact_callback);
   EXPECT_TRUE(exact_callback.found());
 
   const ConversionRequest without_project = ConvReq(config_);
   CheckKeyValueExistenceCallback isolated_callback("こーでっくすじしょ",
                                                    "Codex辞書");
-  dictionary->LookupExact("こーでっくすじしょ", without_project,
+  dictionary->LookupExact("こーでっくすじしょ", without_project.options(),
                           &isolated_callback);
   EXPECT_FALSE(isolated_callback.found());
 
@@ -428,7 +512,7 @@ TEST_F(DictionaryImplTest, RequestScopedProjectDictionaryOverlay) {
           .Build();
   CheckKeyValueExistenceCallback incognito_callback("こーでっくすじしょ",
                                                     "Codex辞書");
-  dictionary->LookupExact("こーでっくすじしょ", incognito,
+  dictionary->LookupExact("こーでっくすじしょ", incognito.options(),
                           &incognito_callback);
   EXPECT_FALSE(incognito_callback.found());
 }

@@ -21,9 +21,11 @@
 
 namespace mozc::renderer {
 
-// Returns the typed reading represented by a live-conversion output. Each
-// preedit segment's key is preferred, with its visible value as a fallback.
-// Returns an empty string for non-live-conversion output or malformed UTF-8.
+// Returns the typed reading represented by a live-conversion output, or by an
+// output flagged pre_live_conversion_reading (composition that is still
+// shorter than live_conversion_min_key_length). Each preedit segment's key is
+// preferred, with its visible value as a fallback. Returns an empty string for
+// any other output or malformed UTF-8.
 std::string BuildLiveConversionReading(const commands::Output& output);
 
 }  // namespace mozc::renderer

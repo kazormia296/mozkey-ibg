@@ -42,6 +42,8 @@
 #include "protocol/commands.pb.h"
 #include "protocol/renderer_command.pb.h"
 #include "renderer/win32/candidate_window.h"
+#include "renderer/win32/cascading_window_layout.h"
+#include "renderer/win32/conversion_status_window.h"
 #include "renderer/win32/indicator_window.h"
 #include "renderer/win32/infolist_window.h"
 #include "renderer/win32/win32_dpi_util.h"
@@ -55,39 +57,52 @@ namespace win32 {
 namespace {
 
 constexpr uint32_t kHideWindowDelay = 500;  // msec
+constexpr int kDefaultDpi = 96;
+constexpr int kVerticalCandidateMinimumHalfClearanceDip = 24;
 const POINT kInvalidMousePosition = {-65535, -65535};
 
 RECT ToWinRect(const Rect& rect) {
   return RECT{rect.Left(), rect.Top(), rect.Right(), rect.Bottom()};
 }
 
-enum class VerticalRelationToPreedit {
-  kAbove,
-  kBelow,
+enum class SideRelationToPreedit {
+  kBefore,
+  kAfter,
   kOverlapping,
 };
 
-VerticalRelationToPreedit GetVerticalRelationToPreedit(
-    const RECT& rect, const Rect& preedit_rect) {
+SideRelationToPreedit GetSideRelationToPreedit(
+    const RECT& rect, const Rect& preedit_rect, bool vertical_writing) {
+  if (vertical_writing) {
+    if (rect.right <= preedit_rect.Left()) {
+      return SideRelationToPreedit::kBefore;
+    }
+    if (rect.left >= preedit_rect.Right()) {
+      return SideRelationToPreedit::kAfter;
+    }
+    return SideRelationToPreedit::kOverlapping;
+  }
+
   if (rect.bottom <= preedit_rect.Top()) {
-    return VerticalRelationToPreedit::kAbove;
+    return SideRelationToPreedit::kBefore;
   }
   if (rect.top >= preedit_rect.Bottom()) {
-    return VerticalRelationToPreedit::kBelow;
+    return SideRelationToPreedit::kAfter;
   }
-  return VerticalRelationToPreedit::kOverlapping;
+  return SideRelationToPreedit::kOverlapping;
 }
 
 bool IsOppositeSideOfPreedit(const RECT& lhs, const RECT& rhs,
-                             const Rect& preedit_rect) {
-  const VerticalRelationToPreedit lhs_relation =
-      GetVerticalRelationToPreedit(lhs, preedit_rect);
-  const VerticalRelationToPreedit rhs_relation =
-      GetVerticalRelationToPreedit(rhs, preedit_rect);
-  return (lhs_relation == VerticalRelationToPreedit::kAbove &&
-          rhs_relation == VerticalRelationToPreedit::kBelow) ||
-         (lhs_relation == VerticalRelationToPreedit::kBelow &&
-          rhs_relation == VerticalRelationToPreedit::kAbove);
+                             const Rect& preedit_rect,
+                             bool vertical_writing) {
+  const SideRelationToPreedit lhs_relation =
+      GetSideRelationToPreedit(lhs, preedit_rect, vertical_writing);
+  const SideRelationToPreedit rhs_relation =
+      GetSideRelationToPreedit(rhs, preedit_rect, vertical_writing);
+  return (lhs_relation == SideRelationToPreedit::kBefore &&
+          rhs_relation == SideRelationToPreedit::kAfter) ||
+         (lhs_relation == SideRelationToPreedit::kAfter &&
+          rhs_relation == SideRelationToPreedit::kBefore);
 }
 
 bool HasRenderableCandidateMainText(
@@ -120,6 +135,7 @@ WindowManager::WindowManager()
       indicator_window_(std::make_unique<IndicatorWindow>()),
       infolist_window_(std::make_unique<InfolistWindow>()),
       ruby_window_(std::make_unique<RubyWindow>()),
+      conversion_status_window_(std::make_unique<ConversionStatusWindow>()),
       layout_manager_(std::make_unique<LayoutManager>()),
       send_command_interface_(nullptr),
       last_position_(kInvalidMousePosition),
@@ -131,19 +147,28 @@ WindowManager::WindowManager()
 
 WindowManager::~WindowManager() {}
 
-void WindowManager::Initialize() {
+void WindowManager::Initialize(HWND owner_window,
+                               bool post_quit_message_on_window_destroy) {
   DCHECK(!main_window_->IsWindow());
   DCHECK(!cascading_window_->IsWindow());
   DCHECK(!infolist_window_->IsWindow());
 
-  main_window_->Create(nullptr);
+  main_window_->set_post_quit_message_on_destroy(
+      post_quit_message_on_window_destroy);
+  cascading_window_->set_post_quit_message_on_destroy(
+      post_quit_message_on_window_destroy);
+  infolist_window_->set_post_quit_message_on_destroy(
+      post_quit_message_on_window_destroy);
+
+  main_window_->Create(owner_window);
   main_window_->HideWithEffects();
-  cascading_window_->Create(nullptr);
+  cascading_window_->Create(owner_window);
   cascading_window_->HideWithEffects();
-  indicator_window_->Initialize();
-  infolist_window_->Create(nullptr);
+  indicator_window_->Initialize(owner_window);
+  infolist_window_->Create(owner_window);
   infolist_window_->ShowWindow(SW_HIDE);
-  ruby_window_->Initialize();
+  ruby_window_->Initialize(owner_window);
+  conversion_status_window_->Initialize(owner_window);
 }
 
 void WindowManager::AsyncHideAllWindows() {
@@ -155,6 +180,7 @@ void WindowManager::AsyncHideAllWindows() {
   main_window_->ShowWindowAsync(SW_HIDE);
   infolist_window_->ShowWindowAsync(SW_HIDE);
   ruby_window_->Hide();
+  conversion_status_window_->Hide();
 }
 
 void WindowManager::AsyncQuitAllWindows() {
@@ -166,6 +192,7 @@ void WindowManager::AsyncQuitAllWindows() {
   main_window_->PostMessage(WM_CLOSE, 0, 0);
   infolist_window_->PostMessage(WM_CLOSE, 0, 0);
   ruby_window_->Destroy();
+  conversion_status_window_->Destroy();
 }
 
 void WindowManager::DestroyAllWindows() {
@@ -184,6 +211,7 @@ void WindowManager::DestroyAllWindows() {
     infolist_window_->DestroyWindow();
   }
   ruby_window_->Destroy();
+  conversion_status_window_->Destroy();
 }
 
 void WindowManager::HideAllWindows() {
@@ -196,6 +224,7 @@ void WindowManager::HideAllWindows() {
   indicator_window_->Hide();
   infolist_window_->DelayHide(0);
   ruby_window_->Hide();
+  conversion_status_window_->Hide();
 }
 
 // TODO(yukawa): Refactor this method by making a new method in LayoutManager
@@ -221,6 +250,7 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     indicator_window_->Hide();
     infolist_window_->DelayHide(0);
     ruby_window_->Hide();
+    conversion_status_window_->Hide();
     return;
   }
 
@@ -235,6 +265,9 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
   // suggestions while preserving Space/Down as normal conversion operations.
   // In that case, do not return here; let the normal candidate-window path draw
   // the non-focused suggestion window alongside the ruby overlay.
+  const bool has_live_conversion_reading =
+      output.has_preedit() &&
+      (output.live_conversion() || output.pre_live_conversion_reading());
   const bool has_passive_suggestion_window =
       output.has_candidate_window() && output.candidate_window().has_category() &&
       output.candidate_window().category() == commands::SUGGESTION &&
@@ -243,33 +276,31 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
       !output.candidate_window().has_focused_index();
   const bool is_live_conversion_passive_suggestion =
       output.live_conversion() && has_passive_suggestion_window;
-  const bool should_keep_previous_live_conversion_passive_suggestion =
-      output.live_conversion() && !is_live_conversion_passive_suggestion &&
-      last_live_conversion_passive_suggestion_visible_ &&
-      (output.zenz_live_correction_pending() ||
-       output.zenz_live_correction_applied() ||
-       output.has_zenz_live_correction_debug());
 
   const bool should_defer_ruby_update =
-      is_live_conversion_passive_suggestion;
-  const RECT* ruby_avoid_rect = nullptr;
-  if (should_keep_previous_live_conversion_passive_suggestion &&
-      has_last_live_conversion_passive_suggestion_rect_) {
-    ruby_avoid_rect = &last_live_conversion_passive_suggestion_rect_;
-  }
+      has_live_conversion_reading && has_passive_suggestion_window;
   if (!should_defer_ruby_update) {
-    ruby_window_->OnUpdate(command, ruby_avoid_rect);
+    ruby_window_->OnUpdate(command, *layout_manager_);
   }
+  // Independent from RubyWindow: a user may disable ruby while keeping this.
+  conversion_status_window_->OnUpdate(
+      command, *layout_manager_, ruby_window_->m_hWnd,
+      main_window_->m_hWnd);
 
   if (output.live_conversion() && !is_live_conversion_passive_suggestion) {
+    // Session output is authoritative.  If this output does not carry a
+    // semantically valid passive SUGGESTION, do not keep an older candidate
+    // surface alive based on Zenz state flags.
     cascading_window_->HideWithEffects();
-    if (!should_keep_previous_live_conversion_passive_suggestion) {
-      main_window_->HideWithEffects();
-      last_live_conversion_passive_suggestion_visible_ = false;
-      has_last_live_conversion_passive_suggestion_rect_ = false;
-    }
+    main_window_->HideWithEffects();
+    last_live_conversion_passive_suggestion_visible_ = false;
+    has_last_live_conversion_passive_suggestion_rect_ = false;
     indicator_window_->Hide();
     infolist_window_->DelayHide(0);
+    // The previous candidate may have been visible when the early status
+    // update ran. Re-evaluate after hiding that candidate.
+    conversion_status_window_->OnUpdate(
+        command, *layout_manager_, ruby_window_->m_hWnd, nullptr);
     return;
   }
   if (!output.live_conversion()) {
@@ -326,6 +357,8 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     cascading_window_->HideWithEffects();
     main_window_->HideWithEffects();
     infolist_window_->DelayHide(0);
+    conversion_status_window_->OnUpdate(
+        command, *layout_manager_, ruby_window_->m_hWnd, nullptr);
     return;
   }
 
@@ -334,6 +367,13 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     cascading_window_->HideWithEffects();
     main_window_->HideWithEffects();
     infolist_window_->DelayHide(0);
+    if (should_defer_ruby_update) {
+      ruby_window_->OnUpdate(command, *layout_manager_);
+    }
+    // A stale candidate may have hidden the badge at the start of the
+    // update. Re-evaluate after hiding that candidate in this branch.
+    conversion_status_window_->OnUpdate(
+        command, *layout_manager_, ruby_window_->m_hWnd, nullptr);
     return;
   }
 
@@ -343,6 +383,10 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     cascading_window_->HideWithEffects();
     main_window_->HideWithEffects();
     infolist_window_->DelayHide(0);
+    // A stale candidate may have hidden the badge at the start of the
+    // update. Re-evaluate after hiding that candidate in this branch.
+    conversion_status_window_->OnUpdate(
+        command, *layout_manager_, ruby_window_->m_hWnd, nullptr);
     return;
   }
 
@@ -351,6 +395,10 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     cascading_window_->HideWithEffects();
     main_window_->HideWithEffects();
     infolist_window_->DelayHide(0);
+    // A stale candidate may have hidden the badge at the start of the
+    // update. Re-evaluate after hiding that candidate in this branch.
+    conversion_status_window_->OnUpdate(
+        command, *layout_manager_, ruby_window_->m_hWnd, nullptr);
     return;
   }
 
@@ -366,8 +414,12 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     last_live_conversion_passive_suggestion_visible_ = false;
     has_last_live_conversion_passive_suggestion_rect_ = false;
     if (should_defer_ruby_update) {
-      ruby_window_->OnUpdate(command);
+      ruby_window_->OnUpdate(command, *layout_manager_);
     }
+    // A stale candidate may have hidden the badge at the start of the
+    // update. Re-evaluate after hiding that candidate in this branch.
+    conversion_status_window_->OnUpdate(
+        command, *layout_manager_, ruby_window_->m_hWnd, nullptr);
     return;
   }
 
@@ -387,9 +439,15 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
   main_window_->UpdateDpi(target_dpi);
   infolist_window_->UpdateDpi(target_dpi);
 
+  const bool vertical = (LayoutManager::GetWritingDirection(app_info) ==
+                         LayoutManager::VERTICAL_WRITING);
+
   if (candidate_changed &&
       (candidate_window.display_type() == commands::MAIN)) {
-    main_window_->UpdateLayout(candidate_window);
+    main_window_->UpdateLayout(
+        candidate_window,
+        vertical ? CandidateWindow::LayoutMode::kVertical
+                 : CandidateWindow::LayoutMode::kHorizontal);
   }
   const Size main_window_size = main_window_->GetLayoutSize();
 
@@ -403,10 +461,14 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     }
   }
 
-  // We prefer the left position of candidate strings is aligned to
-  // that of preedit.
-  const Point main_window_zero_point(
-      main_window_->GetCandidateColumnInClientCord().Left(), 0);
+  // Horizontal writing aligns the left edge of candidate text with the
+  // preedit.  Vertical writing places the window beside the preedit and aligns
+  // the top of the first candidate text with the vertical target position.
+  const Rect main_candidate_text_rect =
+      main_window_->GetCandidateColumnInClientCord();
+  const Point main_window_zero_point =
+      vertical ? Point(0, main_candidate_text_rect.Top())
+               : Point(main_candidate_text_rect.Left(), 0);
 
   Rect main_window_rect;
   Rect preedit_rect_for_transition;
@@ -415,22 +477,35 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     // makes most of users happy.
     const CRect rect(candidate_layout.exclude_region());
     const Rect preedit_rect(rect.left, rect.top, rect.Width(), rect.Height());
+
+    // Keep the host-provided geometry for transition and collision semantics.
+    // Candidate-only visual clearance must not enlarge the composition itself.
     preedit_rect_for_transition = preedit_rect;
-    const bool vertical = (LayoutManager::GetWritingDirection(app_info) ==
-                           LayoutManager::VERTICAL_WRITING);
-    // Sometimes |target_point| is set to the top-left of the exclusion area
-    // but WindowUtil does not support this case yet.
-    // As a workaround, use |preedit_rect.Bottom()| for y-coordinate of the
-    // |target_point|.
-    // TODO(yukawa): Fix WindowUtil to support this case.
-    // TODO(yukawa): Add more unit tests.
+
+    Rect placement_preedit_rect = preedit_rect;
+    if (vertical) {
+      // Some TSF hosts report a narrow vertical line box. Because the vertical
+      // candidate is otherwise placed flush against that box, enforce a
+      // DPI-scaled minimum half-line clearance around its center while leaving
+      // already-wide host geometry unchanged.
+      const int minimum_half_clearance =
+          ::MulDiv(kVerticalCandidateMinimumHalfClearanceDip,
+                   static_cast<int>(target_dpi), kDefaultDpi);
+      placement_preedit_rect =
+          WindowUtil::GetVerticalCandidatePlacementPreeditRect(
+              preedit_rect, minimum_half_clearance);
+    }
+
+    // Horizontal candidate placement uses the bottom of the exclusion area.
+    // Vertical placement intentionally keeps LayoutManager's top-left target
+    // so the first vertical candidate text can align with the segment top.
     Point new_target_point = target_point;
     if (!vertical) {
       new_target_point.y = preedit_rect.Bottom();
     }
     main_window_rect =
         WindowUtil::GetWindowRectForMainWindowFromTargetPointAndPreedit(
-            new_target_point, preedit_rect, main_window_size,
+            new_target_point, placement_preedit_rect, main_window_size,
             main_window_zero_point, working_area, vertical);
   }
 
@@ -447,10 +522,10 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
         IsOppositeSideOfPreedit(
             last_live_conversion_passive_suggestion_rect_,
             next_live_conversion_passive_suggestion_rect,
-            preedit_rect_for_transition)) {
+            preedit_rect_for_transition, vertical)) {
       main_window_->HideWithEffects();
     }
-    ruby_window_->OnUpdate(command,
+    ruby_window_->OnUpdate(command, *layout_manager_,
                            &next_live_conversion_passive_suggestion_rect);
   }
 
@@ -458,11 +533,26 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
   main_window_->SetWindowPos(HWND_TOPMOST, main_window_rect.Left(),
                              main_window_rect.Top(), main_window_rect.Width(),
                              main_window_rect.Height(), set_windows_pos_flags);
-  if (is_live_conversion_passive_suggestion) {
-    main_window_->PresentCachedBitmapImmediately();
-    main_window_->RedrawImmediately();
-  }
-  main_window_->UpdateEffectWindows();
+  // CandidateWindow is a per-pixel-alpha layered window. Present the complete
+  // cached surface immediately for every candidate-like UI, not only passive
+  // live suggestions, so WM_PAINT scheduling cannot expose an empty/stale
+  // first frame.
+  main_window_->PresentCachedBitmapImmediately();
+
+  // The main candidate body is the bottom-most body in this renderer family.
+  // Secondary windows keep their shadows behind it, so no custom shadow can
+  // cover another renderer body while candidate UI is being updated.
+  const HWND main_window_handle = main_window_->GetWindowHandle();
+  infolist_window_->SetShadowZOrderAnchor(main_window_handle);
+  cascading_window_->SetShadowZOrderAnchor(main_window_handle);
+  // Ruby can be updated before the main candidate window. Reassert it now so
+  // main_window_ is the lowest visible renderer body before any secondary
+  // shadow is presented.
+  ruby_window_->RaiseToTopmostWithoutActivation();
+  conversion_status_window_->OnUpdate(
+      command, *layout_manager_, ruby_window_->m_hWnd, main_window_->m_hWnd);
+  conversion_status_window_->RaiseWithoutActivation();
+
   if (is_live_conversion_passive_suggestion) {
     last_live_conversion_passive_suggestion_visible_ = true;
     last_live_conversion_passive_suggestion_rect_ =
@@ -491,19 +581,33 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
 
   if (infolist_visible && !cascading_visible) {
     if (candidate_changed) {
-      infolist_window_->UpdateLayout(candidate_window);
-      infolist_window_->Invalidate();
+      infolist_window_->UpdateLayout(
+          candidate_window,
+          vertical ? InfolistWindow::LayoutMode::kVertical
+                   : InfolistWindow::LayoutMode::kHorizontal);
     }
 
-    // Align infolist window
-    const Rect infolist_rect = WindowUtil::GetWindowRectForInfolistWindow(
-        infolist_window_->GetLayoutSize(), main_window_rect, working_area);
+    // Horizontal writing keeps the legacy right/left placement contract.
+    // Vertical writing treats the active preedit as an obstacle: the candidate
+    // window is normally on its left, so the infolist should continue outward
+    // instead of opening back across the composition.
+    const Size infolist_size = infolist_window_->GetLayoutSize();
+    const Rect infolist_rect =
+        vertical && !preedit_rect_for_transition.IsRectEmpty()
+            ? WindowUtil::GetWindowRectForInfolistWindowAvoidingRect(
+                  infolist_size, main_window_rect,
+                  preedit_rect_for_transition, working_area)
+            : WindowUtil::GetWindowRectForInfolistWindow(
+                  infolist_size, main_window_rect, working_area);
+    // InfolistWindow is permanently layered. Its cached PBGRA surface is
+    // presented explicitly by UpdateEffectWindows(), so moving/resizing must
+    // not trigger the legacy WM_PAINT path.
     infolist_window_->MoveWindow(infolist_rect.Left(), infolist_rect.Top(),
                                  infolist_rect.Width(), infolist_rect.Height(),
-                                 TRUE);
+                                 FALSE);
     infolist_window_->SetWindowPos(
         HWND_TOPMOST, 0, 0, 0, 0,
-        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
     infolist_window_->UpdateEffectWindows();
 
     if (candidate_window.has_focused_index() &&
@@ -531,12 +635,20 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     const commands::CandidateWindow& sub_candidate_window =
         candidate_window.sub_candidate_window();
 
+    const CascadingWindowLayoutMode cascading_layout_mode =
+        GetCascadingWindowLayoutMode(vertical);
     if (candidate_changed) {
-      cascading_window_->UpdateLayout(sub_candidate_window);
+      if (cascading_layout_mode == CascadingWindowLayoutMode::kVertical) {
+        cascading_window_->UpdateLayout(
+            sub_candidate_window, CandidateWindow::LayoutMode::kVertical);
+      } else {
+        cascading_window_->UpdateLayout(sub_candidate_window);
+      }
     }
 
-    // Put the cascading window right to the selected row of this candidate
-    // window.
+    // Anchor the cascading window to the selected candidate. Horizontal
+    // writing preserves the legacy right/left placement, while vertical
+    // writing continues outward from the candidate/preedit obstacle.
     const Rect selected_row = main_window_->GetSelectionRectInScreenCord();
     const Rect selected_row_with_window_border(
         Point(main_window_rect.Left(), selected_row.Top()),
@@ -551,30 +663,29 @@ void WindowManager::UpdateLayout(const commands::RendererCommand& command) {
     const Size cascading_window_size = cascading_window_->GetLayoutSize();
 
     // cascading window should be in the same working area as the main window.
-    const Rect cascading_window_rect =
-        WindowUtil::GetWindowRectForCascadingWindow(
-            selected_row_with_window_border, cascading_window_size,
-            cascading_window_zero_point, working_area);
+    const Rect cascading_window_rect = GetCascadingWindowRect(
+        cascading_layout_mode, selected_row, selected_row_with_window_border,
+        main_window_rect, cascading_window_size, cascading_window_zero_point,
+        preedit_rect_for_transition, working_area);
 
     cascading_window_->SetWindowPos(
         HWND_TOPMOST, cascading_window_rect.Left(), cascading_window_rect.Top(),
         cascading_window_rect.Width(), cascading_window_rect.Height(),
         set_windows_pos_flags);
+    cascading_window_->PresentCachedBitmapImmediately();
     cascading_window_->UpdateEffectWindows();
     // This trick ensures that the window is certainly shown as 'inactivated'
     // in terms of visual effect on DWM-enabled desktop.
     cascading_window_->SendMessageW(WM_NCACTIVATE, FALSE);
-    if (candidate_changed) {
-      main_window_->Invalidate();
-      cascading_window_->Invalidate();
-    }
   } else {
     // no cascading window
-    if (candidate_changed) {
-      main_window_->Invalidate();
-    }
     cascading_window_->HideWithEffects();
   }
+
+  // Present the main shadow only after every secondary body has been positioned.
+  // main_window_ is the common Z-order anchor, so every candidate-family
+  // shadow stays below Infolist, cascade, and ruby surfaces.
+  main_window_->UpdateEffectWindows();
 }
 
 bool WindowManager::IsAvailable() const {

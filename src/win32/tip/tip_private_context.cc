@@ -75,6 +75,14 @@ class TipPrivateContext::InternalState {
   int32_t composition_focus_revision_ = 0;
   uint64_t composition_generation_ = 0;
   uint64_t next_composition_generation_ = 0;
+  TipZenzContextRequestState zenz_context_request_state_;
+  WritingDirection composition_writing_direction_ =
+      WritingDirection::kUnknown;
+  bool pending_roman_display_sample_attempted_ = false;
+  bool pending_roman_display_surface_uniform_ = false;
+  bool pending_roman_display_retry_allowed_ = false;
+  COLORREF pending_roman_text_color_ = RGB(0, 0, 0);
+  COLORREF pending_roman_background_color_ = RGB(0, 0, 0);
   VirtualKey last_down_key_;
   bool has_pending_mode_indicator_key_ = false;
   KeyInformation pending_mode_indicator_key_ = 0;
@@ -294,6 +302,11 @@ bool TipPrivateContext::IsCompositionForFocusDomain(
          state_->composition_focus_revision_ == focus_revision;
 }
 
+TipZenzContextRequestState*
+TipPrivateContext::mutable_zenz_context_request_state() {
+  return &state_->zenz_context_request_state_;
+}
+
 const VirtualKey& TipPrivateContext::last_down_key() const {
   return state_->last_down_key_;
 }
@@ -336,6 +349,57 @@ const InputBehavior& TipPrivateContext::input_behavior() const {
 
 InputBehavior* TipPrivateContext::mutable_input_behavior() {
   return &state_->input_behavior_;
+}
+
+WritingDirection TipPrivateContext::composition_writing_direction() const {
+  return state_->composition_writing_direction_;
+}
+
+void TipPrivateContext::SetCompositionWritingDirection(
+    WritingDirection direction) {
+  state_->composition_writing_direction_ = direction;
+}
+
+void TipPrivateContext::ClearCompositionWritingDirection() {
+  state_->composition_writing_direction_ = WritingDirection::kUnknown;
+}
+
+void TipPrivateContext::SetPendingRomanDisplayColors(
+    const COLORREF text_color, const COLORREF background_color,
+    const bool surface_uniform, const bool retry_allowed) {
+  state_->pending_roman_text_color_ = text_color;
+  state_->pending_roman_background_color_ = background_color;
+  state_->pending_roman_display_surface_uniform_ = surface_uniform;
+  state_->pending_roman_display_retry_allowed_ = retry_allowed;
+  state_->pending_roman_display_sample_attempted_ = true;
+}
+
+void TipPrivateContext::SetPendingRomanDisplayColorsUnavailable(
+    const bool retry_allowed) {
+  state_->pending_roman_display_surface_uniform_ = false;
+  state_->pending_roman_display_retry_allowed_ = retry_allowed;
+  state_->pending_roman_display_sample_attempted_ = true;
+}
+
+bool TipPrivateContext::GetPendingRomanDisplayColors(
+    COLORREF* text_color, COLORREF* background_color,
+    bool* surface_uniform, bool* retry_allowed) const {
+  if (!state_->pending_roman_display_sample_attempted_ ||
+      text_color == nullptr || background_color == nullptr ||
+      surface_uniform == nullptr || retry_allowed == nullptr) {
+    return false;
+  }
+  *text_color = state_->pending_roman_text_color_;
+  *background_color = state_->pending_roman_background_color_;
+  *surface_uniform = state_->pending_roman_display_surface_uniform_;
+  *retry_allowed = state_->pending_roman_display_retry_allowed_;
+  return true;
+}
+
+void TipPrivateContext::ClearPendingRomanDisplayColors() {
+  state_->pending_roman_display_sample_attempted_ = false;
+  state_->pending_roman_display_surface_uniform_ = false;
+  state_->pending_roman_display_retry_allowed_ = false;
 }
 
 }  // namespace tsf

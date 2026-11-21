@@ -39,6 +39,7 @@
 
 #include "absl/strings/match.h"
 #include "absl/strings/str_replace.h"
+#include "session/zenz_output_validator.h"
 
 namespace mozc::session {
 
@@ -226,6 +227,113 @@ bool IsJapaneseParticleBoundary(char32_t c) {
       return true;
     default:
       return false;
+  }
+}
+
+bool GetLeftNeighbor(absl::string_view value, size_t pos, bool* present,
+                     char32_t* neighbor) {
+  if (present == nullptr || neighbor == nullptr || pos > value.size()) {
+    return false;
+  }
+  if (pos == 0) {
+    *present = false;
+    *neighbor = 0;
+    return true;
+  }
+
+  size_t begin = 0;
+  size_t length = 0;
+  if (!DecodePreviousUtf8Char(value, pos, neighbor, &begin, &length)) {
+    return false;
+  }
+  *present = true;
+  return true;
+}
+
+bool GetRightNeighbor(absl::string_view value, size_t pos, bool* present,
+                      char32_t* neighbor) {
+  if (present == nullptr || neighbor == nullptr || pos > value.size()) {
+    return false;
+  }
+  if (pos == value.size()) {
+    *present = false;
+    *neighbor = 0;
+    return true;
+  }
+
+  size_t length = 0;
+  if (!DecodeUtf8CharAt(value, pos, neighbor, &length)) {
+    return false;
+  }
+  *present = true;
+  return true;
+}
+
+bool NumericNeighborMatches(bool baseline_present, char32_t baseline,
+                            bool candidate_present, char32_t candidate) {
+  if (baseline_present != candidate_present) {
+    return false;
+  }
+  if (!baseline_present) {
+    return true;
+  }
+
+  // Japanese text next to a number is semantic content that Zenz is allowed to
+  // improve (1代 -> 1台, 100円では変えない -> 100円では買えない).
+  // Non-Japanese separators and symbols are user-visible formatting and must be
+  // preserved exactly (100% must not become 100$, HTTP/2 must keep '/').
+  if (IsJapaneseLetterLike(baseline)) {
+    return IsJapaneseLetterLike(candidate);
+  }
+  return baseline == candidate;
+}
+
+bool NumericLiteralContextsMatch(absl::string_view baseline,
+                                 absl::string_view candidate,
+                                 absl::string_view surface) {
+  if (surface.empty()) {
+    return false;
+  }
+
+  size_t baseline_pos = 0;
+  size_t candidate_pos = 0;
+  while (true) {
+    baseline_pos = baseline.find(surface, baseline_pos);
+    candidate_pos = candidate.find(surface, candidate_pos);
+    if (baseline_pos == absl::string_view::npos ||
+        candidate_pos == absl::string_view::npos) {
+      return baseline_pos == candidate_pos;
+    }
+
+    bool baseline_left_present = false;
+    bool candidate_left_present = false;
+    bool baseline_right_present = false;
+    bool candidate_right_present = false;
+    char32_t baseline_left = 0;
+    char32_t candidate_left = 0;
+    char32_t baseline_right = 0;
+    char32_t candidate_right = 0;
+
+    if (!GetLeftNeighbor(baseline, baseline_pos, &baseline_left_present,
+                         &baseline_left) ||
+        !GetLeftNeighbor(candidate, candidate_pos, &candidate_left_present,
+                         &candidate_left) ||
+        !GetRightNeighbor(baseline, baseline_pos + surface.size(),
+                          &baseline_right_present, &baseline_right) ||
+        !GetRightNeighbor(candidate, candidate_pos + surface.size(),
+                          &candidate_right_present, &candidate_right)) {
+      return false;
+    }
+
+    if (!NumericNeighborMatches(baseline_left_present, baseline_left,
+                                candidate_left_present, candidate_left) ||
+        !NumericNeighborMatches(baseline_right_present, baseline_right,
+                                candidate_right_present, candidate_right)) {
+      return false;
+    }
+
+    baseline_pos += surface.size();
+    candidate_pos += surface.size();
   }
 }
 
@@ -489,7 +597,65 @@ bool TryRepairProtectedSpan(const ProtectedConversionSpan& span,
   return false;
 }
 
+bool BaselineSegmentsMatchAdoptionInput(
+    const std::vector<ZenzBaselineSegment>& baseline_segments,
+    absl::string_view key, absl::string_view mozc_value) {
+  if (baseline_segments.empty()) {
+    return false;
+  }
+
+  std::string concatenated_key;
+  std::string concatenated_value;
+  for (const ZenzBaselineSegment& segment : baseline_segments) {
+    if (segment.key.empty() || segment.value.empty()) {
+      return false;
+    }
+    concatenated_key.append(segment.key);
+    concatenated_value.append(segment.value);
+  }
+  return concatenated_key == key && concatenated_value == mozc_value;
+}
+
 }  // namespace
+
+ProtectedConversionSpan::Tier ClassifyProtectedAsciiSurface(
+    absl::string_view surface) {
+  if (surface.empty()) {
+    return ProtectedConversionSpan::Tier::kIdentityCritical;
+  }
+
+  size_t pos = 0;
+  if (surface[pos] == '+' || surface[pos] == '-') {
+    ++pos;
+  }
+
+  const size_t integer_begin = pos;
+  while (pos < surface.size() && '0' <= surface[pos] &&
+         surface[pos] <= '9') {
+    ++pos;
+  }
+  if (pos == integer_begin) {
+    return ProtectedConversionSpan::Tier::kIdentityCritical;
+  }
+  if (pos == surface.size()) {
+    return ProtectedConversionSpan::Tier::kNumericLiteral;
+  }
+
+  if (surface[pos] != '.') {
+    return ProtectedConversionSpan::Tier::kIdentityCritical;
+  }
+  ++pos;
+
+  const size_t fraction_begin = pos;
+  while (pos < surface.size() && '0' <= surface[pos] &&
+         surface[pos] <= '9') {
+    ++pos;
+  }
+  if (pos == surface.size() && pos > fraction_begin) {
+    return ProtectedConversionSpan::Tier::kNumericLiteral;
+  }
+  return ProtectedConversionSpan::Tier::kIdentityCritical;
+}
 
 ZenzProtectedPromptResult ZenzAdoptionPolicy::ProtectPromptKey(
     const ZenzProtectedPromptInput& input) const {
@@ -560,7 +726,7 @@ std::string ZenzAdoptionPolicy::RestorePlaceholders(
 ZenzAdoptionResult ZenzAdoptionPolicy::Decide(
     const ZenzAdoptionInput& input) const {
   std::string adopted_value(input.zenz_value);
-  bool repaired = false;
+  bool protected_surface_repaired = false;
 
   for (const ProtectedConversionSpan& span : input.protected_spans) {
     if (span.value.empty()) {
@@ -570,17 +736,41 @@ ZenzAdoptionResult ZenzAdoptionPolicy::Decide(
     const size_t required_occurrences =
         span.required_occurrences == 0 ? 1 : span.required_occurrences;
 
+    if (span.tier == ProtectedConversionSpan::Tier::kNumericLiteral) {
+      const size_t baseline_occurrences =
+          CountOccurrences(input.mozc_value, span.value);
+      const size_t adopted_occurrences =
+          CountOccurrences(adopted_value, span.value);
+      if (baseline_occurrences < required_occurrences ||
+          adopted_occurrences != baseline_occurrences) {
+        ZenzAdoptionResult result;
+        result.action = ZenzAdoptionResult::Action::kReject;
+        result.value = std::string(input.mozc_value);
+        result.reason = "protected_numeric_literal_not_preserved";
+        return result;
+      }
+      if (!NumericLiteralContextsMatch(input.mozc_value, adopted_value,
+                                       span.value)) {
+        ZenzAdoptionResult result;
+        result.action = ZenzAdoptionResult::Action::kReject;
+        result.value = std::string(input.mozc_value);
+        result.reason = "protected_numeric_literal_context_changed";
+        return result;
+      }
+      continue;
+    }
+
     while (CountBoundaryPreservedOccurrences(adopted_value, span.value) <
            required_occurrences) {
       if (TryRepairAttachedProtectedSpan(input.mozc_value, span,
                                          &adopted_value)) {
-        repaired = true;
+        protected_surface_repaired = true;
         continue;
       }
 
       if (CountOccurrences(adopted_value, span.value) < required_occurrences &&
           TryRepairProtectedSpan(span, &adopted_value)) {
-        repaired = true;
+        protected_surface_repaired = true;
         continue;
       }
 
@@ -595,12 +785,95 @@ ZenzAdoptionResult ZenzAdoptionPolicy::Decide(
     }
   }
 
+  bool orthography_repaired = false;
+  const bool baseline_segments_match = BaselineSegmentsMatchAdoptionInput(
+      input.baseline_segments, input.key, input.mozc_value);
+  if (baseline_segments_match) {
+    const ZenzSegmentProjection projection = ProjectZenzValueToMozcSegments(
+        input.baseline_segments, input.key, adopted_value);
+
+    if (projection.success) {
+      std::string orthography_repaired_value;
+      for (const ZenzProjectedSegment& segment : projection.segments) {
+        if (!segment.changed) {
+          orthography_repaired_value.append(segment.zenz_value);
+          continue;
+        }
+
+        const ZenzOrthographyDecision decision = orthography_policy_.Evaluate(
+            segment.mozc_value, segment.zenz_value);
+        if (decision.allow) {
+          orthography_repaired_value.append(segment.zenz_value);
+          continue;
+        }
+
+        // An unresolved multi-segment aggregate proves only the outer span;
+        // it does not identify which original Mozc segment owns the unsafe
+        // orthographic transition.  Repairing the whole aggregate back to the
+        // Mozc baseline would report an accepted Zenz result even though none
+        // of that ambiguous rewrite was adopted.  Fail closed instead.  Known
+        // one-segment boundaries may still be repaired locally below.
+        if (!segment.boundary_known) {
+          ZenzAdoptionResult result;
+          result.action = ZenzAdoptionResult::Action::kReject;
+          result.value = std::string(input.mozc_value);
+          result.reason = "orthographic_transition_projection_failed";
+          return result;
+        }
+
+        orthography_repaired_value.append(segment.mozc_value);
+        orthography_repaired = true;
+      }
+      adopted_value = std::move(orthography_repaired_value);
+    } else {
+      const ZenzOrthographyDecision decision =
+          orthography_policy_.Evaluate(input.mozc_value, adopted_value);
+      if (!decision.allow) {
+        ZenzAdoptionResult result;
+        result.action = ZenzAdoptionResult::Action::kReject;
+        result.value = std::string(input.mozc_value);
+        result.reason = "orthographic_transition_projection_failed";
+        return result;
+      }
+    }
+  } else {
+    const ZenzOrthographyDecision decision =
+        orthography_policy_.Evaluate(input.mozc_value, adopted_value);
+    if (!decision.allow) {
+      ZenzAdoptionResult result;
+      result.action = ZenzAdoptionResult::Action::kReject;
+      result.value = std::string(input.mozc_value);
+      result.reason = input.baseline_segments.empty()
+                          ? "orthographic_transition_missing_baseline_segments"
+                          : "orthographic_transition_stale_baseline_segments";
+      return result;
+    }
+  }
+
+  // Reject a clear deletion from the full Mozc surface even when Japanese-
+  // only rewrites pass the orthography checks.  Check the final repaired value
+  // so that repair cannot accidentally reintroduce a truncated phrase.
+  if (ZenzOutputValidator::IsObviousSurfaceTruncation(input.mozc_value,
+                                                     adopted_value)) {
+    ZenzAdoptionResult result;
+    result.action = ZenzAdoptionResult::Action::kReject;
+    result.value = std::string(input.mozc_value);
+    result.reason = "obvious_surface_truncation";
+    return result;
+  }
+
   ZenzAdoptionResult result;
+  const bool repaired = protected_surface_repaired || orthography_repaired;
   result.action = repaired ? ZenzAdoptionResult::Action::kAcceptWithRepair
                            : ZenzAdoptionResult::Action::kAcceptAsIs;
   result.value = std::move(adopted_value);
-  result.reason = repaired ? "protected_user_dictionary_surface_repaired"
-                           : "accepted";
+  if (orthography_repaired) {
+    result.reason = "orthographic_transition_repaired";
+  } else if (protected_surface_repaired) {
+    result.reason = "protected_user_dictionary_surface_repaired";
+  } else {
+    result.reason = "accepted";
+  }
   return result;
 }
 

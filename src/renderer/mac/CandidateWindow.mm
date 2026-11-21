@@ -36,13 +36,16 @@
 #include "base/coordinates.h"
 #include "protocol/commands.pb.h"
 #include "renderer/mac/CandidateWindow.h"
+#include "renderer/renderer_style_handler.h"
 
 namespace mozc {
 namespace renderer {
 namespace mac {
 
 CandidateWindow::CandidateWindow()
-    : command_sender_(nullptr), renderer_callback_token_(0) {}
+    : command_sender_(nullptr),
+      renderer_callback_token_(0),
+      writing_direction_(WritingDirection::kHorizontal) {}
 
 CandidateWindow::~CandidateWindow() {}
 
@@ -63,15 +66,34 @@ void CandidateWindow::SetRendererCallbackToken(uint64_t token) {
   }
 }
 
+void CandidateWindow::SetWritingDirection(
+    WritingDirection writing_direction) {
+  writing_direction_ = writing_direction;
+  if (view_ != nil) {
+    CandidateView* candidate_view = (CandidateView*)view_;
+    [candidate_view setWritingDirection:writing_direction_];
+  }
+}
+
 void CandidateWindow::InitWindow() {
   RendererBaseWindow::InitWindow();
-  const CandidateView* candidate_view = (CandidateView*)view_;
+  [window_ setOpaque:NO];
+  [window_ setHasShadow:NO];
+  [window_ setBackgroundColor:NSColor.clearColor];
+  CandidateView* candidate_view = (CandidateView*)view_;
   [candidate_view setSendCommandInterface:command_sender_];
   [candidate_view setRendererCallbackToken:renderer_callback_token_];
+  [candidate_view setWritingDirection:writing_direction_];
 }
-const mozc::renderer::TableLayout* CandidateWindow::GetTableLayout() const {
+
+mozc::Point CandidateWindow::GetCandidateAnchorOffset() const {
   const CandidateView* candidate_view = (CandidateView*)view_;
-  return [candidate_view tableLayout];
+  return [candidate_view candidateAnchorOffset];
+}
+
+mozc::Rect CandidateWindow::GetCascadingAnchorRect(size_t row) const {
+  const CandidateView* candidate_view = (CandidateView*)view_;
+  return [candidate_view cascadingAnchorRectForRow:row];
 }
 
 void CandidateWindow::SetCandidateWindow(const commands::CandidateWindow& candidate_window) {
@@ -88,6 +110,17 @@ void CandidateWindow::SetCandidateWindow(const commands::CandidateWindow& candid
   [candidate_view setNeedsDisplay:YES];
   NSSize size = [candidate_view updateLayout];
   ResizeWindow(size.width, size.height);
+
+  const RendererStyleHandler::RendererStyleType style_type =
+      RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+          candidate_window);
+  const RendererStyleHandler::CandidateWindowEffectStyle effect_style =
+      RendererStyleHandler::GetCandidateWindowEffectStyle(style_type);
+  SetWindowEffects(
+      effect_style.opacity_percent,
+      static_cast<CGFloat>(
+          RendererStyleHandler::GetCandidateWindowCornerRadius(style_type)),
+      effect_style.shadow);
 }
 
 void CandidateWindow::ResetView() {

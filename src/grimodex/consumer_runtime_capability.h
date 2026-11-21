@@ -16,7 +16,7 @@ bool HasCompleteWindowsZenzRuntime(
     const std::function<bool(absl::string_view)> &file_probe);
 
 // Returns true only when every file consumed by the packaged macOS scorer is
-// present under MozkeyIbGConverter.app/Contents/Resources.
+// present under MozkeyIbG.app/Contents/Resources/ZenzRuntime.
 bool HasCompleteMacosZenzRuntime(
     const std::function<bool(absl::string_view)> &file_probe);
 

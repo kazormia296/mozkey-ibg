@@ -346,7 +346,7 @@ class PrepareWindowsZenzRuntimeTest(unittest.TestCase):
         self.assertIn("-Architecture arm64", arm64_job)
         self.assertNotIn("\\x64\\Microsoft.VC145.CRT", arm64_job)
         self.assertIn("probe_windows_zenz_runtime.ps1", workflow)
-        self.assertEqual(workflow.count("if ($LASTEXITCODE -ne 0)"), 6)
+        self.assertEqual(workflow.count("if ($LASTEXITCODE -ne 0)"), 12)
         self.assertIn("  pull_request:\n", workflow)
         self.assertIn("  push:\n    branches:\n      - main\n", workflow)
         self.assertIn("  workflow_call:\n    inputs:\n      release:\n", workflow)
@@ -356,7 +356,7 @@ class PrepareWindowsZenzRuntimeTest(unittest.TestCase):
             "${{ github.head_ref || github.ref }}",
             workflow,
         )
-        self.assertEqual(workflow.count("name: windows-daily-dictionary"), 5)
+        self.assertEqual(workflow.count("name: windows-daily-dictionary"), 6)
         self.assertEqual(
             workflow.count("if: ${{ inputs.release == true }}"),
             3,
@@ -383,13 +383,13 @@ class PrepareWindowsZenzRuntimeTest(unittest.TestCase):
                     workflow,
                 )
                 self.assertIn(f"name: {artifact_name}", workflow)
-        self.assertEqual(workflow.count("retention-days: 7"), 3)
+        self.assertEqual(workflow.count("retention-days: 7"), 5)
         bazel_commands = [
             line.strip()
             for line in workflow.splitlines()
             if line.lstrip().startswith(("bazelisk build ", "bazelisk test "))
         ]
-        self.assertEqual(len(bazel_commands), 5)
+        self.assertEqual(len(bazel_commands), 7)
         for command in bazel_commands:
             with self.subTest(command=command):
                 self.assertIn(

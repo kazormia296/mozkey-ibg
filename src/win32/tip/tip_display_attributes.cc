@@ -68,6 +68,11 @@ constexpr TF_DISPLAYATTRIBUTE kConvertedAttribute = {
     TF_ATTR_TARGET_CONVERTED  // attribute info
 };
 
+constexpr std::wstring_view kZenzLiveCorrectionDescription =
+    L"TextService Display Attribute Zenz Live Correction";
+constexpr std::wstring_view kPendingRomanDescription =
+    L"TextService Display Attribute Pending Roman";
+
 COLORREF RgbHexToColorRef(const uint32_t rgb) {
   const BYTE r = static_cast<BYTE>((rgb >> 16) & 0xff);
   const BYTE g = static_cast<BYTE>((rgb >> 8) & 0xff);
@@ -86,6 +91,86 @@ TF_DA_COLOR CustomColor(const uint32_t rgb) {
   color.type = TF_CT_COLORREF;
   color.cr = RgbHexToColorRef(rgb);
   return color;
+}
+
+TF_DA_COLOR SystemColor(const int index) {
+  TF_DA_COLOR color = {};
+  color.type = TF_CT_SYSCOLOR;
+  color.nIndex = index;
+  return color;
+}
+
+enum class PendingRomanDisplayMode {
+  kCompatibilityFallback,
+  kSystemGrayText,
+  kSampledColors,
+};
+
+struct PendingRomanDisplayState {
+  PendingRomanDisplayMode mode =
+      PendingRomanDisplayMode::kCompatibilityFallback;
+  COLORREF text_color = RGB(0, 0, 0);
+  COLORREF background_color = RGB(0, 0, 0);
+  bool use_explicit_background = true;
+};
+
+struct GeckoDisplayCompatibilityState {
+  bool has_background = false;
+  bool use_explicit_background = false;
+  COLORREF background_color = RGB(0, 0, 0);
+};
+
+// ITfDisplayAttributeInfo::GetAttributeInfo() is queried in the host process.
+// Keep presentation choices thread-local so independent TSF threads do not
+// leak one editor's sampled background into another.
+thread_local PendingRomanDisplayState g_pending_roman_display_state;
+thread_local GeckoDisplayCompatibilityState
+    g_gecko_display_compatibility_state;
+
+TF_DA_COLOR ColorRefColor(const COLORREF color_ref) {
+  TF_DA_COLOR color = {};
+  color.type = TF_CT_COLORREF;
+  color.cr = color_ref;
+  return color;
+}
+
+TF_DISPLAYATTRIBUTE CreatePendingRomanAttribute() {
+  TF_DISPLAYATTRIBUTE attr = kInputAttribute;
+
+  switch (g_pending_roman_display_state.mode) {
+    case PendingRomanDisplayMode::kSystemGrayText:
+      attr.crText = SystemColor(COLOR_GRAYTEXT);
+      attr.crBk = NoColor();
+      attr.lsStyle = TF_LS_DOT;
+      attr.fBoldLine = FALSE;
+      attr.crLine = SystemColor(COLOR_GRAYTEXT);
+      break;
+
+    case PendingRomanDisplayMode::kSampledColors:
+      attr.crText =
+          ColorRefColor(g_pending_roman_display_state.text_color);
+      attr.crBk =
+          g_pending_roman_display_state.use_explicit_background
+              ? ColorRefColor(
+                    g_pending_roman_display_state.background_color)
+              : NoColor();
+      attr.lsStyle = TF_LS_DOT;
+      attr.fBoldLine = FALSE;
+      attr.crLine = SystemColor(COLOR_GRAYTEXT);
+      break;
+
+    case PendingRomanDisplayMode::kCompatibilityFallback:
+      // Color-free fallback: Gecko keeps the page background untouched.
+      attr.crText = NoColor();
+      attr.crBk = NoColor();
+      attr.lsStyle = TF_LS_DOT;
+      attr.fBoldLine = FALSE;
+      attr.crLine = SystemColor(COLOR_GRAYTEXT);
+      break;
+  }
+
+  attr.bAttr = TF_ATTR_INPUT;
+  return attr;
 }
 
 std::shared_ptr<const config::Config> ReloadAndGetConfig() {
@@ -119,6 +204,7 @@ TF_DISPLAYATTRIBUTE CreateInputAttributeFromConfig() {
           ? CustomColor(config->preedit_underline_color())
           : NoColor();
 
+  ApplyGeckoDisplayCompatibilityBackground(&attr);
   return attr;
 }
 
@@ -145,6 +231,40 @@ TF_DISPLAYATTRIBUTE CreateConvertedAttributeFromConfig() {
           ? CustomColor(config->preedit_target_underline_color())
           : NoColor();
 
+  ApplyGeckoDisplayCompatibilityBackground(&attr);
+  return attr;
+}
+
+TF_DISPLAYATTRIBUTE CreateZenzLiveCorrectionAttributeFromConfig() {
+  TF_DISPLAYATTRIBUTE attr = kConvertedAttribute;
+
+  const std::shared_ptr<const config::Config> config = ReloadAndGetConfig();
+  if (config == nullptr) {
+    return attr;
+  }
+
+  attr.crText =
+      config->use_custom_zenz_live_correction_text_color()
+          ? CustomColor(config->zenz_live_correction_text_color())
+          : (config->use_custom_preedit_target_text_color()
+                 ? CustomColor(config->preedit_target_text_color())
+                 : NoColor());
+
+  attr.crBk =
+      config->use_custom_zenz_live_correction_background_color()
+          ? CustomColor(config->zenz_live_correction_background_color())
+          : (config->use_custom_preedit_target_background_color()
+                 ? CustomColor(config->preedit_target_background_color())
+                 : NoColor());
+
+  attr.crLine =
+      config->use_custom_zenz_live_correction_underline_color()
+          ? CustomColor(config->zenz_live_correction_underline_color())
+          : (config->use_custom_preedit_target_underline_color()
+                 ? CustomColor(config->preedit_target_underline_color())
+                 : NoColor());
+
+  ApplyGeckoDisplayCompatibilityBackground(&attr);
   return attr;
 }
 
@@ -164,8 +284,24 @@ constexpr GUID kDisplayAttributeConverted = {
     0x4d29,
     {0xbd, 0x2f, 0xe4, 0x13, 0xa9, 0x44, 0xb7, 0xe4}};
 
+// {90D581F4-3D1A-411D-A11F-0ACA7CF9C783}
+constexpr GUID kDisplayAttributeZenzLiveCorrection = {
+    0x90d581f4,
+    0x3d1a,
+    0x411d,
+    {0xa1, 0x1f, 0x0a, 0xca, 0x7c, 0xf9, 0xc7, 0x83}};
+
+// {08E60AFF-F2EB-461D-A053-67C971B4D6CC}
+constexpr GUID kDisplayAttributePendingRoman = {
+    0x08e60aff,
+    0xf2eb,
+    0x461d,
+    {0xa0, 0x53, 0x67, 0xc9, 0x71, 0xb4, 0xd6, 0xcc}};
+
 #else  // GOOGLE_JAPANESE_INPUT_BUILD
 
+// Mozkey IbG display attribute GUIDs.  Every one is fork-specific and must
+// differ from upstream Mozkey's so both TIPs can be registered side by side.
 // {1A677FDF-21DA-4577-8A18-E77B928CFD2D}
 constexpr GUID kDisplayAttributeInput = {
     0x1a677fdf,
@@ -180,9 +316,73 @@ constexpr GUID kDisplayAttributeConverted = {
     0x46f9,
     {0xb3, 0xe5, 0x25, 0xbb, 0xb1, 0x7d, 0xbb, 0x82}};
 
+// {7AF91EB2-4170-4EB8-A483-0BB29DC4D9B6}
+constexpr GUID kDisplayAttributeZenzLiveCorrection = {
+    0x7af91eb2,
+    0x4170,
+    0x4eb8,
+    {0xa4, 0x83, 0x0b, 0xb2, 0x9d, 0xc4, 0xd9, 0xb6}};
+
+// {390F880F-9BEB-4258-AAD8-023E5CAA4C35}
+constexpr GUID kDisplayAttributePendingRoman = {
+    0x390f880f,
+    0x9beb,
+    0x4258,
+    {0xaa, 0xd8, 0x02, 0x3e, 0x5c, 0xaa, 0x4c, 0x35}};
+
 #endif  // !GOOGLE_JAPANESE_INPUT_BUILD
 
 }  // namespace
+
+void SetPendingRomanDisplayAttributeSystemGray() {
+  g_pending_roman_display_state.mode =
+      PendingRomanDisplayMode::kSystemGrayText;
+}
+
+void SetGeckoDisplayCompatibilityBackground(
+    const COLORREF background_color,
+    const bool use_explicit_background) {
+  g_gecko_display_compatibility_state.has_background = true;
+  g_gecko_display_compatibility_state.use_explicit_background =
+      use_explicit_background;
+  g_gecko_display_compatibility_state.background_color =
+      background_color;
+}
+
+void ClearGeckoDisplayCompatibilityBackground() {
+  g_gecko_display_compatibility_state =
+      GeckoDisplayCompatibilityState();
+}
+
+void ApplyGeckoDisplayCompatibilityBackground(
+    TF_DISPLAYATTRIBUTE* attribute) {
+  if (attribute == nullptr ||
+      !g_gecko_display_compatibility_state.has_background ||
+      !g_gecko_display_compatibility_state.use_explicit_background) {
+    return;
+  }
+  if (attribute->crText.type != TF_CT_NONE &&
+      attribute->crBk.type == TF_CT_NONE) {
+    attribute->crBk = ColorRefColor(
+        g_gecko_display_compatibility_state.background_color);
+  }
+}
+
+void SetPendingRomanDisplayAttributeSampledColors(
+    const COLORREF text_color, const COLORREF background_color,
+    const bool use_explicit_background) {
+  g_pending_roman_display_state.mode =
+      PendingRomanDisplayMode::kSampledColors;
+  g_pending_roman_display_state.text_color = text_color;
+  g_pending_roman_display_state.background_color = background_color;
+  g_pending_roman_display_state.use_explicit_background =
+      use_explicit_background;
+}
+
+void SetPendingRomanDisplayAttributeCompatibilityFallback() {
+  g_pending_roman_display_state.mode =
+      PendingRomanDisplayMode::kCompatibilityFallback;
+}
 
 TipDisplayAttribute::TipDisplayAttribute(const GUID& guid,
                                          const TF_DISPLAYATTRIBUTE& attribute,
@@ -244,6 +444,35 @@ STDMETHODIMP TipDisplayAttributeConverted::GetAttributeInfo(
 
 const GUID& TipDisplayAttributeConverted::guid() {
   return kDisplayAttributeConverted;
+}
+
+TipDisplayAttributeZenzLiveCorrection::TipDisplayAttributeZenzLiveCorrection()
+    : TipDisplayAttribute(kDisplayAttributeZenzLiveCorrection,
+                          kConvertedAttribute,
+                          kZenzLiveCorrectionDescription) {}
+
+STDMETHODIMP TipDisplayAttributeZenzLiveCorrection::GetAttributeInfo(
+    TF_DISPLAYATTRIBUTE* absl_nullable attribute) {
+  return SaveToOutParam(
+      CreateZenzLiveCorrectionAttributeFromConfig(), attribute);
+}
+
+const GUID& TipDisplayAttributeZenzLiveCorrection::guid() {
+  return kDisplayAttributeZenzLiveCorrection;
+}
+
+TipDisplayAttributePendingRoman::TipDisplayAttributePendingRoman()
+    : TipDisplayAttribute(kDisplayAttributePendingRoman,
+                          CreatePendingRomanAttribute(),
+                          kPendingRomanDescription) {}
+
+STDMETHODIMP TipDisplayAttributePendingRoman::GetAttributeInfo(
+    TF_DISPLAYATTRIBUTE* absl_nullable attribute) {
+  return SaveToOutParam(CreatePendingRomanAttribute(), attribute);
+}
+
+const GUID& TipDisplayAttributePendingRoman::guid() {
+  return kDisplayAttributePendingRoman;
 }
 
 }  // namespace tsf

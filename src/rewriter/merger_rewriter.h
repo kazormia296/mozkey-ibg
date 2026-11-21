@@ -139,9 +139,31 @@ class MergerRewriter : public RewriterInterface {
     }
   }
 
+  void PrepareForSuggestionLearning(
+      const ConversionRequest& request) override {
+    for (const std::unique_ptr<RewriterInterface>& rewriter : rewriters_) {
+      rewriter->PrepareForSuggestionLearning(request);
+    }
+  }
+
+  void FinishWithSuggestionLearningSegments(
+      const ConversionRequest& request, const Segments& committed_segments,
+      const Segments* suggestion_learning_segments) override {
+    for (const std::unique_ptr<RewriterInterface>& rewriter : rewriters_) {
+      rewriter->FinishWithSuggestionLearningSegments(
+          request, committed_segments, suggestion_learning_segments);
+    }
+  }
+
   void Revert(const Segments& segments) override {
     for (const std::unique_ptr<RewriterInterface>& rewriter : rewriters_) {
       rewriter->Revert(segments);
+    }
+  }
+
+  void DiscardRevert(const Segments& segments) override {
+    for (const std::unique_ptr<RewriterInterface>& rewriter : rewriters_) {
+      rewriter->DiscardRevert(segments);
     }
   }
 

@@ -424,4 +424,84 @@ TEST_F(UserHistoryStorageTest, UserHistoryStorageContainingInvalidEntries) {
   EXPECT_EQ(valid_num, 1);
 }
 
+TEST_F(UserHistoryStorageTest, ClearWhileAsyncLoadAndSaveTest) {
+  const TempFile file = testing::MakeTempFileOrDie();
+  UserHistoryStorage storage(file.path());
+  storage.Wait();
+
+  for (int i = 0; i < 1000; ++i) {
+    storage.Insert(MakeEntry(i));
+  }
+  EXPECT_TRUE(storage.Save());
+  EXPECT_OK(FileUtil::FileExists(file.path()));
+
+  // Clear() while AsyncLoad() is in flight must wait for the background task
+  // and leave both memory and disk cleared.
+  storage.AsyncLoad();
+  storage.Clear();
+  storage.Wait();
+  EXPECT_TRUE(storage.IsEmpty());
+  EXPECT_FALSE(FileUtil::FileExists(file.path()).ok());
+
+  // Clear() while AsyncSave() is in flight must wait for the background task
+  // and not allow the old snapshot to be written back to disk.
+  for (int i = 0; i < 1000; ++i) {
+    storage.Insert(MakeEntry(i));
+  }
+  storage.AsyncSave();
+  storage.Clear();
+  storage.Wait();
+  EXPECT_TRUE(storage.IsEmpty());
+  EXPECT_FALSE(FileUtil::FileExists(file.path()).ok());
+}
+
+TEST_F(UserHistoryStorageTest, LoadClearsMemoryWhenFileRemovedTest) {
+  const TempFile file = testing::MakeTempFileOrDie();
+  UserHistoryStorage storage1(file.path());
+  storage1.Wait();
+  storage1.Insert(MakeEntry(1));
+  EXPECT_TRUE(storage1.Save());
+  EXPECT_OK(FileUtil::FileExists(file.path()));
+
+  // A second instance loads the saved history from disk.
+  UserHistoryStorage storage2(file.path());
+  storage2.Wait();
+  EXPECT_FALSE(storage2.IsEmpty());
+
+  // Clearing storage1 removes the file on disk.
+  storage1.Clear();
+  EXPECT_FALSE(FileUtil::FileExists(file.path()).ok());
+
+  // Reloading storage2 when the backing file no longer exists must clear its
+  // in-memory cache rather than retaining stale entries.
+  storage2.AsyncLoad();
+  storage2.Wait();
+  EXPECT_TRUE(storage2.IsEmpty());
+
+  // If storage2 has unsaved in-memory entries and Load() fails due to a
+  // corrupted storage file, both the in-memory cache and needs_sync_ must be
+  // reset so a subsequent Save() does not unlink the backing file.
+  storage2.Insert(MakeEntry(2));
+  EXPECT_FALSE(storage2.IsEmpty());
+  ASSERT_OK(FileUtil::SetContents(file.path(), "corrupted_storage"));
+  storage2.AsyncLoad();
+  storage2.Wait();
+  EXPECT_TRUE(storage2.IsEmpty());
+  EXPECT_TRUE(storage2.Save());
+  EXPECT_OK(FileUtil::FileExists(file.path()));
+
+  // Likewise, if EncryptedStringStorage succeeds but the decrypted payload is
+  // not a valid UserHistory protobuf, Load() must clear the in-memory cache and
+  // reset needs_sync_.
+  storage2.Insert(MakeEntry(3));
+  EXPECT_FALSE(storage2.IsEmpty());
+  storage::EncryptedStringStorage encrypted_storage(file.path());
+  ASSERT_TRUE(encrypted_storage.Save("invalid_protobuf_payload"));
+  storage2.AsyncLoad();
+  storage2.Wait();
+  EXPECT_TRUE(storage2.IsEmpty());
+  EXPECT_TRUE(storage2.Save());
+  EXPECT_OK(FileUtil::FileExists(file.path()));
+}
+
 }  // namespace mozc::prediction

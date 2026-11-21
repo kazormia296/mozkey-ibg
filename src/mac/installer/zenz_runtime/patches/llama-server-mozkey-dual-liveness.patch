@@ -1,0 +1,87 @@
+diff --git a/tools/server/main.cpp b/tools/server/main.cpp
+--- a/tools/server/main.cpp
++++ b/tools/server/main.cpp
+@@ -1,5 +1,83 @@
++// Mozkey's guarded macOS runtime: the worker monitors two independent
++// liveness pipes inherited only when the guard opts in.  Unmodified llama-server
++// launches and other platforms never activate this extension.
++#if defined(__APPLE__)
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/stat.h>
++#include <thread>
++#include <unistd.h>
++
++namespace {
++constexpr int kMozkeyScorerLifetimeFd = 23;
++constexpr int kMozkeyGuardLifetimeFd = 24;
++constexpr char kMozkeyDualLifetimeSwitch[] =
++    "--mozkey-zenz-dual-liveness-v1";
++// Also provides an identity marker in both thin binaries for the build audit.
++
++bool ValidateLifetimeFd(int fd) {
++    const int flags = ::fcntl(fd, F_GETFL);
++    if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY) {
++        return false;
++    }
++    struct stat st = {};
++    if (::fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode)) {
++        return false;
++    }
++    const int fd_flags = ::fcntl(fd, F_GETFD);
++    return fd_flags >= 0 &&
++           ::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) == 0;
++}
++
++// Never rely on another process to deliver a signal: it may have been
++// SIGKILLed.  Direct kernel-process exit also works during model load and
++// before llama-server's own shutdown_handler is initialized.  The OS closes
++// HTTP sockets and releases Metal/memory resources on process termination.
++[[noreturn]] void WatchLifetimePipes() {
++    pollfd fds[2] = {};
++    fds[0].fd = kMozkeyScorerLifetimeFd;
++    fds[0].events = POLLIN | POLLHUP;
++    fds[1].fd = kMozkeyGuardLifetimeFd;
++    fds[1].events = POLLIN | POLLHUP;
++    while (true) {
++        const int rc = ::poll(fds, 2, -1);
++        if (rc < 0 && errno == EINTR) {
++            continue;
++        }
++        // No data should ever arrive.  Any readable/closed/invalid FD, or
++        // poll failure, means the worker must fail closed immediately.
++        if (rc < 0 || fds[0].revents != 0 || fds[1].revents != 0) {
++            ::_exit(73);
++        }
++    }
++}
++}  // namespace
++#endif  // __APPLE__
++
+ int llama_server(int argc, char ** argv);
+ 
+ int main(int argc, char ** argv) {
++#if defined(__APPLE__)
++    if (argc > 1 && std::strcmp(argv[1], kMozkeyDualLifetimeSwitch) == 0) {
++        // Validate both pipes BEFORE model loading or daemon startup.  The
++        // guard passes the switch only after mapping FDs 23 and 24.
++        if (!ValidateLifetimeFd(kMozkeyScorerLifetimeFd) ||
++            !ValidateLifetimeFd(kMozkeyGuardLifetimeFd)) {
++            return 73;
++        }
++        // Strip the Mozkey-only switch before llama.cpp's option parser.
++        for (int i = 1; i < argc; ++i) {
++            argv[i] = argv[i + 1];
++        }
++        --argc;
++        try {
++            std::thread(WatchLifetimePipes).detach();
++        } catch (...) {
++            return 73;
++        }
++    }
++#endif
+     return llama_server(argc, argv);
+ }

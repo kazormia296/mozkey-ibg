@@ -36,11 +36,14 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/base/no_destructor.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/log/log.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
@@ -65,6 +68,269 @@ namespace config {
 namespace {
 
 constexpr absl::string_view kFileNamePrefix = "user://config";
+
+constexpr uint32_t kMozkeyDefaultDirectCommitKey =
+    Config::DIRECT_COMMIT_KUTEN |
+    Config::DIRECT_COMMIT_TOUTEN |
+    Config::DIRECT_COMMIT_QUESTION_MARK |
+    Config::DIRECT_COMMIT_EXCLAMATION_MARK |
+    Config::DIRECT_COMMIT_OPEN_BRACKET |
+    Config::DIRECT_COMMIT_CLOSE_BRACKET;
+
+constexpr absl::string_view kCandidateHideConversionRow =
+    "Conversion\tCtrl Delete\tDeleteSelectedCandidate";
+
+bool MaybeMigrateCandidateHideCustomKeymap(Config* config) {
+  if (config->session_keymap() != Config::CUSTOM ||
+      config->custom_keymap_table().empty()) {
+    return false;
+  }
+
+  bool has_conversion_delete_selected_candidate = false;
+  bool conversion_ctrl_delete_is_occupied = false;
+
+  for (absl::string_view line :
+       absl::StrSplit(config->custom_keymap_table(), '\n')) {
+    line = absl::StripAsciiWhitespace(line);
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+
+    const std::vector<absl::string_view> columns =
+        absl::StrSplit(line, '\t');
+    if (columns.size() != 3) {
+      continue;
+    }
+
+    const absl::string_view state = absl::StripAsciiWhitespace(columns[0]);
+    const absl::string_view key = absl::StripAsciiWhitespace(columns[1]);
+    const absl::string_view command_sequence =
+        absl::StripAsciiWhitespace(columns[2]);
+
+    if (state != "Conversion") {
+      continue;
+    }
+
+    if (key == "Ctrl Delete") {
+      conversion_ctrl_delete_is_occupied = true;
+    }
+
+    for (absl::string_view command :
+         absl::StrSplit(command_sequence, '|', absl::SkipEmpty())) {
+      if (absl::StripAsciiWhitespace(command) ==
+          "DeleteSelectedCandidate") {
+        has_conversion_delete_selected_candidate = true;
+        break;
+      }
+    }
+  }
+
+  if (has_conversion_delete_selected_candidate ||
+      conversion_ctrl_delete_is_occupied) {
+    return false;
+  }
+
+  std::string table = config->custom_keymap_table();
+  if (!table.empty() && table.back() != '\n') {
+    table.push_back('\n');
+  }
+  table.append(kCandidateHideConversionRow.data(),
+               kCandidateHideConversionRow.size());
+  table.push_back('\n');
+  config->set_custom_keymap_table(std::move(table));
+  return true;
+}
+
+// Persist an explicit Zenz Space action only for CUSTOM tables which still
+// use the original single-step Conversion Space behavior. Never overwrite
+// a user's Zenz-specific binding or reinterpret a customized Space key.
+constexpr absl::string_view kZenzRevertSpaceRow =
+    "ZenzConversion\tSpace\tRevertZenzToMozc";
+
+bool MaybeMigrateZenzRevertCustomKeymap(Config* config) {
+  if (config->session_keymap() != Config::CUSTOM ||
+      config->custom_keymap_table().empty()) {
+    return false;
+  }
+
+  int conversion_space_rows = 0;
+  bool conversion_space_is_convert_next = false;
+  for (absl::string_view line :
+       absl::StrSplit(config->custom_keymap_table(), '\n')) {
+    line = absl::StripAsciiWhitespace(line);
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    const std::vector<absl::string_view> columns =
+        absl::StrSplit(line, '\t');
+    if (columns.size() != 3) {
+      continue;
+    }
+    const absl::string_view state = absl::StripAsciiWhitespace(columns[0]);
+    const absl::string_view key = absl::StripAsciiWhitespace(columns[1]);
+    const absl::string_view value = absl::StripAsciiWhitespace(columns[2]);
+    // An existing Zenz-specific Space binding is owned by the user.
+    if (state == "ZenzConversion" && key == "Space") {
+      return false;
+    }
+    if (state == "Conversion" && key == "Space") {
+      ++conversion_space_rows;
+      conversion_space_is_convert_next = (value == "ConvertNext");
+    }
+  }
+  // No Space rule, duplicate Space rules, or a customized macro: do not alter.
+  if (conversion_space_rows != 1 || !conversion_space_is_convert_next) {
+    return false;
+  }
+  std::string table = config->custom_keymap_table();
+  if (!table.empty() && table.back() != '\n') {
+    table.push_back('\n');
+  }
+  table.append(kZenzRevertSpaceRow.data(), kZenzRevertSpaceRow.size());
+  table.push_back('\n');
+  config->set_custom_keymap_table(std::move(table));
+  return true;
+}
+
+// Preserve physical-Backspace editing when a legacy CUSTOM map inherits
+// Conversion+Backspace=Cancel in live mode. Manual Zenz must instead inherit
+// ordinary Conversion+Backspace; never create a ZenzConversion override.
+// Preserve any explicit user specialized binding.
+bool MaybeMigrateLiveBackspaceCustomKeymap(Config* config) {
+  if (config->session_keymap() != Config::CUSTOM ||
+      config->custom_keymap_table().empty()) {
+    return false;
+  }
+
+  int conversion_backspace_rows = 0;
+  bool is_single_cancel = false;
+  bool has_live_backspace = false;
+  for (absl::string_view line :
+       absl::StrSplit(config->custom_keymap_table(), '\n')) {
+    line = absl::StripAsciiWhitespace(line);
+    if (line.empty() || line.front() == '#') continue;
+    const std::vector<absl::string_view> columns = absl::StrSplit(line, '\t');
+    if (columns.size() != 3) continue;
+    const absl::string_view state = absl::StripAsciiWhitespace(columns[0]);
+    const absl::string_view key = absl::StripAsciiWhitespace(columns[1]);
+    const absl::string_view value = absl::StripAsciiWhitespace(columns[2]);
+    if (key != "Backspace") continue;
+    if (state == "Conversion") {
+      ++conversion_backspace_rows;
+      is_single_cancel = (value == "Cancel");
+    } else if (state == "LiveConversion") {
+      has_live_backspace = true;
+    }
+  }
+  if (conversion_backspace_rows != 1 || !is_single_cancel ||
+      has_live_backspace) {
+    return false;
+  }
+
+  std::string table = config->custom_keymap_table();
+  if (!table.empty() && table.back() != '\n') table.push_back('\n');
+  table.append("LiveConversion\tBackspace\tBackspace\n");
+  config->set_custom_keymap_table(std::move(table));
+  return true;
+}
+
+// Run all migrations even when an earlier one changes the table.
+bool MaybeMigrateMozkeyCustomKeymap(Config* config) {
+  bool changed = MaybeMigrateCandidateHideCustomKeymap(config);
+  if (MaybeMigrateZenzRevertCustomKeymap(config)) {
+    changed = true;
+  }
+  if (MaybeMigrateLiveBackspaceCustomKeymap(config)) {
+    changed = true;
+  }
+  return changed;
+}
+
+// Applies Mozkey-specific product defaults only to fields that have not been
+// explicitly stored.  Keep this shared by normalization and the user-facing
+// product-default accessor so that a fresh profile, an older profile missing
+// newer fields, and "Reset to defaults" all resolve to the same values without
+// overwriting explicit user choices.
+void ApplyMozkeyProductDefaults(Config* config) {
+  if (!config->has_use_live_conversion()) {
+    config->set_use_live_conversion(true);
+  }
+  if (!config->has_show_candidate_window_on_initial_conversion()) {
+    config->set_show_candidate_window_on_initial_conversion(true);
+  }
+  if (!config->has_use_direct_commit()) {
+    config->set_use_direct_commit(true);
+  }
+  if (!config->has_direct_commit_key()) {
+    config->set_direct_commit_key(kMozkeyDefaultDirectCommitKey);
+  }
+  if (!config->has_use_zenz_live_correction()) {
+    config->set_use_zenz_live_correction(true);
+  }
+  if (!config->has_use_zenz_strict_reading_preservation()) {
+    config->set_use_zenz_strict_reading_preservation(false);
+  }
+  if (!config->has_use_zenz_feedback_learning()) {
+    config->set_use_zenz_feedback_learning(true);
+  }
+  // Inherit the original combined preference independently for each field.
+  // Respect explicitly saved new values, even when they disagree with 1011.
+  // A missing legacy preference has just received the Mozkey ON default.
+  const bool legacy_zenz_feedback_learning =
+      config->use_zenz_feedback_learning();
+  if (!config->has_use_zenz_feedback_recording()) {
+    config->set_use_zenz_feedback_recording(legacy_zenz_feedback_learning);
+  }
+  if (!config->has_use_zenz_feedback_reuse()) {
+    config->set_use_zenz_feedback_reuse(legacy_zenz_feedback_learning);
+  }
+  if (!config->has_use_zenz_mozc_history_learning()) {
+    config->set_use_zenz_mozc_history_learning(legacy_zenz_feedback_learning);
+  }
+  if (!config->has_use_zenz_feedback_min_key_length()) {
+    config->set_use_zenz_feedback_min_key_length(true);
+  }
+  if (!config->has_zenz_feedback_min_key_length()) {
+    config->set_zenz_feedback_min_key_length(7);
+  }
+  if (!config->has_use_zenz_auto_block_rejected_correction()) {
+    config->set_use_zenz_auto_block_rejected_correction(true);
+  }
+  if (!config->has_use_zenz_live_correction_right_context()) {
+    config->set_use_zenz_live_correction_right_context(true);
+  }
+  if (!config->has_use_realtime_conversion()) {
+    config->set_use_realtime_conversion(true);
+  }
+
+#ifdef _WIN32
+  // Pending-Roman presentation is a Windows TSF feature. Keep it disabled
+  // by default so users opt in explicitly. Presence checks still preserve any
+  // stored user choice, including an older explicit ON value.
+  if (!config->has_dim_pending_roman_input()) {
+    config->set_dim_pending_roman_input(false);
+  }
+  if (!config->has_pending_roman_dimness_percent()) {
+    config->set_pending_roman_dimness_percent(85);
+  }
+
+  // Default Windows TSF preedit underlines for Mozkey. Presence checks are
+  // deliberate: older/fresh profiles get the product defaults, while any
+  // explicitly stored user choice (including OFF or a custom color) is kept.
+  if (!config->has_use_custom_preedit_underline_color()) {
+    config->set_use_custom_preedit_underline_color(true);
+  }
+  if (!config->has_preedit_underline_color()) {
+    config->set_preedit_underline_color(0x30dcc8);
+  }
+  if (!config->has_use_custom_preedit_target_underline_color()) {
+    config->set_use_custom_preedit_target_underline_color(true);
+  }
+  if (!config->has_preedit_target_underline_color()) {
+    config->set_preedit_target_underline_color(0xc1a5ab);
+  }
+#endif  // _WIN32
+}
 
 void AddCharacterFormRule(const absl::string_view group,
                           const Config::CharacterForm preedit_form,
@@ -112,9 +378,11 @@ Config CreateDefaultConfig() {
     config.set_use_emoji_conversion(true);
   }
 
+  // Mozkey IbG product defaults.  use_zenz_live_correction is intentionally
+  // not set here: it is applied by ApplyMozkeyProductDefaults() so that the
+  // default config keeps representing it by field absence.
   config.set_use_typing_correction(true);
   config.set_use_cycle_segmentation_shortcut(true);
-  config.set_use_zenz_live_correction(true);
 
   return config;
 }
@@ -150,6 +418,9 @@ void NormalizeConfig(Config* config) {
     config->set_use_emoji_conversion(true);
   }
 
+  // Mozkey IbG product defaults which are not part of upstream Mozkey's
+  // product defaults.  CreateDefaultConfig() sets the same values, so
+  // GetProductDefaultConfig() resolves to them as well.
   if (!config->has_use_typing_correction()) {
     config->set_use_typing_correction(true);
   }
@@ -158,31 +429,7 @@ void NormalizeConfig(Config* config) {
     config->set_use_cycle_segmentation_shortcut(true);
   }
 
-  if (!config->has_use_live_conversion()) {
-    config->set_use_live_conversion(true);
-  }
-
-  if (!config->has_use_zenz_live_correction()) {
-    config->set_use_zenz_live_correction(true);
-  }
-
-  if (!config->has_show_candidate_window_on_initial_conversion()) {
-    config->set_show_candidate_window_on_initial_conversion(true);
-  }
-
-  if (!config->has_use_direct_commit()) {
-    config->set_use_direct_commit(true);
-  }
-
-  if (!config->has_direct_commit_key()) {
-    config->set_direct_commit_key(
-        Config::DIRECT_COMMIT_KUTEN |
-        Config::DIRECT_COMMIT_TOUTEN |
-        Config::DIRECT_COMMIT_QUESTION_MARK |
-        Config::DIRECT_COMMIT_EXCLAMATION_MARK |
-        Config::DIRECT_COMMIT_OPEN_BRACKET |
-        Config::DIRECT_COMMIT_CLOSE_BRACKET);
-  }
+  ApplyMozkeyProductDefaults(config);
 }
 
 class ConfigHandlerImpl final {
@@ -237,6 +484,8 @@ void ConfigHandlerImpl::SetConfigInternal(std::shared_ptr<Config> config) {
 }
 
 void ConfigHandlerImpl::SetConfig(Config config) {
+  MaybeMigrateMozkeyCustomKeymap(&config);
+
   const uint64_t config_hash = CityFingerprint(config.SerializeAsString());
 
   // If the wire format of config is identical to the one of the previously
@@ -291,16 +540,51 @@ void ConfigHandlerImpl::Reload() {
   MOZC_VLOG(1) << "Reloading config file: " << filename;
   std::unique_ptr<std::istream> is(ConfigFileStream::OpenReadBinary(filename));
   auto input_config = std::make_shared<Config>();
+  bool loaded_from_file = false;
 
   if (is == nullptr) {
     LOG(ERROR) << filename << " is not found";
   } else if (!input_config->ParseFromIstream(is.get())) {
     LOG(ERROR) << filename << " is broken";
     input_config->Clear();  // revert to default setting
+  } else {
+    loaded_from_file = true;
   }
 
-  // we set default config when file is broken
+  // Close the input stream before AtomicUpdate() replaces the same file.
+  // Windows can reject the atomic rename while the old config file is open.
+  is.reset();
+
+  // Persist only the CUSTOM-keymap migration before normalization so
+  // unrelated product defaults remain represented by field absence.
+  if (MaybeMigrateMozkeyCustomKeymap(input_config.get())) {
+    SetMetaData(input_config.get());
+    if (!ConfigFileStream::AtomicUpdate(filename,
+                                        input_config->SerializeAsString())) {
+      LOG(ERROR) << "Failed to persist CUSTOM keymap migration: " << filename;
+    } else {
+#ifdef _WIN32
+      ConfigFileStream::FixupFilePermission(filename);
+#endif  // _WIN32
+    }
+  }
+
+  // We set the default config when the file is missing or broken.
   NormalizeConfig(input_config.get());
+
+  // Keep SetConfig()'s deduplication fingerprints synchronized with the config
+  // installed by Reload().  Otherwise an identical value from a previous
+  // config file (or before an external reload) can suppress a necessary write.
+  // A missing or broken file has no persisted config to deduplicate against.
+  if (loaded_from_file) {
+    config_hash_ = CityFingerprint(input_config->SerializeAsString());
+    Config without_modified_time = *input_config;
+    without_modified_time.mutable_general_config()->clear_last_modified_time();
+    content_hash_ = CityFingerprint(without_modified_time.SerializeAsString());
+  } else {
+    config_hash_ = 0;
+    content_hash_ = 0;
+  }
 
   SetConfigInternal(input_config);
 }
@@ -333,6 +617,12 @@ void ConfigHandler::SetConfig(Config config) {
 // static
 void ConfigHandler::GetDefaultConfig(Config* config) {
   *config = DefaultConfig();
+}
+
+Config ConfigHandler::GetProductDefaultConfig() {
+  Config config = DefaultConfig();
+  ApplyMozkeyProductDefaults(&config);
+  return config;
 }
 
 std::shared_ptr<const Config> ConfigHandler::GetSharedDefaultConfig() {

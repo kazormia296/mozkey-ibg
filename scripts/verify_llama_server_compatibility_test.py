@@ -10,7 +10,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("verify_llama_server_compatibility")
 FLAGS = (
     "--api-key --host --port --model --ctx-size --threads "
-    "--device --list-devices --flash-attn"
+    "--device --list-devices --flash-attn --parallel --cache-ram"
 )
 
 

@@ -32,6 +32,7 @@
 #include "session/keymap.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <istream>
 #include <memory>
 #include <ostream>
@@ -44,6 +45,7 @@
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "base/config_file_stream.h"
@@ -121,6 +123,20 @@ constexpr absl::string_view NormalizeCommand(absl::string_view command_string) {
   return command_string;
 }
 
+// Delay commands are parsed separately from state-specific commands. The
+// syntax is intentionally bounded and independent from locale/UI translation.
+bool ParseSequenceDelay(absl::string_view name, uint32_t* delay_msec) {
+  if (!name.starts_with("Delay(") || !name.ends_with(")")) return false;
+  const absl::string_view digits = name.substr(6, name.size() - 7);
+  if (digits.empty() || digits.size() > 4 ||
+      !std::all_of(digits.begin(), digits.end(),
+                   [](char c) { return c >= '0' && c <= '9'; })) return false;
+  uint32_t value = 0;
+  if (!absl::SimpleAtoi(digits, &value) || value > 5000) return false;
+  if (delay_msec) *delay_msec = value;
+  return true;
+}
+
 CommandSequence ParseCommandSequenceString(
     const std::string& command_sequence_string) {
   CommandSequence sequence;
@@ -185,6 +201,8 @@ void KeyMapManager::Reset() {
   keymap_precomposition_.Clear();
   keymap_composition_.Clear();
   keymap_conversion_.Clear();
+  keymap_live_conversion_.Clear();
+  keymap_zenz_conversion_.Clear();
   keymap_zero_query_suggestion_.Clear();
   keymap_suggestion_.Clear();
   keymap_prediction_.Clear();
@@ -218,6 +236,8 @@ bool KeyMapManager::ApplyPrimarySessionKeymap(
 #endif  // NDEBUG
 
     std::istringstream ifs(custom_keymap_table);
+    // ConfigHandler persists any candidate-hide CUSTOM migration into the
+    // table itself. KeyMapManager therefore reflects the stored table exactly.
     return LoadStream(&ifs);
   }
 }
@@ -326,9 +346,15 @@ bool KeyMapManager::LoadStreamWithErrors(std::istream* ifs,
 
   key_event.Clear();
   KeyParser::ParseKey("Shift", &key_event);
-  keymap_composition_.AddRule(
-      key_event, CompositionState::INSERT_CHARACTER,
-      CommandSequence{"InsertCharacter"});
+  KeyInformation shift_key = 0;
+  if (KeyEventUtil::GetKeyInformation(key_event, &shift_key) &&
+      !keymap_composition_.HasBinding(shift_key)) {
+    // Preserve the historical fallback unless the active keymap explicitly
+    // assigns Composition Shift to a different command or sequence.
+    keymap_composition_.AddRule(
+        key_event, CompositionState::INSERT_CHARACTER,
+        CommandSequence{"InsertCharacter"});
+  }
 
   key_event.Clear();
   key_event.set_special_key(commands::KeyEvent::IME_ACTION);
@@ -359,8 +385,24 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
   }
 #endif  // NDEBUG
 
-  for (const std::string& command : command_sequence) {
+  for (size_t i = 0; i < command_sequence.size(); ++i) {
+    const std::string& command = command_sequence[i];
     if (!IsKnownCommandNameForAnyState(command)) {
+      return false;
+    }
+    // Output::Callback carries only one SessionCommand. Starting Zenz and
+    // then continuing with Delay/another command would replace its async poll
+    // callback. Until callback chaining is explicitly supported, make manual
+    // Zenz correction a terminal command instead of silently losing results.
+    if ((command == "ForceZenzLiveCorrection" ||
+         command == "ForceZenzLiveCorrectionWithoutFeedback") &&
+        i + 1 != command_sequence.size()) {
+      return false;
+    }
+    // Switching the visible presentation to ordinary conversion is a
+    // stand-alone action. Do not silently discard later macro steps from
+    // SendKeyConversionState's special-case dispatch.
+    if (command == "RevertZenzToMozc" && command_sequence.size() != 1) {
       return false;
     }
   }
@@ -378,7 +420,8 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
       return false;
     }
 
-    keymap_direct_.AddRule(key_event, command, command_sequence);
+    keymap_direct_.AddRule(key_event, command, command_sequence,
+                           key_event_name);
     return true;
   }
 
@@ -388,7 +431,8 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
       return false;
     }
 
-    keymap_precomposition_.AddRule(key_event, command, command_sequence);
+    keymap_precomposition_.AddRule(key_event, command, command_sequence,
+                                    key_event_name);
     return true;
   }
 
@@ -398,7 +442,8 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
       return false;
     }
 
-    keymap_composition_.AddRule(key_event, command, command_sequence);
+    keymap_composition_.AddRule(key_event, command, command_sequence,
+                                 key_event_name);
     return true;
   }
 
@@ -408,7 +453,30 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
       return false;
     }
 
-    keymap_conversion_.AddRule(key_event, command, command_sequence);
+    keymap_conversion_.AddRule(key_event, command, command_sequence,
+                                key_event_name);
+    return true;
+  }
+
+  if (state_name == "LiveConversion") {
+    ConversionState::Commands command;
+    if (!ParseCommandConversion(first_command_name, &command)) {
+      return false;
+    }
+
+    keymap_live_conversion_.AddRule(key_event, command, command_sequence,
+                                    key_event_name);
+    return true;
+  }
+
+  if (state_name == "ZenzConversion") {
+    ConversionState::Commands command;
+    if (!ParseCommandConversion(first_command_name, &command)) {
+      return false;
+    }
+
+    keymap_zenz_conversion_.AddRule(key_event, command, command_sequence,
+                                    key_event_name);
     return true;
   }
 
@@ -418,8 +486,8 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
       return false;
     }
 
-    keymap_zero_query_suggestion_.AddRule(key_event, command,
-                                          command_sequence);
+    keymap_zero_query_suggestion_.AddRule(
+        key_event, command, command_sequence, key_event_name);
     return true;
   }
 
@@ -429,7 +497,8 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
       return false;
     }
 
-    keymap_suggestion_.AddRule(key_event, command, command_sequence);
+    keymap_suggestion_.AddRule(key_event, command, command_sequence,
+                                key_event_name);
     return true;
   }
 
@@ -439,7 +508,8 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
       return false;
     }
 
-    keymap_prediction_.AddRule(key_event, command, command_sequence);
+    keymap_prediction_.AddRule(key_event, command, command_sequence,
+                                key_event_name);
     return true;
   }
 
@@ -448,6 +518,7 @@ bool KeyMapManager::AddCommand(const std::string& state_name,
 
 bool KeyMapManager::IsKnownCommandNameForAnyState(
     const std::string& command_string) const {
+  if (ParseSequenceDelay(command_string, nullptr)) return true;
   DirectInputState::Commands direct_command;
   if (ParseCommandDirect(command_string, &direct_command)) {
     return true;
@@ -635,6 +706,11 @@ void KeyMapManager::InitCommandData() {
                                 PrecompositionState::PREDICT_AND_CONVERT);
 
   // Composition
+  RegisterCompositionCommand("ForceZenzLiveCorrection",
+                             CompositionState::FORCE_ZENZ_LIVE_CORRECTION);
+  RegisterCompositionCommand(
+      "ForceZenzLiveCorrectionWithoutFeedback",
+      CompositionState::FORCE_ZENZ_LIVE_CORRECTION_WITHOUT_FEEDBACK);
   RegisterCompositionCommand("IMEOff", CompositionState::IME_OFF);
   RegisterCompositionCommand("IMEOn", CompositionState::IME_ON);
   RegisterCompositionCommand("InsertCharacter",
@@ -725,6 +801,14 @@ void KeyMapManager::InitCommandData() {
   }
 
   // Conversion
+  RegisterConversionCommand("ForceZenzLiveCorrection",
+                            ConversionState::FORCE_ZENZ_LIVE_CORRECTION);
+  RegisterConversionCommand(
+      "ForceZenzLiveCorrectionWithoutFeedback",
+      ConversionState::FORCE_ZENZ_LIVE_CORRECTION_WITHOUT_FEEDBACK);
+  RegisterConversionCommand("RevertZenzToMozc",
+                            ConversionState::REVERT_ZENZ_TO_MOZC);
+  RegisterConversionCommand("Backspace", ConversionState::BACKSPACE);
   RegisterConversionCommand("IMEOff", ConversionState::IME_OFF);
   RegisterConversionCommand("IMEOn", ConversionState::IME_ON);
   RegisterConversionCommand("InsertCharacter",
@@ -882,6 +966,65 @@ bool KeyMapManager::GetCommandPrediction(
   return keymap_conversion_.GetCommand(key_event, command);
 }
 
+std::vector<std::string> KeyMapManager::GetKeyBindingsForConversionCommand(
+    ConversionState::Commands command) const {
+  std::vector<KeyMap<ConversionState>::NamedBinding> bindings;
+  keymap_conversion_.AppendNamedBindings(command, &bindings);
+
+  std::vector<std::string> result;
+  result.reserve(bindings.size());
+  for (const auto& [key, name] : bindings) {
+    result.push_back(name);
+  }
+  std::sort(result.begin(), result.end(),
+            [](const std::string& lhs, const std::string& rhs) {
+              if (lhs.size() != rhs.size()) {
+                return lhs.size() < rhs.size();
+              }
+              return lhs < rhs;
+            });
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+std::vector<std::string> KeyMapManager::GetKeyBindingsForPredictionCommand(
+    ConversionState::Commands command) const {
+  std::vector<KeyMap<ConversionState>::NamedBinding> prediction_bindings;
+  keymap_prediction_.AppendNamedBindings(command, &prediction_bindings);
+  std::sort(prediction_bindings.begin(), prediction_bindings.end(),
+            [](const auto& lhs, const auto& rhs) {
+              if (lhs.second.size() != rhs.second.size()) {
+                return lhs.second.size() < rhs.second.size();
+              }
+              return lhs.second < rhs.second;
+            });
+
+  std::vector<std::string> result;
+  result.reserve(prediction_bindings.size());
+  for (const auto& [key, name] : prediction_bindings) {
+    result.push_back(name);
+  }
+
+  std::vector<KeyMap<ConversionState>::NamedBinding> conversion_bindings;
+  keymap_conversion_.AppendNamedBindings(command, &conversion_bindings);
+  std::sort(conversion_bindings.begin(), conversion_bindings.end(),
+            [](const auto& lhs, const auto& rhs) {
+              if (lhs.second.size() != rhs.second.size()) {
+                return lhs.second.size() < rhs.second.size();
+              }
+              return lhs.second < rhs.second;
+            });
+
+  for (const auto& [key, name] : conversion_bindings) {
+    if (!keymap_prediction_.HasBinding(key)) {
+      result.push_back(name);
+    }
+  }
+
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
 bool KeyMapManager::GetCommandSequenceDirect(
     const commands::KeyEvent& key_event,
     CommandSequence* commands) const {
@@ -903,6 +1046,52 @@ bool KeyMapManager::GetCommandSequenceComposition(
 bool KeyMapManager::GetCommandSequenceConversion(
     const commands::KeyEvent& key_event,
     CommandSequence* commands) const {
+  return keymap_conversion_.GetCommandSequence(key_event, commands);
+}
+
+bool KeyMapManager::GetCommandSequenceLiveConversion(
+    const commands::KeyEvent& key_event, CommandSequence* commands,
+    bool* specialized_override) const {
+  if (specialized_override != nullptr) {
+    *specialized_override = false;
+  }
+  if (keymap_live_conversion_.GetCommandSequence(key_event, commands)) {
+    if (specialized_override != nullptr) {
+      *specialized_override = true;
+    }
+    return true;
+  }
+  return keymap_conversion_.GetCommandSequence(key_event, commands);
+}
+
+bool KeyMapManager::GetCommandSequenceZenzLiveConversion(
+    const commands::KeyEvent& key_event, CommandSequence* commands,
+    bool* specialized_override) const {
+  if (specialized_override != nullptr) {
+    *specialized_override = false;
+  }
+  if (keymap_zenz_conversion_.GetCommandSequence(key_event, commands)) {
+    if (specialized_override != nullptr) {
+      *specialized_override = true;
+    }
+    return true;
+  }
+  return GetCommandSequenceLiveConversion(key_event, commands,
+                                          specialized_override);
+}
+
+bool KeyMapManager::GetCommandSequenceZenzConversion(
+    const commands::KeyEvent& key_event, CommandSequence* commands,
+    bool* zenz_override) const {
+  if (zenz_override != nullptr) {
+    *zenz_override = false;
+  }
+  if (keymap_zenz_conversion_.GetCommandSequence(key_event, commands)) {
+    if (zenz_override != nullptr) {
+      *zenz_override = true;
+    }
+    return true;
+  }
   return keymap_conversion_.GetCommandSequence(key_event, commands);
 }
 

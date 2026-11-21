@@ -201,6 +201,31 @@ mozc_cc_test(
 )
 
 mozc_cc_library(
+    name = "date_util",
+    srcs = ["date_util.cc"],
+    hdrs = ["date_util.h"],
+    deps = [
+        ":clock",
+        ":japanese_util",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+mozc_cc_test(
+    name = "date_util_test",
+    size = "small",
+    srcs = ["date_util_test.cc"],
+    deps = [
+        ":clock_mock",
+        ":date_util",
+        "//testing:gunit_main",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+mozc_cc_library(
     name = "japanese_util",
     hdrs = ["japanese_util.h"],
     visibility = [
@@ -458,7 +483,9 @@ mozc_cc_test(
     srcs = ["file_util_test.cc"],
     tags = ["noandroid"],  # TODO(b/73698251): disabled due to errors
     deps = [
+        ":file_stream",
         ":file_util",
+        ":thread",
         ":util",
         "//base/file:temp_dir",
         "//testing:gunit_main",
@@ -467,6 +494,7 @@ mozc_cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/time",
     ] + mozc_select(
         windows = ["//base/win32:wide_char"],
     ),
@@ -512,6 +540,7 @@ mozc_cc_library(
         apple = ["//base/mac:mac_util"],
         windows = [
             ":vlog",
+            "//base/win32:ntdll_dll",
             "//base/win32:wide_char",
             "@com_microsoft_wil//:wil",
         ],

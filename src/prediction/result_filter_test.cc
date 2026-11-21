@@ -37,7 +37,13 @@
 #include "absl/algorithm/container.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "converter/connector.h"
+#include "data_manager/testing/mock_data_manager.h"
+#include "dictionary/pos_matcher.h"
 #include "prediction/result.h"
+#include "prediction/suggestion_filter.h"
+#include "request/conversion_request.h"
+#include "storage/existence_filter.h"
 #include "testing/gunit.h"
 
 namespace mozc::prediction::filter {
@@ -122,7 +128,8 @@ TEST(ResultFilterTest, SelectSuggestionFilterStrategies) {
   constexpr uint32_t kSkipFilter = ResultFilter::kSkipFilter;
   constexpr uint32_t kByValue = ResultFilter::kFilterByValue;
   constexpr uint32_t kByHistAndValue =
-      ResultFilter::kFilterByValue | ResultFilter::kFilterByHistoryAndValue;
+      ResultFilter::kFilterByValue | ResultFilter::kFilterByHistoryAndValue |
+      ResultFilter::kFilterByNwp;
 
   struct {
     const Result result;
@@ -156,6 +163,38 @@ TEST(ResultFilterTest, SelectSuggestionFilterStrategies) {
                   test_case.result, test_case.request_key,
                   test_case.history_value, test_case.include_exact_key));
   }
+}
+
+TEST(ResultFilterTest, ShouldRemoveWithNwpSuggestionFilter) {
+  storage::ExistenceFilterBuilder builder =
+      storage::ExistenceFilterBuilder::CreateOptimal(1024, 1);
+  // SuggestionFilter normalizes lookup strings to lowercase.
+  builder.Insert("<nwp>京都");
+  const SuggestionFilter suggestion_filter(builder.Build());
+  EXPECT_TRUE(suggestion_filter.IsBadSuggestion("<NWP>京都"));
+  EXPECT_FALSE(suggestion_filter.IsBadSuggestion("京都"));
+
+  testing::MockDataManager data_manager;
+  auto connector_or = Connector::Create(data_manager.GetConnectorData());
+  ASSERT_TRUE(connector_or.ok()) << connector_or.status();
+  Connector connector = std::move(connector_or).value();
+  const dictionary::PosMatcher pos_matcher(data_manager.GetPosMatcherData());
+
+  const Result history = {.key = "ひがし", .value = "東"};
+  const ConversionRequest nwp_request =
+      ConversionRequestBuilder().SetHistoryResult(history).Build();
+  ResultFilter nwp_filter(nwp_request, pos_matcher, connector,
+                          suggestion_filter);
+  const Result nwp_result = {.key = "", .value = "京都"};
+  EXPECT_TRUE(nwp_filter.ShouldRemove(nwp_result, 0));
+
+  // The same value remains available for an explicit reading.
+  const ConversionRequest normal_request =
+      ConversionRequestBuilder().SetKey("きょうと").Build();
+  ResultFilter normal_filter(normal_request, pos_matcher, connector,
+                             suggestion_filter);
+  const Result normal_result = {.key = "きょうと", .value = "京都"};
+  EXPECT_FALSE(normal_filter.ShouldRemove(normal_result, 0));
 }
 
 }  // namespace

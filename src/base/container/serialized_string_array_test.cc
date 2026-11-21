@@ -77,6 +77,24 @@ TEST(SerializedStringArrayTest, SerializeToBuffer) {
   EXPECT_EQ(actual, kTestData);
 }
 
+TEST(SerializedStringArrayTest, SerializeToBufferUtf8AndEmpty) {
+  std::unique_ptr<uint32_t[]> buf;
+  const absl::string_view data = SerializedStringArray::SerializeToBuffer(
+      {"", "あいう", "😀"}, &buf);
+  ASSERT_TRUE(SerializedStringArray::VerifyData(data));
+
+  SerializedStringArray array;
+  ASSERT_TRUE(array.Init(data));
+  ASSERT_EQ(array.size(), 3);
+  EXPECT_EQ(array[0], "");
+  EXPECT_EQ(array[1], "あいう");
+  EXPECT_EQ(array[2], "😀");
+  // The serialization format includes a NUL after every string, even empty.
+  EXPECT_EQ(array[0].data()[array[0].size()], '\0');
+  EXPECT_EQ(array[1].data()[array[1].size()], '\0');
+  EXPECT_EQ(array[2].data()[array[2].size()], '\0');
+}
+
 TEST(SerializedStringArrayTest, Basic) {
   ASSERT_TRUE(SerializedStringArray::VerifyData(kTestData));
 

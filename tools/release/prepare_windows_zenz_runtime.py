@@ -98,6 +98,9 @@ REQUIRED_CLI_FLAGS = (
     b"--model",
     b"--ctx-size",
     b"--threads",
+    # src/zenz_scorer always launches with `--parallel 1 --cache-ram 0`.
+    b"--parallel",
+    b"--cache-ram",
 )
 REQUIRED_CMAKE_BOOL_OPTIONS = {
     "BUILD_SHARED_LIBS": "OFF",

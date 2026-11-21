@@ -1,0 +1,114 @@
+diff --git a/src/merge/merge_dictionaries.py b/src/merge/merge_dictionaries.py
+--- a/src/merge/merge_dictionaries.py
++++ b/src/merge/merge_dictionaries.py
+@@ -10,0 +11 @@
++import os
+@@ -67,57 +68,51 @@
+-    # Mozc の最終コミット日を取得
+-    url = 'https://api.github.com/repos/google/mozc/commits/master'
+-
+-    with urllib.request.urlopen(url) as response:
+-        data = json.loads(response.read().decode())
+-        date_str = data['commit']['committer']['date']
+-
+-    date_str = datetime.fromisoformat(date_str)
+-    date_str = date_str.strftime('%Y%m%d')
+-
+-    # Mozc のアーカイブを取得
+-    url = 'https://github.com/google/mozc/archive/refs/heads/master.zip'
+-
+-    if not Path(f'mozc-{date_str}.zip').exists():
+-        urllib.request.urlretrieve(
+-                url, f'mozc-{date_str}.zip')
+-
+-    with ZipFile(f'mozc-{date_str}.zip') as zip_ref:
+-        # 一般名詞の ID を取得
+-        with zip_ref.open(
+-                'mozc-master/src/data/dictionary_oss/id.def') as file:
+-            for line in file:
+-                line = line.decode()
+-
+-                if ' 名詞,一般,' in line:
+-                    id_mozc = line.split(' 名詞,一般,')[0]
+-                    break
+-
+-        # Mozc 辞書のファイルリストを取得
+-        all_files = zip_ref.namelist()
+-        dict_path = 'mozc-master/src/data/dictionary_oss/dictionary0'
+-        dict_files = [f for f in all_files if f.startswith(dict_path)]
+-
+-        # Mozc 辞書のエントリを取得
+-        mozc_entry = []
+-
+-        for dict_file in dict_files:
+-            with zip_ref.open(dict_file) as file:
+-                # バイナリストリームをテキストストリームに変換
+-                file_text = io.TextIOWrapper(file, encoding='utf-8')
+-                reader = csv.reader(file_text, delimiter='\t')
+-                mozc_entry.extend(list(reader))
+-
+-        mozc_entry_mod = []
+-
+-        for entry in mozc_entry:
+-            yomi, id1, id2, cost, hyouki = entry[:5]
+-
+-            # 不要な表記をスキップ
+-            hyouki = remove_short_or_long_hyouki(hyouki)
+-            if not hyouki:
+-                continue
+-
+-            # 表記を正規化
+-            hyouki = normalize_entry(hyouki)
+-
+-            mozc_entry_mod.append([yomi, id1, id2, cost, hyouki])
++    # Mozkey のローカル辞書を基準にする。
++    # GitHub API / google/mozc master.zip にはアクセスしない。
++    dictionary_root = os.environ.get("MOZKEY_DICTIONARY_OSS_DIR")
++    if not dictionary_root:
++        raise RuntimeError("MOZKEY_DICTIONARY_OSS_DIR is required")
++    dictionary_dir = Path(dictionary_root)
++
++    id_def = dictionary_dir / "id.def"
++    if not id_def.exists():
++        raise FileNotFoundError(id_def)
++
++    # 一般名詞の ID を取得
++    id_mozc = None
++    with id_def.open("r", encoding="utf-8") as file:
++        for line in file:
++            if " 名詞,一般," in line:
++                id_mozc = line.split(" 名詞,一般,")[0]
++                break
++
++    if id_mozc is None:
++        raise RuntimeError("名詞,一般 ID not found in id.def")
++
++    # Mozkey ローカル辞書のエントリを取得
++    dict_files = sorted(dictionary_dir.glob("dictionary0*.txt"))
++    if not dict_files:
++        raise RuntimeError(f"No dictionary0*.txt files found in {dictionary_dir}")
++
++    mozc_entry = []
++
++    for dict_file in dict_files:
++        with dict_file.open("r", encoding="utf-8", newline="") as file:
++            reader = csv.reader(file, delimiter="\t")
++            mozc_entry.extend(list(reader))
++
++    mozc_entry_mod = []
++
++    for entry in mozc_entry:
++        if len(entry) < 5:
++            continue
++
++        yomi, id1, id2, cost, hyouki = entry[:5]
++
++        # 不要な表記をスキップ
++        hyouki = remove_short_or_long_hyouki(hyouki)
++        if not hyouki:
++            continue
++
++        # 表記を正規化
++        hyouki = normalize_entry(hyouki)
++
++        mozc_entry_mod.append([yomi, id1, id2, cost, hyouki])

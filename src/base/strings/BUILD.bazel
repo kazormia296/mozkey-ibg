@@ -103,10 +103,28 @@ mozc_cc_test(
 )
 
 mozc_cc_library(
+    name = "strip",
+    srcs = ["strip.cc"],
+    hdrs = ["strip.h"],
+    deps = ["@com_google_absl//absl/strings:string_view"],
+)
+
+mozc_cc_test(
+    name = "strip_test",
+    size = "small",
+    srcs = ["strip_test.cc"],
+    deps = [
+        ":strip",
+        "//testing:gunit_main",
+    ],
+)
+
+mozc_cc_library(
     name = "unicode",
     srcs = ["unicode.cc"],
     hdrs = ["unicode.h"],
     deps = [
+        "//base:bits",
         "//base/strings/internal:utf8_internal",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:nullability",

@@ -399,7 +399,198 @@ std::string RestoreSymbolGroupStyleFromKeyOrMozc(
                                  avoid_ascii_token_fallback_when_widening);
 }
 
+const std::vector<std::vector<char32_t>>& UserControlledTrailingSymbolGroups() {
+  static const std::vector<std::vector<char32_t>> kGroups = {
+      {U'!', U'！'},
+      {U'?', U'？'},
+      {U'.', U'．', U'。'},
+      {U'~', U'～', U'〜'},
+      {U'…', U'‥'},
+  };
+  return kGroups;
+}
+
+int FindUserControlledTrailingSymbolGroup(
+    char32_t cp,
+    const std::vector<std::vector<char32_t>>& groups) {
+  for (size_t i = 0; i < groups.size(); ++i) {
+    if (FindSymbolStyleVariantIndex(cp, groups[i]) >= 0) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+bool CountUserControlledTrailingSymbols(
+    absl::string_view text,
+    const std::vector<std::vector<char32_t>>& groups,
+    std::vector<int>* counts) {
+  counts->assign(groups.size(), 0);
+  if (text.empty()) {
+    return true;
+  }
+
+  const std::vector<Utf8CharForSymbolRestore> chars =
+      SplitUtf8ForSymbolRestore(text);
+  if (chars.empty()) {
+    return false;
+  }
+
+  // Only the trailing punctuation run authorizes trailing punctuation in Zenz
+  // output.  Interior punctuation is lexical/technical context, not a budget
+  // that Zenz may spend at the end.  For example, the period in "3.14" must
+  // not authorize an added final period in "3.14.".
+  for (size_t i = chars.size(); i > 0; --i) {
+    const int group =
+        FindUserControlledTrailingSymbolGroup(chars[i - 1].cp, groups);
+    if (group < 0) {
+      break;
+    }
+    ++(*counts)[group];
+  }
+
+  return true;
+}
+
+std::string SuppressUnrequestedTrailingSymbols(
+    absl::string_view key,
+    absl::string_view mozc_value,
+    absl::string_view zenz_value) {
+  if (zenz_value.empty()) {
+    return std::string(zenz_value);
+  }
+
+  const std::vector<std::vector<char32_t>>& groups =
+      UserControlledTrailingSymbolGroups();
+
+  std::vector<int> key_counts;
+  std::vector<int> mozc_counts;
+  std::vector<int> zenz_counts;
+  if (!CountUserControlledTrailingSymbols(key, groups, &key_counts) ||
+      !CountUserControlledTrailingSymbols(mozc_value, groups, &mozc_counts) ||
+      !CountUserControlledTrailingSymbols(zenz_value, groups, &zenz_counts)) {
+    return std::string(zenz_value);
+  }
+
+  std::vector<int> allowed_counts(groups.size(), 0);
+  for (size_t i = 0; i < groups.size(); ++i) {
+    allowed_counts[i] = std::max(key_counts[i], mozc_counts[i]);
+  }
+
+  const std::vector<Utf8CharForSymbolRestore> zenz_chars =
+      SplitUtf8ForSymbolRestore(zenz_value);
+  if (zenz_chars.empty()) {
+    return std::string(zenz_value);
+  }
+
+  std::vector<bool> remove(zenz_chars.size(), false);
+  bool changed = false;
+
+  // Only repair a trailing punctuation run. Interior punctuation can be part of
+  // lexical or technical output such as "3.14", and deleting it would silently
+  // change meaning. Within the trailing run, preserve at most the count already
+  // present in the visible key or original Mozc value.
+  for (size_t i = zenz_chars.size(); i > 0; --i) {
+    const int group =
+        FindUserControlledTrailingSymbolGroup(zenz_chars[i - 1].cp, groups);
+    if (group < 0) {
+      break;
+    }
+
+    if (zenz_counts[group] > allowed_counts[group]) {
+      remove[i - 1] = true;
+      --zenz_counts[group];
+      changed = true;
+    }
+  }
+
+  if (!changed) {
+    return std::string(zenz_value);
+  }
+
+  std::string repaired;
+  repaired.reserve(zenz_value.size());
+  for (size_t i = 0; i < zenz_chars.size(); ++i) {
+    if (!remove[i]) {
+      repaired.append(zenz_chars[i].bytes);
+    }
+  }
+  return repaired;
+}
+
+size_t LongestLeftContextSuffixPrefixChars(
+    absl::string_view left_context, absl::string_view zenz_value) {
+  if (left_context.empty() || zenz_value.empty()) {
+    return 0;
+  }
+
+  const std::vector<Utf8CharForSymbolRestore> context_chars =
+      SplitUtf8ForSymbolRestore(left_context);
+  const std::vector<Utf8CharForSymbolRestore> value_chars =
+      SplitUtf8ForSymbolRestore(zenz_value);
+  if (context_chars.empty() || value_chars.empty()) {
+    return 0;
+  }
+
+  const size_t max_overlap = std::min(context_chars.size(), value_chars.size());
+  for (size_t overlap = max_overlap; overlap > 0; --overlap) {
+    const size_t context_begin = context_chars.size() - overlap;
+    bool matches = true;
+    for (size_t i = 0; i < overlap; ++i) {
+      if (context_chars[context_begin + i].bytes != value_chars[i].bytes) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return overlap;
+    }
+  }
+
+  return 0;
+}
+
+bool LooksLikeLeftContextEcho(const ZenzValidationInput& input,
+                              size_t key_len,
+                              size_t value_len) {
+  // A short overlap such as a particle or a common two-character word is not
+  // strong enough evidence of context copying.  Four Japanese characters are
+  // long enough to make accidental suffix/prefix overlap much less likely,
+  // while still catching observed phrases such as "同じ試験を".
+  constexpr size_t kMinContextEchoChars = 4;
+
+  const size_t echo_len = LongestLeftContextSuffixPrefixChars(
+      input.left_context, input.zenz_value);
+  if (echo_len < kMinContextEchoChars) {
+    return false;
+  }
+
+  const size_t baseline_len = std::max<size_t>(
+      1, std::max(key_len, Util::CharsLen(input.mozc_value)));
+
+  // A context prefix that is already much larger than the current composition
+  // is itself strong echo evidence, even if the model returns only that copied
+  // suffix.  Otherwise require the returned value to contain the context-sized
+  // prefix plus at least one current-composition-sized payload.  These two
+  // conditions target continuation/echo output while preserving legitimate
+  // repeated words and short abbreviations whose output happens to equal a
+  // context suffix.
+  if (echo_len >= baseline_len * 2 + 1) {
+    return true;
+  }
+  return value_len >= echo_len + baseline_len;
+}
+
 }  // namespace
+
+std::string ZenzOutputValidator::RepairUserControlledSymbols(
+    absl::string_view key,
+    absl::string_view mozc_value,
+    absl::string_view zenz_value) {
+  const std::string restored =
+      RestoreUserVisibleSymbolStyle(key, mozc_value, zenz_value);
+  return SuppressUnrequestedTrailingSymbols(key, mozc_value, restored);
+}
 
 std::string ZenzOutputValidator::RestoreUserVisibleSymbolStyle(
     absl::string_view key,
@@ -512,6 +703,55 @@ bool ZenzOutputValidator::LooksLikeSecret(absl::string_view text) {
          absl::StrContains(text, "apikey");
 }
 
+bool ZenzOutputValidator::IsObviousSurfaceTruncation(
+    absl::string_view mozc_value, absl::string_view candidate_value) {
+  return !mozc_value.empty() && !candidate_value.empty() &&
+         candidate_value.size() < mozc_value.size() &&
+         (absl::StartsWith(mozc_value, candidate_value) ||
+          absl::EndsWith(mozc_value, candidate_value));
+}
+
+ZenzContextPrefixDecision ZenzOutputValidator::ResolveLeftContextPrefix(
+    absl::string_view raw_value, absl::string_view left_context,
+    absl::string_view mozc_value) {
+  ZenzContextPrefixDecision decision;
+  decision.value = std::string(raw_value);
+  if (left_context.empty() || !absl::StartsWith(raw_value, left_context) ||
+      raw_value == mozc_value) {
+    return decision;
+  }
+
+  const absl::string_view stripped = raw_value.substr(left_context.size());
+  if (!stripped.empty() && stripped == mozc_value) {
+    decision.stripped = true;
+    decision.value = std::string(stripped);
+    return decision;
+  }
+
+  // The same surface prefix may be the user's own conversion or a context
+  // echo.  Without reading evidence, neither removing nor retaining it is
+  // safe: return the Mozc fallback instead of presenting a partial phrase.
+  decision.safe = false;
+  return decision;
+}
+
+ZenzValidationResult ZenzOutputValidator::ValidateReadingPreservation(
+    absl::string_view key, absl::string_view normalized_key_reading,
+    absl::string_view zenz_reading) {
+  if (key.empty() || zenz_reading.empty()) {
+    return Reject("reading_unavailable");
+  }
+  if (zenz_reading == key ||
+      (!normalized_key_reading.empty() &&
+       zenz_reading == normalized_key_reading)) {
+    return Accept(false, "reading_preserved");
+  }
+  if (normalized_key_reading.empty()) {
+    return Reject("reading_unavailable");
+  }
+  return Reject("reading_mismatch");
+}
+
 ZenzValidationResult ZenzOutputValidator::Validate(
     const ZenzValidationInput& input) const {
   if (input.key.empty()) {
@@ -553,6 +793,10 @@ ZenzValidationResult ZenzOutputValidator::Validate(
 
   if (value_len == 0) {
     return Reject("zero_value_len");
+  }
+
+  if (LooksLikeLeftContextEcho(input, key_len, value_len)) {
+    return Reject("left_context_echo");
   }
 
   // Conservative length guard. Japanese conversion can shrink/expand, but not

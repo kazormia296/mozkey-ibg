@@ -29,10 +29,14 @@
 
 #include "rewriter/user_segment_history_rewriter.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/log/check.h"
 #include "absl/random/random.h"
@@ -59,18 +63,23 @@
 #include "request/conversion_request.h"
 #include "request/request_test_util.h"
 #include "rewriter/number_rewriter.h"
-#include "rewriter/variants_rewriter.h"
 #include "testing/gmock.h"
 #include "testing/gunit.h"
 #include "testing/mozctest.h"
 #include "testing/test_peer.h"
+#include "transliteration/transliteration.h"
 
 namespace mozc {
 
 class UserSegmentHistoryRewriterTestPeer
     : public testing::TestPeer<UserSegmentHistoryRewriter> {
  public:
+  explicit UserSegmentHistoryRewriterTestPeer(
+      UserSegmentHistoryRewriter& rewriter)
+      : testing::TestPeer<UserSegmentHistoryRewriter>(rewriter) {}
+
   PEER_STATIC_METHOD(MakeLearningSegmentsFromInnerSegments);
+  PEER_VARIABLE(storage_);
 };
 
 namespace {
@@ -147,12 +156,14 @@ class UserSegmentHistoryRewriterTest : public testing::TestWithTempUserProfile {
       }
     }
     CharacterFormManager::GetCharacterFormManager()->ReloadConfig(*config_);
+    CharacterFormManager::GetCharacterFormManager()->ClearHistory();
 
     Clock::SetClockForUnitTest(nullptr);
   }
 
   void TearDown() override {
     CharacterFormManager::GetCharacterFormManager()->SetDefaultRule();
+    CharacterFormManager::GetCharacterFormManager()->ClearHistory();
     std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
         CreateUserSegmentHistoryRewriter());
     rewriter->Clear();
@@ -190,6 +201,18 @@ class UserSegmentHistoryRewriterTest : public testing::TestWithTempUserProfile {
     return ConversionRequestBuilder()
         .SetConfig(*config_)
         .SetRequest(*request_)
+        .Build();
+  }
+
+  ConversionRequest CreateReversibleExternalConversionRequest() const {
+    ConversionRequest::Options options;
+    options.request_type = ConversionRequest::CONVERSION;
+    options.enable_user_history_for_conversion = true;
+    options.reversible_external_learning = true;
+    return ConversionRequestBuilder()
+        .SetConfig(*config_)
+        .SetRequest(*request_)
+        .SetOptions(options)
         .Build();
   }
 
@@ -356,6 +379,235 @@ TEST_F(UserSegmentHistoryRewriterTest, DisableTest) {
     rewriter->Rewrite(convreq_hist_false, &segments);
     EXPECT_EQ(segments.segment(0).candidate(0).value, "candidate0");
   }
+}
+
+TEST_F(UserSegmentHistoryRewriterTest,
+       ClearHistoryEntryUsesSelectedCandidateIndex) {
+  Segments segments;
+  std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
+      CreateUserSegmentHistoryRewriter());
+  rewriter->Clear();
+  const ConversionRequest convreq = CreateConversionRequest();
+
+  auto set_candidate_keys = [](Segments* segments) {
+    for (Segment& segment : segments->conversion_segments()) {
+      for (size_t i = 0; i < segment.candidates_size(); ++i) {
+        segment.mutable_candidate(i)->key = segment.key();
+      }
+    }
+  };
+
+  InitSegments(&segments, 1);
+  set_candidate_keys(&segments);
+  segments.mutable_segment(0)->move_candidate(2, 0);
+  segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
+      converter::Attribute::RERANKED;
+  segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  rewriter->Finish(convreq, segments);
+
+  InitSegments(&segments, 1);
+  set_candidate_keys(&segments);
+  ASSERT_TRUE(rewriter->Rewrite(convreq, &segments));
+  ASSERT_EQ(segments.segment(0).candidate(0).value, "candidate2");
+  ASSERT_EQ(segments.segment(0).candidate(1).value, "candidate0");
+
+  // candidate1 has no learned entry. The old implementation incorrectly used
+  // candidate(0) here and would delete candidate2's history.
+  EXPECT_FALSE(rewriter->ClearHistoryEntry(segments, 0, 1));
+
+  InitSegments(&segments, 1);
+  set_candidate_keys(&segments);
+  rewriter->Rewrite(convreq, &segments);
+  EXPECT_EQ(segments.segment(0).candidate(0).value, "candidate2");
+
+  EXPECT_TRUE(rewriter->ClearHistoryEntry(segments, 0, 0));
+  InitSegments(&segments, 1);
+  set_candidate_keys(&segments);
+  rewriter->Rewrite(convreq, &segments);
+  EXPECT_EQ(segments.segment(0).candidate(0).value, "candidate0");
+}
+
+// The separately validated suggestion view must teach legacy segment history
+// the complete native conversion key, not the user's incomplete typed prefix.
+// This test uses the real UserSegmentHistoryRewriter storage and Rewrite path.
+TEST_F(UserSegmentHistoryRewriterTest,
+       VerifiedSuggestionLearningViewUsesCompleteReading) {
+  auto rewriter = CreateUserSegmentHistoryRewriter();
+  rewriter->Clear();
+  const ConversionRequest request = CreateConversionRequest();
+
+  Segments committed;
+  InitSegments(&committed, 1);
+  committed.mutable_segment(0)->set_key("segment");  // Typed prefix.
+  committed.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  committed.set_revert_id(701);
+
+  Segments learning;
+  InitSegments(&learning, 1);  // Full key is "segment0".
+  learning.mutable_segment(0)->move_candidate(2, 0);
+  learning.mutable_segment(0)->mutable_candidate(0)->attributes |=
+      converter::Attribute::RERANKED;
+  learning.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  learning.set_revert_id(committed.revert_id());
+
+  rewriter->FinishWithSuggestionLearningSegments(request, committed, &learning);
+
+  Segments full_key_probe;
+  InitSegments(&full_key_probe, 1);
+  EXPECT_TRUE(rewriter->Rewrite(request, &full_key_probe));
+  EXPECT_EQ(full_key_probe.segment(0).candidate(0).value, "candidate2");
+
+  Segments typed_prefix_probe;
+  InitSegments(&typed_prefix_probe, 1);
+  typed_prefix_probe.mutable_segment(0)->set_key("segment");
+  for (converter::Candidate* candidate :
+       typed_prefix_probe.mutable_segment(0)->candidates()) {
+    candidate->content_key = "segment";
+  }
+  EXPECT_FALSE(rewriter->Rewrite(request, &typed_prefix_probe));
+  EXPECT_EQ(typed_prefix_probe.segment(0).candidate(0).value, "candidate0");
+}
+
+// Ordinary Mozc undo retains its existing deferred-revert semantics. The
+// verified suggestion view must share the original commit's revert ID so that
+// its new full-reading feature keys are removed by that existing pathway.
+TEST_F(UserSegmentHistoryRewriterTest,
+       VerifiedSuggestionLearningViewUsesOriginalUndoIdentity) {
+  auto rewriter = CreateUserSegmentHistoryRewriter();
+  rewriter->Clear();
+  const ConversionRequest request = CreateConversionRequest();
+
+  Segments committed;
+  InitSegments(&committed, 1);
+  committed.mutable_segment(0)->set_key("segment");
+  committed.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  committed.set_revert_id(702);
+
+  Segments learning;
+  InitSegments(&learning, 1);
+  learning.mutable_segment(0)->move_candidate(2, 0);
+  learning.mutable_segment(0)->mutable_candidate(0)->attributes |=
+      converter::Attribute::RERANKED;
+  learning.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  learning.set_revert_id(committed.revert_id());
+  rewriter->FinishWithSuggestionLearningSegments(request, committed, &learning);
+
+  Segments before_undo;
+  InitSegments(&before_undo, 1);
+  EXPECT_TRUE(rewriter->Rewrite(request, &before_undo));
+  EXPECT_EQ(before_undo.segment(0).candidate(0).value, "candidate2");
+
+  // This schedules the normal deferred revert, and the following Rewrite
+  // applies it with empty preceding_text (the committed text was removed).
+  rewriter->Revert(committed);
+  Segments after_undo;
+  InitSegments(&after_undo, 1);
+  rewriter->Rewrite(request, &after_undo);
+  EXPECT_EQ(after_undo.segment(0).candidate(0).value, "candidate0");
+}
+
+// A suggestion with reverse-resolved native boundaries must learn the local
+// selections as one transaction. An undo of that one commit removes both
+// locally learned preferences using the original revert ID.
+TEST_F(UserSegmentHistoryRewriterTest,
+       VerifiedSuggestionMultiSegmentLearningAndUndoAreOneTransaction) {
+  auto rewriter = CreateUserSegmentHistoryRewriter();
+  rewriter->Clear();
+  const ConversionRequest request = CreateConversionRequest();
+
+  Segments committed;
+  InitSegments(&committed, 1);
+  committed.mutable_segment(0)->set_key("segment");  // Typed prefix.
+  committed.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  committed.set_revert_id(703);
+
+  Segments learning;
+  InitSegments(&learning, 2);  // Full native keys: segment0, segment1.
+  learning.set_revert_id(committed.revert_id());
+  for (size_t i = 0; i < 2; ++i) {
+    Segment* segment = learning.mutable_segment(i);
+    segment->move_candidate(static_cast<int>(i + 2), 0);
+    segment->mutable_candidate(0)->attributes |=
+        converter::Attribute::RERANKED;
+    segment->set_segment_type(Segment::FIXED_VALUE);
+  }
+
+  rewriter->FinishWithSuggestionLearningSegments(request, committed, &learning);
+  Segments probe;
+  InitSegments(&probe, 2);
+  rewriter->Rewrite(request, &probe);
+  EXPECT_EQ(probe.segment(0).candidate(0).value, "candidate2");
+  EXPECT_EQ(probe.segment(1).candidate(0).value, "candidate3");
+
+  rewriter->Revert(committed);
+  InitSegments(&probe, 2);
+  rewriter->Rewrite(request, &probe);
+  EXPECT_EQ(probe.segment(0).candidate(0).value, "candidate0");
+  EXPECT_EQ(probe.segment(1).candidate(0).value, "candidate0");
+}
+
+// No Rewrite between undo and recommit: the old deferred delete must run
+// BEFORE recording the new preference, rather than removing it afterward.
+TEST_F(UserSegmentHistoryRewriterTest,
+       VerifiedSuggestionUndoThenImmediateRecommitKeepsNewPreference) {
+  auto rewriter = CreateUserSegmentHistoryRewriter();
+  rewriter->Clear();
+  const ConversionRequest request = CreateConversionRequest();
+
+  auto make_commit = [](int candidate_index, uint64_t revert_id) {
+    Segments result;
+    InitSegments(&result, 1);
+    result.mutable_segment(0)->move_candidate(candidate_index, 0);
+    result.mutable_segment(0)->mutable_candidate(0)->attributes |=
+        converter::Attribute::RERANKED;
+    result.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    result.set_revert_id(revert_id);
+    return result;
+  };
+
+  Segments old_commit = make_commit(2, 91001);
+  rewriter->Finish(request, old_commit);
+  rewriter->Revert(old_commit);  // Deferred; no intervening Rewrite.
+
+  Segments new_commit = make_commit(3, 91002);
+  rewriter->Finish(request, new_commit);
+
+  Segments result;
+  InitSegments(&result, 1);
+  rewriter->Rewrite(request, &result);
+  EXPECT_EQ(result.segment(0).candidate(0).value, "candidate3");
+
+  rewriter->Revert(new_commit);
+  InitSegments(&result, 1);
+  rewriter->Rewrite(request, &result);
+  EXPECT_EQ(result.segment(0).candidate(0).value, "candidate0");
+}
+
+// The verification probe must see history AFTER a pending undo. Otherwise an
+// undone preference can incorrectly appear to be the already displayed top.
+TEST_F(UserSegmentHistoryRewriterTest,
+       VerifiedSuggestionProbeFlushesPendingUndoBeforeRanking) {
+  auto rewriter = CreateUserSegmentHistoryRewriter();
+  rewriter->Clear();
+  const ConversionRequest request = CreateConversionRequest();
+
+  Segments old_commit;
+  InitSegments(&old_commit, 1);
+  old_commit.mutable_segment(0)->move_candidate(2, 0);
+  old_commit.mutable_segment(0)->mutable_candidate(0)->attributes |=
+      converter::Attribute::RERANKED;
+  old_commit.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  old_commit.set_revert_id(91003);
+  rewriter->Finish(request, old_commit);
+  rewriter->Revert(old_commit);
+  rewriter->PrepareForSuggestionLearning(request);
+
+  // This Rewrite should no longer see the old preference even though no
+  // ordinary Rewrite happened between Undo and the preparation call.
+  Segments after_undo;
+  InitSegments(&after_undo, 1);
+  rewriter->Rewrite(request, &after_undo);
+  EXPECT_EQ(after_undo.segment(0).candidate(0).value, "candidate0");
 }
 
 TEST_F(UserSegmentHistoryRewriterTest, BasicTest) {
@@ -1262,6 +1514,7 @@ TEST_F(UserSegmentHistoryRewriterTest, NumberSpecial) {
     segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
         converter::Attribute::RERANKED;
     segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    number_rewriter->Finish(convreq, segments);
     rewriter->Finish(convreq, segments);
   }
 
@@ -1310,6 +1563,7 @@ TEST_F(UserSegmentHistoryRewriterTest, NumberHalfWidth) {
     candidate->style =
         NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH;
     segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    number_rewriter->Finish(convreq, segments);
     rewriter->Finish(convreq, segments);  // full-width for separated number
   }
 
@@ -1359,6 +1613,7 @@ TEST_F(UserSegmentHistoryRewriterTest, NumberFullWidth) {
     candidate->style =
         NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH;
     segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    number_rewriter->Finish(convreq, segments);
     rewriter->Finish(convreq, segments);  // half-width for separated number
   }
 
@@ -1390,6 +1645,7 @@ class UserSegmentHistoryNumberTest
 INSTANTIATE_TEST_SUITE_P(
     NumberStyleLearningTestForRequest, UserSegmentHistoryNumberTest,
     ::testing::Values(
+        commands::Request(),
         []() {
           commands::Request request;
           request_test_util::FillMobileRequest(&request);
@@ -1477,6 +1733,7 @@ TEST_F(UserSegmentHistoryRewriterTest, NumberNoSeparated) {
     candidate->rid = pos_matcher().GetNumberId();
     candidate->style = NumberUtil::NumberString::NUMBER_KANJI;
     segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    number_rewriter->Finish(convreq, segments);
     rewriter->Finish(convreq, segments);  // learn kanji
   }
   {
@@ -1494,6 +1751,7 @@ TEST_F(UserSegmentHistoryRewriterTest, NumberNoSeparated) {
     candidate->style =
         NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH;
     segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    number_rewriter->Finish(convreq, segments);
     rewriter->Finish(convreq, segments);  // learn kanji
   }
 
@@ -1680,11 +1938,34 @@ TEST_F(UserSegmentHistoryRewriterTest, RandomTest) {
   Clock::SetClockForUnitTest(nullptr);
 }
 
-TEST_F(UserSegmentHistoryRewriterTest, AnnotationAfterLearning) {
+TEST_F(UserSegmentHistoryRewriterTest, PromotionWithWidthInvariantKey) {
   Segments segments;
   std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
       CreateUserSegmentHistoryRewriter());
 
+  // Step 1: Learn half-width "abc".
+  {
+    const ConversionRequest convreq = CreateConversionRequest();
+    segments.Clear();
+    InitSegments(&segments, 1, 2);
+    segments.mutable_segment(0)->set_key("abc");
+    converter::Candidate* candidate =
+        segments.mutable_segment(0)->mutable_candidate(1);
+    candidate->value = "abc";
+    candidate->content_value = "abc";
+    candidate->content_key = "abc";
+    candidate->description = "[半] アルファベット";
+    segments.mutable_segment(0)->move_candidate(1, 0);
+    segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
+        converter::Attribute::RERANKED;
+    segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    rewriter->Finish(convreq, segments);
+  }
+
+  // Step 2: Rewrite with full-width "ａｂｃ".
+  // USHR promotes the full-width candidate based on half-width learning,
+  // without altering candidate form or description (deferred to
+  // VariantsRewriter).
   {
     const ConversionRequest convreq = CreateConversionRequest();
     segments.Clear();
@@ -1696,6 +1977,31 @@ TEST_F(UserSegmentHistoryRewriterTest, AnnotationAfterLearning) {
     candidate->content_value = "ａｂｃ";
     candidate->content_key = "abc";
     candidate->description = "[全] アルファベット";
+    rewriter->Rewrite(convreq, &segments);
+    EXPECT_EQ(segments.segment(0).candidate(0).content_value, "ａｂｃ");
+    EXPECT_EQ(segments.segment(0).candidate(0).description,
+              "[全] アルファベット");
+    rewriter->Finish(convreq, segments);
+  }
+}
+
+TEST_F(UserSegmentHistoryRewriterTest,
+       MetaCandidatesTransliterationDeduplication) {
+  Segments segments;
+  std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
+      CreateUserSegmentHistoryRewriter());
+
+  // Step 1: Learn half-width "aiu" for "あいう".
+  {
+    const ConversionRequest convreq = CreateConversionRequest();
+    segments.Clear();
+    InitSegments(&segments, 1, 2);
+    segments.mutable_segment(0)->set_key("あいう");
+    converter::Candidate* candidate =
+        segments.mutable_segment(0)->mutable_candidate(1);
+    candidate->value = "aiu";
+    candidate->content_value = "aiu";
+    candidate->content_key = "あいう";
     segments.mutable_segment(0)->move_candidate(1, 0);
     segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
         converter::Attribute::RERANKED;
@@ -1703,24 +2009,85 @@ TEST_F(UserSegmentHistoryRewriterTest, AnnotationAfterLearning) {
     rewriter->Finish(convreq, segments);
   }
 
+  // Step 2: Rewrite "あいう" with meta candidates containing both half-width
+  // and full-width transliterations.
   {
     const ConversionRequest convreq = CreateConversionRequest();
     segments.Clear();
     InitSegments(&segments, 1, 2);
-    segments.mutable_segment(0)->set_key("abc");
+    Segment* seg = segments.mutable_segment(0);
+    seg->set_key("あいう");
+    seg->mutable_candidate(0)->value = "あいう";
+    seg->mutable_candidate(0)->content_value = "あいう";
+    seg->mutable_candidate(1)->value = "アイウ";
+    seg->mutable_candidate(1)->content_value = "アイウ";
+
+    for (size_t i = 0; i < transliteration::NUM_T13N_TYPES; ++i) {
+      converter::Candidate* mc = seg->add_meta_candidate();
+      mc->key = "あいう";
+      mc->content_key = "あいう";
+    }
+    seg->mutable_meta_candidate(transliteration::HALF_ASCII)->value = "aiu";
+    seg->mutable_meta_candidate(transliteration::HALF_ASCII)->content_value =
+        "aiu";
+    seg->mutable_meta_candidate(transliteration::FULL_ASCII)->value = "ａｉｕ";
+    seg->mutable_meta_candidate(transliteration::FULL_ASCII)->content_value =
+        "ａｉｕ";
+
+    rewriter->Rewrite(convreq, &segments);
+
+    // Only one ASCII transliteration candidate ("aiu") should be promoted to
+    // index 0, and not duplicated with "ａｉｕ".
+    EXPECT_EQ(seg->candidates_size(), 3);
+    EXPECT_EQ(seg->candidate(0).value, "aiu");
+    EXPECT_NE(seg->candidate(1).value, "ａｉｕ");
+  }
+}
+
+TEST_F(UserSegmentHistoryRewriterTest, PreserveNoVariantsExpansionOnPromotion) {
+  Segments segments;
+  std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
+      CreateUserSegmentHistoryRewriter());
+
+  // Step 1: Learn "Google" with NO_VARIANTS_EXPANSION (e.g. from
+  // EnglishVariantsRewriter).
+  {
+    const ConversionRequest convreq = CreateConversionRequest();
+    segments.Clear();
+    InitSegments(&segments, 1, 2);
+    segments.mutable_segment(0)->set_key("ぐーぐる");
     converter::Candidate* candidate =
         segments.mutable_segment(0)->mutable_candidate(1);
-    candidate->value = "ａｂｃ";
-    candidate->content_value = "ａｂｃ";
-    candidate->content_key = "abc";
-    candidate->description = "[全]アルファベット";
-    candidate->content_key = "abc";
-    rewriter->Rewrite(convreq, &segments);
-    EXPECT_EQ(segments.segment(0).candidate(0).content_value, "abc");
-    // "アルファベット"
-    EXPECT_EQ(VariantsRewriter::kAlphabet,
-              segments.segment(0).candidate(0).description);
+    candidate->value = "Google";
+    candidate->content_value = "Google";
+    candidate->content_key = "ぐーぐる";
+    candidate->attributes |= converter::Attribute::NO_VARIANTS_EXPANSION;
+    segments.mutable_segment(0)->move_candidate(1, 0);
+    segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
+        converter::Attribute::RERANKED;
+    segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
     rewriter->Finish(convreq, segments);
+  }
+
+  // Step 2: Rewrite "ぐーぐる".
+  {
+    const ConversionRequest convreq = CreateConversionRequest();
+    segments.Clear();
+    InitSegments(&segments, 1, 2);
+    Segment* seg = segments.mutable_segment(0);
+    seg->set_key("ぐーぐる");
+    seg->mutable_candidate(0)->value = "グーグル";
+    seg->mutable_candidate(0)->content_value = "グーグル";
+    seg->mutable_candidate(1)->value = "Google";
+    seg->mutable_candidate(1)->content_value = "Google";
+    seg->mutable_candidate(1)->attributes |=
+        converter::Attribute::NO_VARIANTS_EXPANSION;
+
+    rewriter->Rewrite(convreq, &segments);
+
+    EXPECT_EQ(seg->candidate(0).value, "Google");
+    EXPECT_TRUE(seg->candidate(0).attributes &
+                converter::Attribute::NO_VARIANTS_EXPANSION);
   }
 }
 
@@ -1909,5 +2276,163 @@ TEST_F(UserSegmentHistoryRewriterTest, Revert) {
   }
 }
 
+TEST_F(UserSegmentHistoryRewriterTest,
+       RevertExternalLearningRestoresRawStorageExactly) {
+  std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
+      CreateUserSegmentHistoryRewriter());
+  const ConversionRequest normal_request = CreateConversionRequest();
+  const ConversionRequest external_request =
+      CreateReversibleExternalConversionRequest();
+
+  UserSegmentHistoryRewriterTestPeer peer(*rewriter);
+  auto snapshot_storage = [&]() {
+    storage::LruStorage* storage = peer.storage_().get();
+    CHECK(storage != nullptr);
+
+    // Compare logical segment.db state only. Timestamps and LRU ordering are
+    // intentionally ignored because restoring a previous value may touch it.
+    std::vector<std::pair<uint64_t, std::string>> snapshot;
+    snapshot.reserve(storage->used_size());
+    for (size_t i = 0; i < storage->used_size(); ++i) {
+      uint64_t fingerprint = 0;
+      std::string value;
+      uint32_t last_access_time = 0;
+      storage->Read(i, &fingerprint, &value, &last_access_time);
+      snapshot.emplace_back(fingerprint, std::move(value));
+    }
+    std::sort(snapshot.begin(), snapshot.end());
+    return snapshot;
+  };
+
+  Segments segments;
+  InitSegments(&segments, 1, 3);
+  segments.mutable_segment(0)->set_key("abc");
+  segments.mutable_segment(0)->move_candidate(1, 0);
+  segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
+      converter::Attribute::RERANKED;
+  segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  segments.set_revert_id(20);
+  rewriter->Finish(normal_request, segments);
+
+  const auto before_external = snapshot_storage();
+  ASSERT_FALSE(before_external.empty());
+
+  InitSegments(&segments, 1, 3);
+  segments.mutable_segment(0)->set_key("abc");
+  segments.mutable_segment(0)->move_candidate(2, 0);
+  segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
+      converter::Attribute::RERANKED;
+  segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  segments.set_revert_id(21);
+  rewriter->Finish(external_request, segments);
+  const Segments external_commit = segments;
+
+  const auto after_external = snapshot_storage();
+  EXPECT_NE(after_external, before_external);
+
+  rewriter->Revert(external_commit);
+
+  const auto after_revert = snapshot_storage();
+  EXPECT_EQ(after_revert, before_external);
+}
+
+TEST_F(UserSegmentHistoryRewriterTest,
+       DiscardExternalRevertKeepsLearnedRawStorage) {
+  std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
+      CreateUserSegmentHistoryRewriter());
+  const ConversionRequest external_request =
+      CreateReversibleExternalConversionRequest();
+
+  UserSegmentHistoryRewriterTestPeer peer(*rewriter);
+  auto snapshot_storage = [&]() {
+    storage::LruStorage* storage = peer.storage_().get();
+    CHECK(storage != nullptr);
+    std::vector<std::pair<uint64_t, std::string>> snapshot;
+    snapshot.reserve(storage->used_size());
+    for (size_t i = 0; i < storage->used_size(); ++i) {
+      uint64_t fingerprint = 0;
+      std::string value;
+      uint32_t last_access_time = 0;
+      storage->Read(i, &fingerprint, &value, &last_access_time);
+      snapshot.emplace_back(fingerprint, std::move(value));
+    }
+    std::sort(snapshot.begin(), snapshot.end());
+    return snapshot;
+  };
+
+  Segments segments;
+  InitSegments(&segments, 1, 3);
+  segments.mutable_segment(0)->set_key("abc");
+  segments.mutable_segment(0)->move_candidate(2, 0);
+  segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
+      converter::Attribute::RERANKED;
+  segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+  segments.set_revert_id(31);
+  rewriter->Finish(external_request, segments);
+
+  const auto learned = snapshot_storage();
+  ASSERT_FALSE(learned.empty());
+
+  rewriter->DiscardRevert(segments);
+  rewriter->Revert(segments);
+
+  EXPECT_EQ(snapshot_storage(), learned);
+}
+
 }  // namespace
+TEST_F(UserSegmentHistoryRewriterTest,
+       WidthInvariantHistoryMatchingPreservesInnerSegmentBoundary) {
+  Segments segments;
+  std::unique_ptr<UserSegmentHistoryRewriter> rewriter(
+      CreateUserSegmentHistoryRewriter());
+  rewriter->Clear();
+
+  const ConversionRequest convreq = CreateConversionRequest();
+
+  // Learn "２日" (full-width) for "ふつか".
+  {
+    InitSegments(&segments, 1, 2);
+    segments.mutable_segment(0)->set_key("ふつか");
+    converter::Candidate* candidate =
+        segments.mutable_segment(0)->mutable_candidate(1);
+    candidate->key = "ふつか";
+    candidate->content_key = "ふつか";
+    candidate->value = "２日";
+    candidate->content_value = "２日";
+    segments.mutable_segment(0)->move_candidate(1, 0);
+    segments.mutable_segment(0)->mutable_candidate(0)->attributes |=
+        converter::Attribute::RERANKED;
+    segments.mutable_segment(0)->set_segment_type(Segment::FIXED_VALUE);
+    rewriter->Finish(convreq, segments);
+  }
+
+  // Rewrite a segment where "2日" (half-width) has an inner_segment_boundary.
+  // USHR matches width-invariantly and promotes "2日" to top, without modifying
+  // its value or boundary (normalization is deferred to VariantsRewriter).
+  {
+    segments.Clear();
+    InitSegments(&segments, 1, 2);
+    segments.mutable_segment(0)->set_key("ふつか");
+    converter::Candidate* candidate =
+        segments.mutable_segment(0)->mutable_candidate(1);
+    candidate->key = "ふつか";
+    candidate->content_key = "ふつか";
+    candidate->value = "2日";
+    candidate->content_value = "2日";
+    candidate->inner_segment_boundary = converter::BuildInnerSegmentBoundary(
+        {{strlen("ふつか"), strlen("2日"), strlen("ふつか"), strlen("2日")}},
+        candidate->key, candidate->value);
+
+    EXPECT_TRUE(rewriter->Rewrite(convreq, &segments));
+    const converter::Candidate& top = segments.segment(0).candidate(0);
+    EXPECT_EQ(top.value, "2日");
+    EXPECT_EQ(top.content_value, "2日");
+    EXPECT_EQ(top.inner_segment_boundary,
+              converter::BuildInnerSegmentBoundary(
+                  {{strlen("ふつか"), strlen("2日"), strlen("ふつか"),
+                    strlen("2日")}},
+                  "ふつか", "2日"));
+  }
+}
+
 }  // namespace mozc

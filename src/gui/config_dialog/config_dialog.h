@@ -75,8 +75,10 @@ class ConfigDialog : public QDialog, private Ui::ConfigDialog {
   virtual void SelectInputModeSetting(int index);
   virtual void SelectLiveConversionSetting(int state);
   virtual void SelectZenzLiveCorrectionSetting(int state);
+  virtual void SelectZenzDeferredPresentationSetting(int state);
   virtual void SelectZenzRightContextSetting(int state);
-  virtual void SelectZenzFeedbackLearningSetting(int state);
+  virtual void SelectZenzFeedbackReuseSetting(int state);
+  virtual void SelectZenzFeedbackAutoBlockSetting(int state);
   virtual void SelectAutoConversionSetting(int state);
   virtual void SelectDirectCommitSetting(int state);
   virtual void SelectSuggestionSetting(int state);
@@ -101,6 +103,7 @@ class ConfigDialog : public QDialog, private Ui::ConfigDialog {
   bool SetConfig(const config::Config &config);
   void ConvertToProto(config::Config *config) const;
   void InitializeRendererAppearanceControls();
+  void UpdateConversionStatusPreview();
   void InitializeWindowsImeIconStyleControls();
   void ConvertRendererAppearanceFromProto(const config::Config &config);
   void ConvertRendererAppearanceToProto(config::Config *config) const;
@@ -111,6 +114,7 @@ class ConfigDialog : public QDialog, private Ui::ConfigDialog {
   void RecordCurrentStateAsApplied();
   bool IsModified() const;
 
+  QWidget* conversion_status_preview_ = nullptr;
   std::unique_ptr<client::ClientInterface> client_;
   std::string custom_keymap_table_;
   std::string custom_roman_table_;
@@ -139,6 +143,13 @@ class ConfigDialog : public QDialog, private Ui::ConfigDialog {
   uint32_t initial_preedit_target_background_color_;
   bool initial_use_custom_preedit_target_underline_color_;
   uint32_t initial_preedit_target_underline_color_;
+
+  bool initial_use_custom_zenz_live_correction_text_color_;
+  uint32_t initial_zenz_live_correction_text_color_;
+  bool initial_use_custom_zenz_live_correction_background_color_;
+  uint32_t initial_zenz_live_correction_background_color_;
+  bool initial_use_custom_zenz_live_correction_underline_color_;
+  uint32_t initial_zenz_live_correction_underline_color_;
 
   std::map<QString, config::Config::SessionKeymap>
       keymapname_sessionkeymap_map_;

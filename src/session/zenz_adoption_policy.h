@@ -36,6 +36,8 @@
 
 #include "absl/strings/string_view.h"
 #include "protocol/candidate_window.pb.h"
+#include "session/zenz_orthography_policy.h"
+#include "session/zenz_segment_projection.h"
 
 namespace mozc::session {
 
@@ -52,6 +54,12 @@ struct ProtectedConversionSpan {
     // Product names, handles, ASCII/mixed-script spellings, and other surfaces
     // where the exact spelling is part of the user's intent.
     kIdentityCritical,
+
+    // ASCII numeric literals typed by the user, such as "1", "100", or
+    // "3.14".  The exact numeric spelling is preserved, but adjacent Japanese
+    // text is allowed to change so Zenz can still correct expressions such as
+    // "1代" -> "1台" and surrounding homophones.
+    kNumericLiteral,
 
     // Other protected dictionary surfaces selected by normal Mozc live
     // conversion.  They are protected from silent overwrite.  They are not
@@ -79,6 +87,12 @@ struct ProtectedConversionSpan {
   std::string placeholder;
 };
 
+// Classifies an ASCII identity surface extracted from the visible Mozc
+// baseline.  Pure signed integers and decimals are numeric literals; mixed
+// technical spellings remain identity-critical.
+ProtectedConversionSpan::Tier ClassifyProtectedAsciiSurface(
+    absl::string_view surface);
+
 struct ZenzProtectedPromptInput {
   absl::string_view key;
   std::vector<ProtectedConversionSpan> protected_spans;
@@ -95,6 +109,7 @@ struct ZenzAdoptionInput {
   absl::string_view mozc_value;
   absl::string_view zenz_value;
   std::vector<ProtectedConversionSpan> protected_spans;
+  std::vector<ZenzBaselineSegment> baseline_segments;
 };
 
 struct ZenzAdoptionResult {
@@ -119,6 +134,9 @@ class ZenzAdoptionPolicy {
       const std::vector<ProtectedConversionSpan>& protected_spans) const;
 
   ZenzAdoptionResult Decide(const ZenzAdoptionInput& input) const;
+
+ private:
+  ZenzOrthographyPolicy orthography_policy_;
 };
 
 }  // namespace mozc::session

@@ -36,8 +36,11 @@
 #include <wil/resource.h>
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 
 #include "base/const.h"
 #include "base/coordinates.h"
@@ -46,6 +49,7 @@
 #include "protocol/commands.pb.h"
 #include "renderer/table_layout.h"
 #include "renderer/win32/text_renderer.h"
+#include "renderer/win32/vertical_candidate_layout.h"
 #include "renderer/win32/win32_renderer_util.h"
 
 namespace mozc {
@@ -58,8 +62,9 @@ namespace win32 {
 // SPI_GETACTIVEWINDOWTRACKING is enabled.
 // TODO(yukawa): Support mouse operations before we add a GUI feature which
 //   requires UI interaction by mouse and/or touch. (b/2954874)
-typedef ATL::CWinTraits<WS_POPUP | WS_DISABLED,
-                        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE>
+typedef ATL::CWinTraits<
+    WS_POPUP | WS_DISABLED,
+    WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED>
     CandidateWindowTraits;
 
 // a class which implements an IME candidate window for Windows. This class
@@ -76,6 +81,7 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
   MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
   MESSAGE_HANDLER(WM_GETMINMAXINFO, OnGetMinMaxInfo)
+  MESSAGE_HANDLER(WM_MOUSEACTIVATE, OnMouseActivate)
   MESSAGE_HANDLER(WM_LBUTTONDOWN, OnLButtonDown)
   MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
   MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
@@ -93,6 +99,9 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   void OnDestroy();
   BOOL OnEraseBkgnd(HDC dc);
   void OnGetMinMaxInfo(MINMAXINFO* min_max_info);
+  LRESULT OnMouseActivate(UINT, WPARAM, LPARAM, BOOL&) {
+    return MA_NOACTIVATE;
+  }
   void OnLButtonDown(UINT nFlags, CPoint point);
   void OnLButtonUp(UINT nFlags, CPoint point);
   void OnMouseMove(UINT nFlags, CPoint point);
@@ -109,14 +118,21 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   // UpdateLayout.
   void UpdateDpi(uint32_t dpi);
 
+  enum class LayoutMode {
+    kHorizontal,
+    kVertical,
+  };
+
   void UpdateLayout(const commands::CandidateWindow& candidate_window);
+  void UpdateLayout(const commands::CandidateWindow& candidate_window,
+                    LayoutMode layout_mode);
   void UpdateEffectWindows();
-  void RedrawImmediately();
-  // Paints the pre-rendered candidate window bitmap to the window DC
-  // immediately.  This is used just after SWP_SHOWWINDOW for live passive
-  // suggestion UI so that the first visible frame already contains the
-  // completed candidate contents.  If the cache is unavailable, this method
-  // is a no-op and the normal WM_PAINT path remains the fallback.
+  void SetShadowZOrderAnchor(HWND hwnd) { shadow_z_order_anchor_ = hwnd; }
+  HWND GetWindowHandle() const { return m_hWnd; }
+  // Presents the pre-rendered PBGRA candidate surface with per-pixel alpha.
+  // The rounded silhouette and the configured whole-window opacity are both
+  // composed by UpdateLayeredWindow, so this must be used instead of BitBlt or
+  // SetLayeredWindowAttributes for candidate-like windows.
   void PresentCachedBitmapImmediately();
   // Hides both the candidate window and its renderer-owned visual effects.
   // This avoids one-frame shadow remnants when WindowManager suppresses or
@@ -125,6 +141,9 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   void SetSendCommandInterface(
       client::SendCommandInterface* send_command_interface);
   void SetRendererCallbackToken(uint64_t token);
+  void set_post_quit_message_on_destroy(bool enabled) {
+    post_quit_message_on_destroy_ = enabled;
+  }
 
   // Layout information for the WindowManager class.
   Size GetLayoutSize() const;
@@ -133,11 +152,17 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   Rect GetFirstRowInClientCord() const;
 
  private:
-  void DoPaint(HDC dc);
+  void DoPaint(HDC dc, bool draw_frame);
 
   bool RenderToBitmapCache();
-  bool BitBltCachedBitmapTo(HDC target_dc, const RECT& target_rect) const;
   void ClearBitmapCache();
+
+  bool IsVerticalLayout() const;
+  bool IsLayoutReady() const;
+  Rect GetCandidateRect(size_t index) const;
+  Rect GetFooterRect() const;
+  Size MeasureVerticalFooterSize() const;
+  bool TryUpdateVerticalLayout();
 
   void DrawCells(HDC dc);
   void DrawVScrollBar(HDC dc);
@@ -152,9 +177,36 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   // width) for the current |dpi_|.
   void UpdateDpiDependentResources();
 
-  // Handles candidate selection by mouse.
+  struct PressedSuggestionCandidateIdentity {
+    int32_t id = 0;
+    std::string value;
+  };
+
+  // Returns the candidate ID under |point| in the currently rendered list.
+  std::optional<int32_t> GetCandidateIdAtPoint(const CPoint& point) const;
+
+  std::optional<PressedSuggestionCandidateIdentity>
+  GetPassiveSuggestionCandidateIdentityAtPoint(const CPoint& point) const;
+
+  static bool ContainsPassiveSuggestionCandidateIdentity(
+      const commands::CandidateWindow& candidate_window,
+      const PressedSuggestionCandidateIdentity& identity);
+
+  // Sends a candidate mouse command without re-reading the rendered list.
+  void SendCandidateCommand(commands::SessionCommand::CommandType type,
+                            int32_t candidate_id);
+
+  // Handles ordinary conversion/prediction candidate selection by mouse.
   void HandleMouseEvent(UINT nFlags, const CPoint& point,
                         bool close_candidatewindow);
+
+  // A suggestion has no focused candidate yet.  Sending
+  // HIGHLIGHT_CANDIDATE on mouse-down promotes the session to CONVERSION and
+  // can replace the rendered list before WM_LBUTTONUP.  Keep the suggestion
+  // mouse gesture local until mouse-up instead.
+  bool suggestion_mouse_gesture_active_ = false;
+  std::optional<PressedSuggestionCandidateIdentity>
+      pressed_suggestion_candidate_;
 
   // Even though the candidate window supports limited mouse operations, we
   // accept them when and only when SPI_GETACTIVEWINDOWTRACKING is disabled
@@ -225,6 +277,8 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   Size footer_logo_display_size_;
   client::SendCommandInterface* send_command_interface_;
   std::unique_ptr<TableLayout> table_layout_;
+  std::unique_ptr<VerticalCandidateLayout> vertical_layout_;
+  LayoutMode layout_mode_;
   wil::unique_hbitmap cached_bitmap_;
   Size cached_bitmap_size_;
   bool cached_bitmap_valid_;
@@ -233,6 +287,8 @@ class CandidateWindow : public ATL::CWindowImpl<CandidateWindow, ATL::CWindow,
   int indicator_width_;
   bool metrics_changed_;
   bool mouse_moving_;
+  bool post_quit_message_on_destroy_;
+  HWND shadow_z_order_anchor_ = nullptr;
   uint64_t renderer_callback_token_;
   uint64_t mouse_down_renderer_callback_token_;
   RendererShadowWindow shadow_window_;

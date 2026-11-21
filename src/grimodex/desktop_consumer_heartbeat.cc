@@ -145,7 +145,8 @@ bool IsPackagedMacosRuntimeFile(absl::string_view path) {
     return false;
   }
   const std::string filename = FileUtil::Basename(path);
-  if ((filename == "mozc_zenz_scorer" || filename == "llama-server") &&
+  if ((filename == "mozc_zenz_scorer" || filename == "mozc_zenz_guard" ||
+       filename == "llama-server") &&
       (info.st_mode & S_IXUSR) == 0) {
     return false;
   }
@@ -153,16 +154,18 @@ bool IsPackagedMacosRuntimeFile(absl::string_view path) {
 }
 
 bool MacosZenzRuntimeAvailable() {
-  const std::string converter_app = SystemUtil::GetServerPath();
-  if (converter_app.empty()) {
+  // Same location session/zenz_client_factory.cc launches the scorer from:
+  // MozkeyIbG.app/Contents/Resources/ZenzRuntime.
+  const std::string server_directory = SystemUtil::GetServerDirectory();
+  if (server_directory.empty()) {
     return false;
   }
-  const std::string resources = FileUtil::JoinPath(
-      FileUtil::JoinPath(converter_app, "Contents"), "Resources");
+  const std::string runtime =
+      FileUtil::JoinPath(server_directory, "ZenzRuntime");
   return HasCompleteMacosZenzRuntime(
-      [&resources](absl::string_view relative_path) {
+      [&runtime](absl::string_view relative_path) {
         return IsPackagedMacosRuntimeFile(
-            FileUtil::JoinPath(resources, relative_path));
+            FileUtil::JoinPath(runtime, relative_path));
       });
 }
 

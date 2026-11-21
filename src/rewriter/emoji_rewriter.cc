@@ -91,6 +91,10 @@ std::unique_ptr<converter::Candidate> CreateCandidate(
   }
   candidate->attributes |= converter::Attribute::NO_VARIANTS_EXPANSION;
   candidate->attributes |= converter::Attribute::CONTEXT_SENSITIVE;
+  // EmojiRewriter provenance: keep emojis selectable, but never at rank 0
+  // in normal conversion.  Deliberate user-dictionary symbol entries remain
+  // unconstrained and independently eligible for rank 0.
+  candidate->ranking_constraints |= converter::RankingConstraint::NO_TOP;
   candidate->category = converter::Candidate::SYMBOL;
 
   return candidate;

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "purpose": "Reproducible daily dictionary inputs. Update only after semantic and license review.",
+  "merge_ut": {
+    "revision": "640844881690e877d0e54dff024edb8ec7b77290",
+    "children": [
+      {
+        "name": "mozcdic-ut-place-names",
+        "repository": "utuhiro78/mozcdic-ut-place-names",
+        "revision": "98cf8e9d7731695a52e5bc72ed633933c71d1913"
+      },
+      {
+        "name": "mozcdic-ut-sudachidict",
+        "repository": "utuhiro78/mozcdic-ut-sudachidict",
+        "revision": "13129ddebe1cb8eabb63feccbe157adec4e1de01"
+      }
+    ]
+  },
+  "wikipedia": {
+    "snapshot": "20261001",
+    "filename": "jawiki-20261001-pages-articles-multistream-index.txt.bz2",
+    "url": "https://dumps.wikimedia.org/jawiki/20261001/jawiki-20261001-pages-articles-multistream-index.txt.bz2",
+    "sha256": "8A040564302DC0BA57160172ABEF3D4F69CC7CA36EA67B6439959D441CD037E7",
+    "bytes": 31437876
+  },
+  "nico_pixiv": {
+    "repository": "Niccori250k/dic-nico-intersection-pixiv",
+    "revision": "4d0d8d219d0b9abf34745016e398e762182fce61",
+    "path": "public/dic-nico-intersection-pixiv-google.txt",
+    "sha256": "E16990B24D75FCCAC9CF2B0B4382E59988E735BC9FA634626078DC500E0B8BC4",
+    "bytes": 7659574
+  },
+  "personal_names": {
+    "repository": "utuhiro78/mozcdic-ut-personal-names",
+    "revision": "b557dd4c1548cc7c2164d5f8b14170c40cbb6f81",
+    "path": "mozcdic-ut-personal-names.txt.bz2",
+    "sha256": "610E2E52FAD15DF0EDAC854960A05451A7E9A62F3DF09C3F065DB9E1AB6F51F4",
+    "bytes": 729168
+  }
+}

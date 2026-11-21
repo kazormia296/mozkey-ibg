@@ -1,0 +1,22 @@
+// Windows version information for the in-tree Mozkey Zenz scorer.
+// This file uses the same version resource generator as other Mozkey PEs.
+#include "winres.h"
+
+LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+
+#ifndef MOZC_RES_INTERNAL_NAME
+  #define MOZC_RES_INTERNAL_NAME "mozc_zenz_scorer"
+#endif
+#ifndef MOZC_RES_ORIGINAL_FILENAME
+  #define MOZC_RES_ORIGINAL_FILENAME "mozc_zenz_scorer.exe"
+#endif
+#ifndef MOZC_RES_FILE_DESCRIPTION
+  #define MOZC_RES_FILE_DESCRIPTION "Zenz Scorer"
+#endif
+#ifndef MOZC_RES_FILETYPE
+  #define MOZC_RES_FILETYPE VFT_APP
+#endif
+
+#ifdef MOZC_RES_USE_TEMPLATE
+  #include "build_tools/mozc_win32_resource_template.rc"
+#endif

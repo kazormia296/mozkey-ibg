@@ -40,6 +40,7 @@
 #include "base/protobuf/text_format.h"
 #include "base/protobuf_util.h"
 #include "base/text_normalizer.h"
+#include "protocol/candidate_window.pb.h"
 #include "protocol/renderer_style.pb.h"
 
 namespace mozc {
@@ -118,6 +119,10 @@ RendererStyleHandler::RubyWindowStyle RubyStyleFromRendererStyle(
     ruby_style.text_color = ToRgb(style.candidate_style().foreground_color(),
                                   ruby_style.text_color);
   }
+  if (style.candidate_style().has_font_weight()) {
+    ruby_style.font_weight = static_cast<uint32_t>(std::clamp(
+        style.candidate_style().font_weight(), 100, 900));
+  }
   return ruby_style;
 }
 
@@ -128,6 +133,9 @@ void ApplyLightCandidateWindowTheme(RendererStyle* style) {
            0x77, 0x77, 0x77);
   SetColor(style->mutable_shortcut_style()->mutable_background_color(),
            0xf3, 0xf4, 0xff);
+
+  SetColor(style->mutable_gap1_style()->mutable_background_color(),
+           0xff, 0xff, 0xff);
 
   SetColor(style->mutable_candidate_style()->mutable_foreground_color(),
            0x00, 0x00, 0x00);
@@ -181,6 +189,9 @@ void ApplyDarkCandidateWindowTheme(RendererStyle* style) {
   SetColor(style->mutable_shortcut_style()->mutable_foreground_color(),
            0x96, 0xa0, 0xaa);
   SetColor(style->mutable_shortcut_style()->mutable_background_color(),
+           0x18, 0x1b, 0x20);
+
+  SetColor(style->mutable_gap1_style()->mutable_background_color(),
            0x18, 0x1b, 0x20);
 
   SetColor(style->mutable_candidate_style()->mutable_foreground_color(),
@@ -385,6 +396,16 @@ bool RendererStyleHandler::SetRendererStyle(const RendererStyle& style) {
   return GetRendererStyleHandlerImpl()->SetRendererStyle(style);
 }
 
+RendererStyleHandler::RendererStyleType
+RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+    const commands::CandidateWindow& candidate_window) {
+  const bool use_suggestion_style =
+      candidate_window.category() == commands::SUGGESTION ||
+      candidate_window.category() == commands::PREDICTION;
+  return use_suggestion_style ? RendererStyleType::kSuggestion
+                              : RendererStyleType::kCandidate;
+}
+
 bool RendererStyleHandler::GetRendererStyleForWindowType(
     RendererStyleType type, RendererStyle* style) {
   return GetRendererStyleHandlerImpl()->GetRendererStyleForWindowType(type,
@@ -449,6 +470,8 @@ void RendererStyleHandler::ApplyCandidateWindowCustomColors(
               shortcut_text_color);
   SetRgbColor(style->mutable_shortcut_style()->mutable_background_color(),
               shortcut_background_color);
+  SetRgbColor(style->mutable_gap1_style()->mutable_background_color(),
+              background_color);
   SetRgbColor(style->mutable_candidate_style()->mutable_foreground_color(),
               text_color);
   SetRgbColor(style->mutable_candidate_style()->mutable_background_color(),

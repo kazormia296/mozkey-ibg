@@ -35,7 +35,9 @@
 
 #include <bit>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
+#include <vector>
 
 #include "protocol/commands.pb.h"
 #include "protocol/renderer_command.pb.h"
@@ -227,6 +229,155 @@ TEST(Win32RendererUtilTest, GetRectInPhysicalCoordsTest) {
   }
 }
 
+TEST(Win32RendererUtilTest, GetCompositionTargetInPhysicalCoordsTest) {
+  const CPoint kClientOffset(8, 42);
+  const CSize kClientSize(100, 200);
+  const CRect kWindowRect(1000, 500, 1116, 750);
+  constexpr double kScaleFactors[] = {1.0, 2.0};
+
+  for (const double scale_factor : kScaleFactors) {
+    HWND hwnd = nullptr;
+    LayoutManager layout_mgr(CreateWindowEmulator(
+        kWindowRect, kClientOffset, kClientSize, scale_factor, &hwnd));
+
+    ApplicationInfo app_info;
+    AppInfoUtil::SetBasicApplicationInfo(
+        &app_info, hwnd, ApplicationInfo::ShowCandidateWindow,
+        ApplicationInfo::TSF);
+    AppInfoUtil::SetCompositionTarget(&app_info, 0, 86, 122, 20, 83, 119,
+                                      109, 525);
+
+    const int expected_x = static_cast<int>(86 * scale_factor);
+    const int expected_y = static_cast<int>(122 * scale_factor);
+    POINT top_left = {};
+    int line_height = 0;
+    ASSERT_TRUE(layout_mgr.GetCompositionTargetInPhysicalCoords(
+        app_info, 22, &top_left, &line_height));
+    EXPECT_EQ(CPoint(expected_x, expected_y), CPoint(top_left));
+    EXPECT_EQ(static_cast<int>(20 * scale_factor), line_height);
+
+    // Vertical writing keeps CharacterPosition::top_left as its right-top
+    // anchor and scales line_height along the x-axis.
+    app_info.mutable_composition_target()->set_vertical_writing(true);
+    ASSERT_TRUE(layout_mgr.GetCompositionTargetInPhysicalCoords(
+        app_info, 22, &top_left, &line_height));
+    EXPECT_EQ(CPoint(expected_x, expected_y), CPoint(top_left));
+    EXPECT_EQ(static_cast<int>(20 * scale_factor), line_height);
+
+    // A missing line height uses the caller-provided logical fallback before
+    // DPI virtualization is applied.
+    app_info.mutable_composition_target()->clear_vertical_writing();
+    app_info.mutable_composition_target()->clear_line_height();
+    ASSERT_TRUE(layout_mgr.GetCompositionTargetInPhysicalCoords(
+        app_info, 22, &top_left, &line_height));
+    EXPECT_EQ(static_cast<int>(22 * scale_factor), line_height);
+  }
+}
+
+TEST(Win32RendererUtilTest, RendererWindowOpacityToAlphaClampsAndScales) {
+  EXPECT_EQ(51, RendererWindowOpacityToAlpha(0));
+  EXPECT_EQ(51, RendererWindowOpacityToAlpha(20));
+  EXPECT_EQ(127, RendererWindowOpacityToAlpha(50));
+  EXPECT_EQ(229, RendererWindowOpacityToAlpha(90));
+  EXPECT_EQ(252, RendererWindowOpacityToAlpha(99));
+  EXPECT_EQ(255, RendererWindowOpacityToAlpha(100));
+  EXPECT_EQ(255, RendererWindowOpacityToAlpha(999));
+}
+
+TEST(Win32RendererUtilTest, RendererWindowCornerRadiusScalesAcrossDpi) {
+  struct TestCase {
+    uint32_t logical_radius;
+    uint32_t dpi;
+    int expected_radius;
+  };
+  constexpr TestCase kCases[] = {
+      {0, 96, 0},   {0, 120, 0},  {0, 144, 0},  {0, 168, 0},
+      {0, 192, 0},  {4, 96, 4},   {4, 120, 5},  {4, 144, 6},
+      {4, 168, 7},  {4, 192, 8},  {6, 96, 6},   {6, 120, 8},
+      {6, 144, 9},  {6, 168, 11}, {6, 192, 12}, {8, 96, 8},
+      {8, 120, 10}, {8, 144, 12}, {8, 168, 14}, {8, 192, 16},
+      {12, 96, 12}, {12, 120, 15}, {12, 144, 18}, {12, 168, 21},
+      {12, 192, 24},
+  };
+  constexpr int kWidth = 200;
+  constexpr int kHeight = 100;
+
+  for (const TestCase& test_case : kCases) {
+    EXPECT_EQ(test_case.expected_radius,
+              GetRendererWindowCornerRadiusInPixels(
+                  test_case.logical_radius, test_case.dpi, kWidth, kHeight))
+        << "logical_radius=" << test_case.logical_radius
+        << " dpi=" << test_case.dpi;
+  }
+}
+
+TEST(Win32RendererUtilTest, RendererWindowCornerRadiusClampsToOwnerGeometry) {
+  EXPECT_EQ(0, GetRendererWindowCornerRadiusInPixels(0, 192, 20, 14));
+  EXPECT_EQ(0, GetRendererWindowCornerRadiusInPixels(12, 192, 0, 14));
+  EXPECT_EQ(0, GetRendererWindowCornerRadiusInPixels(12, 192, 20, 0));
+  EXPECT_EQ(7, GetRendererWindowCornerRadiusInPixels(12, 192, 20, 14));
+}
+
+TEST(Win32RendererUtilTest, RoundedRectMaskKeepsOpaqueInteriorAndBorder) {
+  constexpr int kWidth = 5;
+  constexpr int kHeight = 5;
+  constexpr uint32_t kContent = 0x00112233;
+  std::vector<uint32_t> pixels(kWidth * kHeight, kContent);
+
+  ApplyRoundedRectAlphaAndBorder(pixels.data(), kWidth, kHeight,
+                                 /*corner_radius=*/0, /*border_width=*/1,
+                                 RGB(0xaa, 0xbb, 0xcc));
+
+  EXPECT_EQ(0xffaabbccu, pixels[2]);
+  EXPECT_EQ(0xffaabbccu, pixels[2 * kWidth]);
+  EXPECT_EQ(0xff112233u, pixels[2 * kWidth + 2]);
+}
+
+TEST(Win32RendererUtilTest, RoundedRectMaskAntialiasesAndPremultiplies) {
+  constexpr int kWidth = 7;
+  constexpr int kHeight = 7;
+  std::vector<uint32_t> pixels(kWidth * kHeight, 0x00ffffffu);
+
+  ApplyRoundedRectAlphaAndBorder(pixels.data(), kWidth, kHeight,
+                                 /*corner_radius=*/3, /*border_width=*/0,
+                                 RGB(0, 0, 0));
+
+  EXPECT_EQ(0u, pixels[0]);
+  EXPECT_EQ(0xffffffffu, pixels[3]);
+  EXPECT_EQ(0xffffffffu, pixels[3 * kWidth + 3]);
+
+  const uint32_t edge = pixels[1];
+  const uint32_t alpha = (edge >> 24) & 0xff;
+  const uint32_t red = (edge >> 16) & 0xff;
+  const uint32_t green = (edge >> 8) & 0xff;
+  const uint32_t blue = edge & 0xff;
+  EXPECT_GT(alpha, 0u);
+  EXPECT_LT(alpha, 255u);
+  EXPECT_EQ(alpha, red);
+  EXPECT_EQ(alpha, green);
+  EXPECT_EQ(alpha, blue);
+
+  EXPECT_EQ(pixels[1], pixels[kWidth - 2]);
+  EXPECT_EQ(pixels[1], pixels[(kHeight - 1) * kWidth + 1]);
+  EXPECT_EQ(pixels[1], pixels[kHeight * kWidth - 2]);
+}
+
+TEST(Win32RendererUtilTest, RoundedRectMaskClampsOversizedRadius) {
+  constexpr int kWidth = 4;
+  constexpr int kHeight = 4;
+  std::vector<uint32_t> clamped(kWidth * kHeight, 0x00ffffffu);
+  std::vector<uint32_t> oversized(kWidth * kHeight, 0x00ffffffu);
+
+  ApplyRoundedRectAlphaAndBorder(clamped.data(), kWidth, kHeight,
+                                 /*corner_radius=*/2, /*border_width=*/0,
+                                 RGB(0, 0, 0));
+  ApplyRoundedRectAlphaAndBorder(oversized.data(), kWidth, kHeight,
+                                 /*corner_radius=*/100, /*border_width=*/0,
+                                 RGB(0, 0, 0));
+
+  EXPECT_EQ(clamped, oversized);
+}
+
 TEST(Win32RendererUtilTest, GetScalingFactorTest) {
   constexpr double kScalingFactor = 1.5;
 
@@ -415,6 +566,169 @@ TEST(Win32RendererUtilTest, TSF_HighDPI) {
       layout_mgr.LayoutCandidateWindow(app_info, &candidate_window_layout));
   EXPECT_EXCLUDE_CANDIDATE_WINDOW_LAYOUT(172, 284, 172, 244, 174, 284,
                                          candidate_window_layout);
+}
+
+namespace {
+
+// Explicit screen origins exercise fallback mapping independently of the
+// emulator's primary-monitor-only scaling model.
+class OffsetWindowPosition : public WindowPositionInterface {
+ public:
+  OffsetWindowPosition(RECT logical, RECT physical, bool available = true)
+      : logical_(logical), physical_(physical), available_(available) {}
+  bool LogicalToPhysicalPoint(HWND, const POINT&, POINT*) override {
+    return false;  // Native boundary/API failure.
+  }
+  bool GetWindowRect(HWND, RECT* rect) override {
+    *rect = logical_;
+    return available_;
+  }
+  bool GetWindowRectInPhysicalCoords(HWND, RECT* rect) override {
+    *rect = physical_;
+    return available_;
+  }
+  bool GetClientRect(HWND, RECT*) override { return false; }
+  bool ClientToScreen(HWND, POINT*) override { return false; }
+  bool IsWindow(HWND) override { return available_; }
+  HWND GetRootWindow(HWND hwnd) override { return hwnd; }
+
+ private:
+  RECT logical_;
+  RECT physical_;
+  bool available_;
+};
+
+class TestDpiContext {
+ public:
+  explicit TestDpiContext(DPI_AWARENESS_CONTEXT context)
+      : old_(::SetThreadDpiAwarenessContext(context)) {}
+  ~TestDpiContext() {
+    if (old_ != nullptr) ::SetThreadDpiAwarenessContext(old_);
+  }
+  bool valid() const { return old_ != nullptr; }
+
+ private:
+  DPI_AWARENESS_CONTEXT old_;
+};
+
+class TestWindow {
+ public:
+  explicit TestWindow(HWND hwnd) : hwnd_(hwnd) {}
+  ~TestWindow() {
+    if (hwnd_) ::DestroyWindow(hwnd_);
+  }
+  HWND get() const { return hwnd_; }
+
+ private:
+  HWND hwnd_;
+};
+
+}  // namespace
+
+TEST(Win32RendererUtilTest, FallbackAtNonzeroAndNegativeOrigins) {
+  for (const int percent : {100, 125, 150, 200}) {
+    for (const int origin : {-2400, 1600}) {
+      SCOPED_TRACE(::testing::Message() << percent << "% origin=" << origin);
+      const CRect logical(origin + 100, 300, origin + 900, 700);
+      const CRect physical(origin + 100, 450, origin + 100 + 8 * percent,
+                           450 + 4 * percent);
+      LayoutManager layout(
+          std::make_unique<OffsetWindowPosition>(logical, physical));
+      CPoint result;
+      layout.GetPointInPhysicalCoords(
+          nullptr, CPoint(logical.left - 20, logical.top + 500), &result);
+      EXPECT_EQ(result, CPoint(physical.left - percent / 5,
+                               physical.top + 5 * percent));
+      EXPECT_DOUBLE_EQ(layout.GetScalingFactor(nullptr), percent / 100.0);
+    }
+  }
+}
+
+TEST(Win32RendererUtilTest, FallbackFailurePreservesInput) {
+  LayoutManager unavailable(std::make_unique<OffsetWindowPosition>(
+      CRect(0, 0, 100, 100), CRect(0, 0, 150, 150), false));
+  LayoutManager empty(std::make_unique<OffsetWindowPosition>(
+      CRect(7, 9, 7, 9), CRect(10, 14, 10, 14)));
+  for (const LayoutManager* layout : {&unavailable, &empty}) {
+    CPoint result;
+    layout->GetPointInPhysicalCoords(nullptr, CPoint(-17, 234), &result);
+    EXPECT_EQ(result, CPoint(-17, 234));
+    EXPECT_DOUBLE_EQ(layout->GetScalingFactor(nullptr), 1.0);
+  }
+}
+
+TEST(Win32RendererUtilTest, NativeDpiContextsAndWindowBoundaries) {
+  const TestDpiContext caller(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  ASSERT_TRUE(caller.valid());
+  const auto caller_context = ::GetThreadDpiAwarenessContext();
+  for (const auto target_context :
+       {DPI_AWARENESS_CONTEXT_UNAWARE, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2}) {
+    HWND hwnd;
+    {
+      const TestDpiContext target(target_context);
+      ASSERT_TRUE(target.valid());
+      hwnd = ::CreateWindowExW(
+          WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED, L"STATIC", L"",
+          WS_POPUP | WS_DISABLED, 1004, 603, 552, 185, nullptr, nullptr,
+          ::GetModuleHandle(nullptr), nullptr);
+    }
+    const TestWindow window(hwnd);
+    ASSERT_NE(hwnd, nullptr);
+    ASSERT_TRUE(::SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA));
+    ::ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    CPoint logical_origin(0, 0);
+    CRect logical_client;
+    {
+      const TestDpiContext target(target_context);
+      ASSERT_TRUE(::ClientToScreen(hwnd, &logical_origin));
+      ASSERT_TRUE(::GetClientRect(hwnd, &logical_client));
+    }
+    CPoint physical_origin(0, 0);
+    CRect physical_client;
+    ASSERT_TRUE(::ClientToScreen(hwnd, &physical_origin));
+    ASSERT_TRUE(::GetClientRect(hwnd, &physical_client));
+    ASSERT_GT(logical_client.Width(), 0);
+    const double scale =
+        static_cast<double>(physical_client.Width()) / logical_client.Width();
+    LayoutManager layout;
+    // The expected mapping uses independently measured client origins/sizes,
+    // including points rejected by LogicalToPhysicalPointForPerMonitorDPI.
+    for (const CPoint offset :
+         {CPoint(0, 0), CPoint(84, 50),
+          CPoint(logical_client.Width() - 1, logical_client.Height() - 1),
+          CPoint(-20, -20),
+          CPoint(logical_client.Width() + 20, logical_client.Height() + 20)}) {
+      CPoint result;
+      layout.GetPointInPhysicalCoords(hwnd, logical_origin + offset, &result);
+      EXPECT_NEAR(result.x, physical_origin.x + offset.x * scale, 1.0);
+      EXPECT_NEAR(result.y, physical_origin.y + offset.y * scale, 1.0);
+      EXPECT_TRUE(::AreDpiAwarenessContextsEqual(
+          ::GetThreadDpiAwarenessContext(), caller_context));
+    }
+    ApplicationInfo app_info;
+    AppInfoUtil::SetBasicApplicationInfo(&app_info, hwnd,
+                                         ApplicationInfo::ShowCandidateWindow,
+                                         ApplicationInfo::TSF);
+    AppInfoUtil::SetCompositionTarget(
+        &app_info, 0, logical_origin.x + 84, logical_origin.y + 50, 12,
+        logical_origin.x, logical_origin.y,
+        logical_origin.x + logical_client.Width(),
+        logical_origin.y + logical_client.Height());
+    CandidateWindowLayout candidate;
+    ASSERT_TRUE(layout.LayoutCandidateWindow(app_info, &candidate));
+    EXPECT_NEAR(candidate.position().x, physical_origin.x + 84 * scale, 1.0);
+    EXPECT_NEAR(candidate.position().y, physical_origin.y + 62 * scale, 1.0);
+    EXPECT_NEAR(layout.GetScalingFactor(hwnd), scale, 0.01);
+    EXPECT_TRUE(::AreDpiAwarenessContextsEqual(::GetThreadDpiAwarenessContext(),
+                                               caller_context));
+  }
+  LayoutManager layout;
+  CPoint result;
+  layout.GetPointInPhysicalCoords(nullptr, CPoint(11, 23), &result);
+  EXPECT_EQ(result, CPoint(11, 23));
+  EXPECT_TRUE(::AreDpiAwarenessContextsEqual(::GetThreadDpiAwarenessContext(),
+                                             caller_context));
 }
 
 }  // namespace win32

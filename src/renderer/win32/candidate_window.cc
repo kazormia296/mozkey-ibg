@@ -55,6 +55,7 @@
 #include "renderer/table_layout.h"
 #include "renderer/win32/resource.h"
 #include "renderer/win32/text_renderer.h"
+#include "renderer/win32/vertical_candidate_layout.h"
 #include "renderer/win32/win32_dpi_util.h"
 #include "renderer/win32/win32_renderer_util.h"
 
@@ -65,6 +66,23 @@ namespace {
 
 // layout size constants in pixel unit in the default DPI.
 constexpr int kIndicatorWidthInDefaultDPI = 4;
+
+// Vertical candidate geometry mirrors the native macOS contract.  These are
+// logical pixels at 96 DPI and are scaled with the candidate font DPI.
+constexpr int kVerticalCrossAxisEdgePadding = 2;
+constexpr int kVerticalCandidateGap = 1;
+constexpr int kVerticalCardHorizontalPadding = 2;
+constexpr int kVerticalCardVerticalPadding = 7;
+constexpr int kVerticalShortcutBodyGap = 5;
+constexpr int kVerticalValueDescriptionGap = 12;
+constexpr int kVerticalSuggestionCardVerticalPadding = 4;
+constexpr int kVerticalSuggestionShortcutBodyGap = 3;
+constexpr int kVerticalSuggestionValueDescriptionGap = 7;
+// DrawInformationIcon places the top of a vertical information marker 6 DIP
+// above the candidate bottom. Reserve one additional DIP between text and the
+// marker. This matters for PARTIAL_PREDICTION: it runs prediction-capable
+// rewriters but is presented as the compact SUGGESTION category.
+constexpr int kVerticalInformationMarkerTailReserve = 7;
 
 // DPI-invariant layout size constants in pixel unit.
 constexpr int kWindowBorder = 1;
@@ -101,13 +119,8 @@ COLORREF ToColorRef(const RendererStyle::RGBAColor& color) {
 
 RendererStyleHandler::RendererStyleType GetRendererStyleType(
     const commands::CandidateWindow& candidate_window) {
-  // PREDICTION is the user-visible continuation of suggestion UI, so it uses
-  // the same appearance bucket as SUGGESTION.
-  const bool use_suggestion_style =
-      candidate_window.category() == commands::SUGGESTION ||
-      candidate_window.category() == commands::PREDICTION;
-  return use_suggestion_style ? RendererStyleHandler::RendererStyleType::kSuggestion
-                              : RendererStyleHandler::RendererStyleType::kCandidate;
+  return RendererStyleHandler::GetRendererStyleTypeForCandidateWindow(
+      candidate_window);
 }
 
 RendererStyle GetCurrentRendererStyle(
@@ -169,37 +182,6 @@ COLORREF GetFooterBorderColor(const RendererStyle& style) {
     return ToColorRef(style.footer_border_colors(0));
   }
   return GetFrameColor(style);
-}
-
-int GetWindowCornerRadius(uint32_t dpi,
-                          RendererStyleHandler::RendererStyleType style_type) {
-  const uint32_t logical_radius =
-      RendererStyleHandler::GetCandidateWindowCornerRadius(style_type);
-  if (logical_radius == 0) {
-    return 0;
-  }
-  return static_cast<int>(std::lround(logical_radius *
-                                      GetDPIScalingFactor(dpi)));
-}
-
-void UpdateRoundedWindowRegion(
-    HWND hwnd, const Size& size, uint32_t dpi,
-    RendererStyleHandler::RendererStyleType style_type) {
-  if (hwnd == nullptr || size.width <= 0 || size.height <= 0) {
-    return;
-  }
-
-  const int radius = GetWindowCornerRadius(dpi, style_type);
-  if (radius <= 0) {
-    ::SetWindowRgn(hwnd, nullptr, TRUE);
-    return;
-  }
-  HRGN region =
-      ::CreateRoundRectRgn(0, 0, size.width + 1, size.height + 1,
-                           radius * 2, radius * 2);
-  if (region != nullptr) {
-    ::SetWindowRgn(hwnd, region, TRUE);
-  }
 }
 
 // Returns the smallest index of the given candidate list which satisfies
@@ -346,6 +328,8 @@ CandidateWindow::CandidateWindow()
       footer_logo_display_size_(0, 0),
       send_command_interface_(nullptr),
       table_layout_(std::make_unique<TableLayout>()),
+      vertical_layout_(std::make_unique<VerticalCandidateLayout>()),
+      layout_mode_(LayoutMode::kHorizontal),
       cached_bitmap_size_(0, 0),
       cached_bitmap_valid_(false),
       dpi_(::GetDpiForSystem()),
@@ -353,6 +337,7 @@ CandidateWindow::CandidateWindow()
       indicator_width_(0),
       metrics_changed_(false),
       mouse_moving_(true),
+      post_quit_message_on_destroy_(true),
       renderer_callback_token_(0),
       mouse_down_renderer_callback_token_(0) {
   UpdateDpiDependentResources();
@@ -426,10 +411,12 @@ void CandidateWindow::OnDestroy() {
   mouse_down_renderer_callback_token_ = 0;
   ClearBitmapCache();
   shadow_window_.Destroy();
-  // PostQuitMessage may stop the message loop even though other
-  // windows are not closed. WindowManager should close these windows
-  // before process termination.
-  ::PostQuitMessage(0);
+  // Standalone mozc_renderer.exe uses window destruction to terminate its
+  // message loop. Embedded/in-process rendering manages shutdown explicitly,
+  // so destroying an individual renderer window must not post WM_QUIT.
+  if (post_quit_message_on_destroy_) {
+    ::PostQuitMessage(0);
+  }
 }
 
 BOOL CandidateWindow::OnEraseBkgnd(HDC dc) {
@@ -446,47 +433,301 @@ void CandidateWindow::OnGetMinMaxInfo(MINMAXINFO* min_max_info) {
   SetMsgHandled(TRUE);
 }
 
-void CandidateWindow::HandleMouseEvent(UINT nFlags, const CPoint& point,
-                                       bool close_candidatewindow) {
-  if (send_command_interface_ == nullptr || renderer_callback_token_ == 0) {
-    LOG(ERROR) << "send_command_interface_ is nullptr";
-    return;
+bool CandidateWindow::IsVerticalLayout() const {
+  return layout_mode_ == LayoutMode::kVertical;
+}
+
+bool CandidateWindow::IsLayoutReady() const {
+  if (IsVerticalLayout()) {
+    return vertical_layout_->candidate_count() ==
+           static_cast<size_t>(candidate_window_->candidate_size());
+  }
+  return table_layout_->IsLayoutFrozen();
+}
+
+Rect CandidateWindow::GetCandidateRect(size_t index) const {
+  if (IsVerticalLayout()) {
+    return vertical_layout_->GetCandidateRect(index);
+  }
+  return table_layout_->GetRowRect(index);
+}
+
+Rect CandidateWindow::GetFooterRect() const {
+  if (IsVerticalLayout()) {
+    return vertical_layout_->GetFooterRect();
+  }
+  return table_layout_->GetFooterRect();
+}
+
+Size CandidateWindow::MeasureVerticalFooterSize() const {
+  Size footer_size(0, 0);
+  if (!candidate_window_->has_footer()) {
+    return footer_size;
   }
 
+  if (candidate_window_->footer().has_label() &&
+      ShouldRenderFooterText(candidate_window_->footer().label())) {
+    const std::wstring footer_label =
+        mozc::win32::Utf8ToWide(candidate_window_->footer().label());
+    const Size label_size = text_renderer_->MeasureString(
+        TextRenderer::FONTSET_FOOTER_LABEL, L" " + footer_label + L" ");
+    footer_size.width += label_size.width;
+    footer_size.height = std::max(footer_size.height, label_size.height);
+  } else if (candidate_window_->footer().has_sub_label() &&
+             ShouldRenderFooterText(candidate_window_->footer().sub_label())) {
+    const std::wstring footer_sub_label =
+        mozc::win32::Utf8ToWide(candidate_window_->footer().sub_label());
+    const Size label_size = text_renderer_->MeasureString(
+        TextRenderer::FONTSET_FOOTER_SUBLABEL,
+        L" " + footer_sub_label + L" ");
+    footer_size.width += label_size.width;
+    footer_size.height = std::max(footer_size.height, label_size.height);
+  }
+
+  if (candidate_window_->footer().index_visible()) {
+    const std::wstring index_guide_string =
+        mozc::win32::Utf8ToWide(GetIndexGuideString(*candidate_window_));
+    const Size index_size = text_renderer_->MeasureString(
+        TextRenderer::FONTSET_FOOTER_INDEX, index_guide_string);
+    footer_size.width += index_size.width;
+    footer_size.height = std::max(footer_size.height, index_size.height);
+  }
+
+  if (footer_logo_.is_valid()) {
+    if (candidate_window_->footer().logo_visible()) {
+      footer_size.width += footer_logo_display_size_.width;
+      footer_size.height =
+          std::max(footer_size.height, footer_logo_display_size_.height);
+    } else if (footer_size.height > 0) {
+      footer_size.height =
+          std::max(footer_size.height, footer_logo_display_size_.height);
+    }
+  }
+
+  if (footer_size.height > 0) {
+    footer_size.height += kFooterSeparatorHeight;
+  }
+  return footer_size;
+}
+
+bool CandidateWindow::TryUpdateVerticalLayout() {
+  if (!text_renderer_->SupportsVerticalText(TextRenderer::FONTSET_CANDIDATE)) {
+    return false;
+  }
+
+  std::vector<VerticalCandidateLayout::CandidateMetrics> metrics;
+  metrics.reserve(candidate_window_->candidate_size());
+
+  for (size_t i = 0; i < candidate_window_->candidate_size(); ++i) {
+    const commands::CandidateWindow::Candidate& candidate =
+        candidate_window_->candidate(i);
+    const std::wstring shortcut =
+        GetDisplayStringByColumn(candidate, COLUMN_SHORTCUT);
+    const std::wstring value =
+        GetDisplayStringByColumn(candidate, COLUMN_CANDIDATE);
+    const std::wstring description =
+        GetDisplayStringByColumn(candidate, COLUMN_DESCRIPTION);
+
+    if (!description.empty() &&
+        !text_renderer_->SupportsVerticalText(
+            TextRenderer::FONTSET_DESCRIPTION)) {
+      return false;
+    }
+
+    VerticalCandidateLayout::CandidateMetrics item;
+    if (!shortcut.empty()) {
+      item.shortcut_size =
+          text_renderer_->MeasureString(TextRenderer::FONTSET_SHORTCUT,
+                                        shortcut);
+    }
+    if (!value.empty()) {
+      item.value_size = text_renderer_->MeasureStringVertical(
+          TextRenderer::FONTSET_CANDIDATE, value);
+    }
+    if (!description.empty()) {
+      item.description_size = text_renderer_->MeasureStringVertical(
+          TextRenderer::FONTSET_DESCRIPTION, description);
+    }
+    item.has_information_marker = candidate.has_information_id();
+    metrics.push_back(item);
+  }
+
+  const double dpi_scale = GetDPIScalingFactor(dpi_);
+  const auto scale_metric = [dpi_scale](int value) {
+    return std::max(
+        0, static_cast<int>(std::lround(value * dpi_scale)));
+  };
+
+  const bool is_passive_suggestion =
+      candidate_window_->category() == commands::SUGGESTION;
+
+  VerticalCandidateLayout::Parameters parameters;
+  parameters.window_border = kWindowBorder;
+  parameters.cross_axis_edge_padding =
+      scale_metric(kVerticalCrossAxisEdgePadding);
+  parameters.candidate_gap = scale_metric(kVerticalCandidateGap);
+  parameters.card_horizontal_padding =
+      scale_metric(kVerticalCardHorizontalPadding);
+  parameters.card_vertical_padding =
+      scale_metric(is_passive_suggestion
+                       ? kVerticalSuggestionCardVerticalPadding
+                       : kVerticalCardVerticalPadding);
+  parameters.shortcut_body_gap =
+      scale_metric(is_passive_suggestion
+                       ? kVerticalSuggestionShortcutBodyGap
+                       : kVerticalShortcutBodyGap);
+  parameters.value_description_gap =
+      scale_metric(is_passive_suggestion
+                       ? kVerticalSuggestionValueDescriptionGap
+                       : kVerticalValueDescriptionGap);
+  parameters.information_marker_tail_reserve =
+      scale_metric(kVerticalInformationMarkerTailReserve);
+  parameters.footer_size = MeasureVerticalFooterSize();
+
+  vertical_layout_->Initialize(metrics, parameters);
+  layout_mode_ = LayoutMode::kVertical;
+  return true;
+}
+
+std::optional<int32_t> CandidateWindow::GetCandidateIdAtPoint(
+    const CPoint& point) const {
   (void)GetFocusedArrayIndex(*candidate_window_);
 
   for (size_t i = 0; i < candidate_window_->candidate_size(); ++i) {
     const commands::CandidateWindow::Candidate& candidate =
         candidate_window_->candidate(i);
-
-    const CRect rect = ToCRect(table_layout_->GetRowRect(i));
+    const CRect rect = ToCRect(GetCandidateRect(i));
     if (rect.PtInRect(point)) {
-      commands::SessionCommand command;
-      if (close_candidatewindow) {
-        command.set_type(commands::SessionCommand::SELECT_CANDIDATE);
-      } else {
-        command.set_type(commands::SessionCommand::HIGHLIGHT_CANDIDATE);
-      }
-      command.set_id(candidate.id());
-      command.set_renderer_callback_token(renderer_callback_token_);
-      commands::Output output;
-      send_command_interface_->SendCommand(command, &output);
-      return;
+      return candidate.id();
     }
   }
+  return std::nullopt;
+}
+
+std::optional<CandidateWindow::PressedSuggestionCandidateIdentity>
+CandidateWindow::GetPassiveSuggestionCandidateIdentityAtPoint(
+    const CPoint& point) const {
+  if (candidate_window_->category() != commands::SUGGESTION ||
+      candidate_window_->has_focused_index()) {
+    return std::nullopt;
+  }
+
+  for (size_t i = 0; i < candidate_window_->candidate_size(); ++i) {
+    const auto& candidate = candidate_window_->candidate(i);
+    if (!candidate.has_id()) {
+      continue;
+    }
+    const CRect rect = ToCRect(GetCandidateRect(i));
+    if (rect.PtInRect(point)) {
+      return PressedSuggestionCandidateIdentity{
+          .id = candidate.id(),
+          .value = candidate.value(),
+      };
+    }
+  }
+  return std::nullopt;
+}
+
+bool CandidateWindow::ContainsPassiveSuggestionCandidateIdentity(
+    const commands::CandidateWindow& candidate_window,
+    const PressedSuggestionCandidateIdentity& identity) {
+  if (candidate_window.category() != commands::SUGGESTION ||
+      candidate_window.has_focused_index()) {
+    return false;
+  }
+  for (const auto& candidate : candidate_window.candidate()) {
+    if (candidate.has_id() &&
+        candidate.id() == identity.id &&
+        candidate.value() == identity.value) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void CandidateWindow::SendCandidateCommand(
+    commands::SessionCommand::CommandType type, int32_t candidate_id) {
+  if (send_command_interface_ == nullptr) {
+    LOG(ERROR) << "send_command_interface_ is nullptr";
+    return;
+  }
+  if (renderer_callback_token_ == 0) {
+    // No live RendererCommand authorizes callbacks from this view.
+    return;
+  }
+
+  commands::SessionCommand command;
+  command.set_type(type);
+  command.set_id(candidate_id);
+  command.set_renderer_callback_token(renderer_callback_token_);
+  commands::Output output;
+  send_command_interface_->SendCommand(command, &output);
+}
+
+void CandidateWindow::HandleMouseEvent(UINT nFlags, const CPoint& point,
+                                       bool close_candidatewindow) {
+  const std::optional<int32_t> candidate_id = GetCandidateIdAtPoint(point);
+  if (!candidate_id.has_value()) {
+    return;
+  }
+
+  SendCandidateCommand(
+      close_candidatewindow ? commands::SessionCommand::SELECT_CANDIDATE
+                            : commands::SessionCommand::HIGHLIGHT_CANDIDATE,
+      *candidate_id);
 }
 
 void CandidateWindow::OnLButtonDown(UINT nFlags, CPoint point) {
+  // Bind the whole press/release gesture, including the suggestion gesture
+  // below, to the RendererCommand that populated this view.
   mouse_down_renderer_callback_token_ = renderer_callback_token_;
+  // Suggestion is a sub-mode of COMPOSITION with no focused candidate.
+  // HIGHLIGHT_CANDIDATE calls Session::SelectCandidateInternal(), which
+  // switches the session to CONVERSION.  With the in-process renderer that
+  // round-trip can complete before WM_LBUTTONUP and replace candidate_window_,
+  // causing mouse-up to hit-test an unrelated conversion candidate.
+  //
+  // Do not mutate the session on suggestion mouse-down. Latch both ID and
+  // value so an asynchronous renderer update cannot reuse the integer ID for
+  // a different logical suggestion before mouse-up.
+  if (candidate_window_->category() == commands::SUGGESTION &&
+      !candidate_window_->has_focused_index()) {
+    suggestion_mouse_gesture_active_ = true;
+    pressed_suggestion_candidate_ =
+        GetPassiveSuggestionCandidateIdentityAtPoint(point);
+    return;
+  }
+
+  suggestion_mouse_gesture_active_ = false;
+  pressed_suggestion_candidate_.reset();
   HandleMouseEvent(nFlags, point, false);
 }
 
 void CandidateWindow::OnLButtonUp(UINT nFlags, CPoint point) {
   if (mouse_down_renderer_callback_token_ == 0 ||
       mouse_down_renderer_callback_token_ != renderer_callback_token_) {
+    // The view was repopulated (or made inert) after mouse-down.  Drop the
+    // gesture, including any latched suggestion candidate, instead of
+    // committing against a list the user did not press on.
     mouse_down_renderer_callback_token_ = 0;
+    suggestion_mouse_gesture_active_ = false;
+    pressed_suggestion_candidate_.reset();
     return;
   }
+  if (suggestion_mouse_gesture_active_) {
+    suggestion_mouse_gesture_active_ = false;
+    const std::optional<PressedSuggestionCandidateIdentity> candidate =
+        pressed_suggestion_candidate_;
+    pressed_suggestion_candidate_.reset();
+    mouse_down_renderer_callback_token_ = 0;
+
+    if (candidate.has_value()) {
+      SendCandidateCommand(commands::SessionCommand::SUBMIT_CANDIDATE,
+                           candidate->id);
+    }
+    return;
+  }
+
   HandleMouseEvent(nFlags, point, true);
   mouse_down_renderer_callback_token_ = 0;
 }
@@ -506,44 +747,46 @@ void CandidateWindow::OnMouseMove(UINT nFlags, CPoint point) {
     return;
   }
 
+  // Keep suggestion clicks side-effect free until mouse-up. Update the full
+  // logical identity as drag-and-release moves across the current list.
+  if (suggestion_mouse_gesture_active_) {
+    pressed_suggestion_candidate_ =
+        GetPassiveSuggestionCandidateIdentityAtPoint(point);
+    return;
+  }
+
   HandleMouseEvent(nFlags, point, false);
 }
 
 void CandidateWindow::OnPaint(HDC dc) {
-  CRect client_rect;
-  this->GetClientRect(&client_rect);
-
-  wil::unique_hdc_paint paint_dc;
-  if (dc == nullptr) {
-    paint_dc = wil::BeginPaint(this->m_hWnd);
-  }
-  HDC target_dc = paint_dc.is_valid() ? paint_dc.get() : dc;
-
-  if (BitBltCachedBitmapTo(target_dc, client_rect)) {
+  if (dc != nullptr) {
+    DoPaint(dc, true);
     return;
   }
 
-  // Render to offline bitmap first to avoid tearing.
-  wil::unique_hdc memdc(::CreateCompatibleDC(target_dc));
-  wil::unique_hbitmap bitmap(::CreateCompatibleBitmap(
-      target_dc, client_rect.Width(), client_rect.Height()));
-  wil::unique_select_object old_bitmap =
-      wil::SelectObject(memdc.get(), bitmap.get());
-  DoPaint(memdc.get());
-  ::BitBlt(target_dc, client_rect.left, client_rect.top, client_rect.Width(),
-           client_rect.Height(), memdc.get(), 0, 0, SRCCOPY);
+  // UpdateLayeredWindow owns the on-screen candidate surface. WM_PAINT only
+  // validates the invalid region and re-presents the cache when necessary.
+  wil::unique_hdc_paint paint_dc = wil::BeginPaint(this->m_hWnd);
+  if (!cached_bitmap_valid_ && !RenderToBitmapCache()) {
+    return;
+  }
+  PresentCachedBitmapImmediately();
 }
 
-void CandidateWindow::OnPrintClient(HDC dc, UINT uFlags) { OnPaint(dc); }
+void CandidateWindow::OnPrintClient(HDC dc, UINT /*uFlags*/) {
+  if (dc != nullptr) {
+    DoPaint(dc, true);
+  }
+}
 
 bool CandidateWindow::RenderToBitmapCache() {
   ClearBitmapCache();
 
-  if (!table_layout_->IsLayoutFrozen()) {
+  if (!IsLayoutReady()) {
     return false;
   }
 
-  const Size layout_size = table_layout_->GetTotalSize();
+  const Size layout_size = GetLayoutSize();
   if (layout_size.width <= 0 || layout_size.height <= 0) {
     return false;
   }
@@ -554,47 +797,42 @@ bool CandidateWindow::RenderToBitmapCache() {
   }
 
   wil::unique_hdc memdc(::CreateCompatibleDC(screen_dc));
-  wil::unique_hbitmap bitmap(::CreateCompatibleBitmap(
-      screen_dc, layout_size.width, layout_size.height));
+
+  uint32_t* pixels = nullptr;
+  wil::unique_hbitmap bitmap(CreateRendererLayeredWindowBitmap(
+      screen_dc, layout_size.width, layout_size.height, &pixels));
   ::ReleaseDC(nullptr, screen_dc);
 
-  if (!memdc.is_valid() || !bitmap.is_valid()) {
+  if (!memdc.is_valid() || !bitmap.is_valid() || pixels == nullptr) {
     return false;
   }
 
+  std::fill_n(pixels, static_cast<size_t>(layout_size.width) *
+                          static_cast<size_t>(layout_size.height),
+              0u);
+
   wil::unique_select_object old_bitmap =
       wil::SelectObject(memdc.get(), bitmap.get());
-  DoPaint(memdc.get());
+  DoPaint(memdc.get(), false);
+
+  // GDI may batch writes to a DIB section. Flush before touching the backing
+  // memory directly so the alpha/border pass observes the completed frame.
+  ::GdiFlush();
+
+  const RendererStyleHandler::RendererStyleType style_type =
+      GetRendererStyleType(*candidate_window_);
+  const RendererStyle style = GetCurrentRendererStyle(style_type);
+  const int corner_radius = GetRendererWindowCornerRadiusInPixels(
+      RendererStyleHandler::GetCandidateWindowCornerRadius(style_type), dpi_,
+      layout_size.width, layout_size.height);
+  ApplyRoundedRectAlphaAndBorder(pixels, layout_size.width, layout_size.height,
+                                 corner_radius, kWindowBorder,
+                                 GetFrameColor(style));
 
   cached_bitmap_ = std::move(bitmap);
   cached_bitmap_size_ = layout_size;
   cached_bitmap_valid_ = true;
   return true;
-}
-
-bool CandidateWindow::BitBltCachedBitmapTo(HDC target_dc,
-                                           const RECT& target_rect) const {
-  if (target_dc == nullptr || !cached_bitmap_valid_ ||
-      !cached_bitmap_.is_valid()) {
-    return false;
-  }
-
-  const int width = target_rect.right - target_rect.left;
-  const int height = target_rect.bottom - target_rect.top;
-  if (width <= 0 || height <= 0 || cached_bitmap_size_.width != width ||
-      cached_bitmap_size_.height != height) {
-    return false;
-  }
-
-  wil::unique_hdc memdc(::CreateCompatibleDC(target_dc));
-  if (!memdc.is_valid()) {
-    return false;
-  }
-
-  wil::unique_select_object old_bitmap =
-      wil::SelectObject(memdc.get(), cached_bitmap_.get());
-  return ::BitBlt(target_dc, target_rect.left, target_rect.top, width, height,
-                  memdc.get(), 0, 0, SRCCOPY) != FALSE;
 }
 
 void CandidateWindow::ClearBitmapCache() {
@@ -604,25 +842,23 @@ void CandidateWindow::ClearBitmapCache() {
 }
 
 void CandidateWindow::PresentCachedBitmapImmediately() {
-  if (m_hWnd == nullptr || !::IsWindow(m_hWnd)) {
+  if (m_hWnd == nullptr || !::IsWindow(m_hWnd) || !cached_bitmap_valid_ ||
+      !cached_bitmap_.is_valid() || cached_bitmap_size_.width <= 0 ||
+      cached_bitmap_size_.height <= 0) {
     return;
   }
 
-  RECT client_rect = {};
-  if (!::GetClientRect(m_hWnd, &client_rect)) {
-    return;
-  }
-
-  HDC target_dc = ::GetDC(m_hWnd);
-  if (target_dc == nullptr) {
-    return;
-  }
-
-  BitBltCachedBitmapTo(target_dc, client_rect);
-  ::ReleaseDC(m_hWnd, target_dc);
+  const RendererStyleHandler::RendererStyleType style_type =
+      GetRendererStyleType(*candidate_window_);
+  const RendererStyleHandler::CandidateWindowEffectStyle effect_style =
+      RendererStyleHandler::GetCandidateWindowEffectStyle(style_type);
+  PresentRendererLayeredWindowBitmap(
+      m_hWnd, cached_bitmap_.get(), cached_bitmap_size_.width,
+      cached_bitmap_size_.height,
+      RendererWindowOpacityToAlpha(effect_style.opacity_percent));
 }
 
-void CandidateWindow::DoPaint(HDC dc) {
+void CandidateWindow::DoPaint(HDC dc, bool draw_frame) {
   switch (candidate_window_->category()) {
     case commands::CONVERSION:
     case commands::PREDICTION:
@@ -636,8 +872,8 @@ void CandidateWindow::DoPaint(HDC dc) {
       return;
   }
 
-  if (!table_layout_->IsLayoutFrozen()) {
-    LOG(WARNING) << "Table layout is not frozen.";
+  if (!IsLayoutReady()) {
+    LOG(WARNING) << "Candidate layout is not ready.";
     return;
   }
 
@@ -650,7 +886,9 @@ void CandidateWindow::DoPaint(HDC dc) {
   DrawInformationIcon(dc);
   DrawVScrollBar(dc);
   DrawFooter(dc);
-  DrawFrame(dc);
+  if (draw_frame) {
+    DrawFrame(dc);
+  }
 }
 
 void CandidateWindow::OnShowWindow(BOOL shown, UINT /*status*/) {
@@ -690,8 +928,23 @@ void CandidateWindow::OnSettingChange(UINT uFlags, LPCTSTR /*lpszSection*/) {
 
 void CandidateWindow::UpdateLayout(
     const commands::CandidateWindow& candidates) {
+  UpdateLayout(candidates, LayoutMode::kHorizontal);
+}
+
+void CandidateWindow::UpdateLayout(
+    const commands::CandidateWindow& candidates,
+    LayoutMode requested_layout_mode) {
   ClearBitmapCache();
+
+  if (suggestion_mouse_gesture_active_ &&
+      pressed_suggestion_candidate_.has_value() &&
+      !ContainsPassiveSuggestionCandidateIdentity(
+          candidates, *pressed_suggestion_candidate_)) {
+    pressed_suggestion_candidate_.reset();
+  }
+
   *candidate_window_ = candidates;
+  layout_mode_ = LayoutMode::kHorizontal;
 
   const RendererStyleHandler::RendererStyleType style_type =
       GetRendererStyleType(*candidate_window_);
@@ -717,6 +970,12 @@ void CandidateWindow::UpdateLayout(
       LOG(INFO) << "Unknown candidates category: "
                 << candidate_window_->category();
       return;
+  }
+
+  if (requested_layout_mode == LayoutMode::kVertical &&
+      TryUpdateVerticalLayout()) {
+    RenderToBitmapCache();
+    return;
   }
 
   table_layout_->Initialize(candidate_window_->candidate_size(),
@@ -867,18 +1126,6 @@ void CandidateWindow::UpdateLayout(
   table_layout_->FreezeLayout();
 
   RenderToBitmapCache();
-
-  if (m_hWnd != nullptr) {
-    UpdateRoundedWindowRegion(m_hWnd, table_layout_->GetTotalSize(), dpi_,
-                              GetRendererStyleType(*candidate_window_));
-  }
-}
-
-void CandidateWindow::RedrawImmediately() {
-  if (m_hWnd != nullptr && ::IsWindow(m_hWnd)) {
-    ::RedrawWindow(m_hWnd, nullptr, nullptr,
-                   RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
-  }
 }
 
 void CandidateWindow::UpdateEffectWindows() {
@@ -889,7 +1136,6 @@ void CandidateWindow::UpdateEffectWindows() {
       GetRendererStyleType(*candidate_window_);
   const RendererStyleHandler::CandidateWindowEffectStyle effect_style =
       RendererStyleHandler::GetCandidateWindowEffectStyle(style_type);
-  ApplyRendererWindowOpacity(m_hWnd, effect_style.opacity_percent);
   RECT window_rect = {};
   if (!::GetWindowRect(m_hWnd, &window_rect)) {
     shadow_window_.Hide();
@@ -900,10 +1146,11 @@ void CandidateWindow::UpdateEffectWindows() {
   shadow_style.opacity_percent = effect_style.shadow.opacity_percent;
   shadow_style.angle_degrees = effect_style.shadow.angle_degrees;
   shadow_style.distance = effect_style.shadow.distance;
-  shadow_window_.Update(m_hWnd, window_rect, dpi_,
-                        RendererStyleHandler::GetCandidateWindowCornerRadius(
-                            style_type),
-                        shadow_style);
+  const int corner_radius = GetRendererWindowCornerRadiusInPixels(
+      RendererStyleHandler::GetCandidateWindowCornerRadius(style_type), dpi_,
+      window_rect.right - window_rect.left, window_rect.bottom - window_rect.top);
+  shadow_window_.Update(m_hWnd, window_rect, dpi_, corner_radius, shadow_style,
+                        shadow_z_order_anchor_);
 }
 
 void CandidateWindow::SetSendCommandInterface(
@@ -916,8 +1163,10 @@ void CandidateWindow::SetRendererCallbackToken(uint64_t token) {
 }
 
 Size CandidateWindow::GetLayoutSize() const {
-  DCHECK(table_layout_->IsLayoutFrozen()) << "Table layout is not frozen.";
-
+  DCHECK(IsLayoutReady()) << "Candidate layout is not ready.";
+  if (IsVerticalLayout()) {
+    return vertical_layout_->GetTotalSize();
+  }
   return table_layout_->GetTotalSize();
 }
 
@@ -928,7 +1177,7 @@ Rect CandidateWindow::GetSelectionRectInScreenCord() const {
       focused_array_index < candidate_window_->candidate_size()) {
     (void)candidate_window_->candidate(focused_array_index);
 
-    CRect rect = ToCRect(table_layout_->GetRowRect(focused_array_index));
+    CRect rect = ToCRect(GetCandidateRect(focused_array_index));
     ClientToScreen(&rect);
     return Rect(rect.left, rect.top, rect.Width(), rect.Height());
   }
@@ -937,19 +1186,61 @@ Rect CandidateWindow::GetSelectionRectInScreenCord() const {
 }
 
 Rect CandidateWindow::GetCandidateColumnInClientCord() const {
-  DCHECK(table_layout_->IsLayoutFrozen()) << "Table layout is not frozen.";
-
+  DCHECK(IsLayoutReady()) << "Candidate layout is not ready.";
+  if (IsVerticalLayout()) {
+    const Rect value_rect = vertical_layout_->GetValueRect(0);
+    if (!value_rect.IsRectEmpty()) {
+      return value_rect;
+    }
+    return vertical_layout_->GetCandidateRect(0);
+  }
   return table_layout_->GetCellRect(0, COLUMN_CANDIDATE);
 }
 
 Rect CandidateWindow::GetFirstRowInClientCord() const {
-  DCHECK(table_layout_->IsLayoutFrozen()) << "Table layout is not frozen.";
+  DCHECK(IsLayoutReady()) << "Candidate layout is not ready.";
+  if (IsVerticalLayout()) {
+    DCHECK_GT(vertical_layout_->candidate_count(), 0);
+    return vertical_layout_->GetCandidateRect(0);
+  }
   DCHECK_GT(table_layout_->number_of_rows(), 0)
       << "number of rows should be positive";
   return table_layout_->GetRowRect(0);
 }
 
 void CandidateWindow::DrawCells(HDC dc) {
+  if (IsVerticalLayout()) {
+    for (size_t i = 0; i < candidate_window_->candidate_size(); ++i) {
+      const commands::CandidateWindow::Candidate& candidate =
+          candidate_window_->candidate(i);
+
+      const std::wstring shortcut =
+          GetDisplayStringByColumn(candidate, COLUMN_SHORTCUT);
+      if (!shortcut.empty()) {
+        text_renderer_->RenderText(
+            dc, shortcut, vertical_layout_->GetShortcutRect(i),
+            TextRenderer::FONTSET_SHORTCUT);
+      }
+
+      const std::wstring value =
+          GetDisplayStringByColumn(candidate, COLUMN_CANDIDATE);
+      if (!value.empty()) {
+        text_renderer_->RenderTextVertical(
+            dc, value, vertical_layout_->GetValueRect(i),
+            TextRenderer::FONTSET_CANDIDATE);
+      }
+
+      const std::wstring description =
+          GetDisplayStringByColumn(candidate, COLUMN_DESCRIPTION);
+      if (!description.empty()) {
+        text_renderer_->RenderTextVertical(
+            dc, description, vertical_layout_->GetDescriptionRect(i),
+            TextRenderer::FONTSET_DESCRIPTION);
+      }
+    }
+    return;
+  }
+
   COLUMN_TYPE kColumnTypes[] = {COLUMN_SHORTCUT, COLUMN_CANDIDATE,
                                 COLUMN_DESCRIPTION};
   TextRenderer::FONT_TYPE kFontTypes[] = {TextRenderer::FONTSET_SHORTCUT,
@@ -976,6 +1267,10 @@ void CandidateWindow::DrawCells(HDC dc) {
 }
 
 void CandidateWindow::DrawVScrollBar(HDC dc) {
+  if (IsVerticalLayout()) {
+    return;
+  }
+
   const Rect& vscroll_rect = table_layout_->GetVScrollBarRect();
 
   if (!vscroll_rect.IsRectEmpty() && candidate_window_->candidate_size() > 0) {
@@ -999,6 +1294,10 @@ void CandidateWindow::DrawVScrollBar(HDC dc) {
 }
 
 void CandidateWindow::DrawShortcutBackground(HDC dc) {
+  if (IsVerticalLayout()) {
+    return;
+  }
+
   if (table_layout_->number_of_columns() > 0) {
     Rect shortcut_colmun_rect = table_layout_->GetColumnRect(0);
     if (!shortcut_colmun_rect.IsRectEmpty()) {
@@ -1021,7 +1320,7 @@ void CandidateWindow::DrawShortcutBackground(HDC dc) {
 }
 
 void CandidateWindow::DrawFooter(HDC dc) {
-  const Rect& footer_rect = table_layout_->GetFooterRect();
+  const Rect footer_rect = GetFooterRect();
   if (!candidate_window_->has_footer() || footer_rect.IsRectEmpty()) {
     return;
   }
@@ -1116,7 +1415,7 @@ void CandidateWindow::DrawFooter(HDC dc) {
 }
 
 void CandidateWindow::DrawSelectedRect(HDC dc) {
-  DCHECK(table_layout_->IsLayoutFrozen()) << "Table layout is not frozen.";
+  DCHECK(IsLayoutReady()) << "Candidate layout is not ready.";
 
   const int focused_array_index = GetFocusedArrayIndex(*candidate_window_);
 
@@ -1127,13 +1426,22 @@ void CandidateWindow::DrawSelectedRect(HDC dc) {
     const auto style = GetCurrentRendererStyle(
         GetRendererStyleType(*candidate_window_));
 
-    CRect selected_rect =
-        ToCRect(table_layout_->GetRowRect(focused_array_index));
-
-    selected_rect.DeflateRect(4, 1);
-
-    const int radius = GetWindowCornerRadius(
-        dpi_, GetRendererStyleType(*candidate_window_));
+    CRect selected_rect;
+    int radius = 0;
+    if (IsVerticalLayout()) {
+      // Keep natural candidate cards for text layout, but paint selection as
+      // a full-height stripe to the end of the candidate body.  Focus then
+      // remains visually stable when moving between short and long strings.
+      selected_rect = ToCRect(
+          vertical_layout_->GetCandidateSelectionRect(focused_array_index));
+    } else {
+      selected_rect = ToCRect(GetCandidateRect(focused_array_index));
+      selected_rect.DeflateRect(4, 1);
+      radius = GetRendererWindowCornerRadiusInPixels(
+          RendererStyleHandler::GetCandidateWindowCornerRadius(
+              GetRendererStyleType(*candidate_window_)),
+          dpi_, selected_rect.Width(), selected_rect.Height());
+    }
 
     wil::unique_select_object prev_pen =
         wil::SelectObject(dc, static_cast<HPEN>(::GetStockObject(DC_PEN)));
@@ -1153,17 +1461,24 @@ void CandidateWindow::DrawSelectedRect(HDC dc) {
 }
 
 void CandidateWindow::DrawInformationIcon(HDC dc) {
-  DCHECK(table_layout_->IsLayoutFrozen()) << "Table layout is not frozen.";
+  DCHECK(IsLayoutReady()) << "Candidate layout is not ready.";
   const double scale_factor = GetDPIScalingFactor(dpi_);
   for (size_t i = 0; i < candidate_window_->candidate_size(); ++i) {
     if (candidate_window_->candidate(i).has_information_id()) {
-      CRect rect = ToCRect(table_layout_->GetRowRect(i));
-      rect.left = rect.right - (6.0 * scale_factor);
-      rect.right = rect.right - (2.0 * scale_factor);
-      rect.top += (2.0 * scale_factor);
-      rect.bottom -= (2.0 * scale_factor);
+      CRect rect = ToCRect(GetCandidateRect(i));
+      if (IsVerticalLayout()) {
+        rect.left += (2.0 * scale_factor);
+        rect.right -= (2.0 * scale_factor);
+        rect.top = rect.bottom - (6.0 * scale_factor);
+        rect.bottom -= (2.0 * scale_factor);
+      } else {
+        rect.left = rect.right - (6.0 * scale_factor);
+        rect.right -= (2.0 * scale_factor);
+        rect.top += (2.0 * scale_factor);
+        rect.bottom -= (2.0 * scale_factor);
+      }
       const auto style = GetCurrentRendererStyle(
-        GetRendererStyleType(*candidate_window_));
+          GetRendererStyleType(*candidate_window_));
 
       FillSolidRect(dc, &rect, GetIndicatorColor(style));
       ::SetDCBrushColor(dc, GetIndicatorColor(style));
@@ -1175,7 +1490,7 @@ void CandidateWindow::DrawInformationIcon(HDC dc) {
 void CandidateWindow::DrawBackground(HDC dc) {
   const auto style = GetCurrentRendererStyle(
         GetRendererStyleType(*candidate_window_));
-  const Rect client_rect(Point(0, 0), table_layout_->GetTotalSize());
+  const Rect client_rect(Point(0, 0), GetLayoutSize());
   const CRect client_crect = ToCRect(client_rect);
   FillSolidRect(dc, &client_crect, GetDefaultBackgroundColor(style));
 }
@@ -1183,11 +1498,13 @@ void CandidateWindow::DrawBackground(HDC dc) {
 void CandidateWindow::DrawFrame(HDC dc) {
   const auto style = GetCurrentRendererStyle(
         GetRendererStyleType(*candidate_window_));
-  const Rect client_rect(Point(0, 0), table_layout_->GetTotalSize());
+  const Rect client_rect(Point(0, 0), GetLayoutSize());
   const CRect client_crect = ToCRect(client_rect);
 
-  const int radius = GetWindowCornerRadius(
-        dpi_, GetRendererStyleType(*candidate_window_));
+  const int radius = GetRendererWindowCornerRadiusInPixels(
+      RendererStyleHandler::GetCandidateWindowCornerRadius(
+          GetRendererStyleType(*candidate_window_)),
+      dpi_, client_crect.Width(), client_crect.Height());
 
   wil::unique_select_object prev_pen =
       wil::SelectObject(dc, static_cast<HPEN>(::GetStockObject(DC_PEN)));

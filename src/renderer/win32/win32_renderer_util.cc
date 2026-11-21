@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -48,6 +49,7 @@
 #include "absl/log/log.h"
 #include "base/win32/win_util.h"
 #include "protocol/renderer_command.pb.h"
+#include "renderer/window_effect_util.h"
 
 namespace mozc {
 namespace renderer {
@@ -60,9 +62,6 @@ constexpr wchar_t kRendererShadowWindowClassName[] =
 constexpr uint32_t kDefaultDpi = 96;
 constexpr uint32_t kMinOpacityPercent = 20;
 constexpr uint32_t kMaxOpacityPercent = 100;
-constexpr uint32_t kMaxShadowSize = 96;
-constexpr uint32_t kMaxShadowDistance = 96;
-constexpr uint32_t kMaxShadowOpacityPercent = 100;
 
 LRESULT CALLBACK ShadowWindowProc(HWND hwnd, UINT message, WPARAM wparam,
                                   LPARAM lparam) {
@@ -98,71 +97,27 @@ uint32_t ScaleLogicalPixel(uint32_t value, uint32_t dpi) {
                                                static_cast<int>(value), dpi)));
 }
 
-// Signed distance from a rounded rectangle.  Negative means inside the owner
-// shape.  Positive means outside and is used as the shadow falloff distance.
-double SignedDistanceFromRoundedRect(double x, double y, double width,
-                                     double height, double radius) {
-  radius = std::max(0.0, std::min(radius, std::min(width, height) / 2.0));
-  const double half_width = width / 2.0;
-  const double half_height = height / 2.0;
-  const double qx = std::abs(x - half_width) - (half_width - radius);
-  const double qy = std::abs(y - half_height) - (half_height - radius);
-  const double outside_x = std::max(qx, 0.0);
-  const double outside_y = std::max(qy, 0.0);
-  const double outside_distance =
-      std::sqrt(outside_x * outside_x + outside_y * outside_y);
-  const double inside_distance = std::min(std::max(qx, qy), 0.0);
-  return outside_distance + inside_distance - radius;
+uint8_t ClampToByte(double value) {
+  return static_cast<uint8_t>(
+      std::clamp(std::lround(value), 0l, 255l));
 }
 
-constexpr double kPi = 3.14159265358979323846;
-
-void DrawShadowBitmap(uint32_t* pixels, int width, int height, int owner_width,
-                      int owner_height, int shadow_size, int shadow_dx,
-                      int shadow_dy, int owner_left, int owner_top,
-                      int owner_corner_radius, uint32_t opacity_percent) {
-  if (pixels == nullptr || width <= 0 || height <= 0 || owner_width <= 0 ||
-      owner_height <= 0 || shadow_size <= 0 || opacity_percent == 0) {
+void DrawShadowBitmap(uint32_t* pixels,
+                      const WindowShadowGeometry& geometry,
+                      uint32_t opacity_percent) {
+  if (pixels == nullptr || !geometry.enabled() || opacity_percent == 0) {
     return;
   }
 
-  std::memset(pixels, 0, sizeof(uint32_t) * width * height);
-  const uint32_t max_alpha =
-      std::clamp(opacity_percent, 0u, kMaxShadowOpacityPercent) * 255u / 100u;
-  const double corner_radius = static_cast<double>(owner_corner_radius);
-  const double falloff = static_cast<double>(std::max(1, shadow_size));
-
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      const double owner_x = static_cast<double>(x - owner_left) + 0.5;
-      const double owner_y = static_cast<double>(y - owner_top) + 0.5;
-      const double owner_distance = SignedDistanceFromRoundedRect(
-          owner_x, owner_y, owner_width, owner_height, corner_radius);
-      if (owner_distance <= 0.0) {
-        continue;
-      }
-
-      const double shadow_x =
-          static_cast<double>(x - owner_left - shadow_dx) + 0.5;
-      const double shadow_y =
-          static_cast<double>(y - owner_top - shadow_dy) + 0.5;
-      const double shadow_distance = SignedDistanceFromRoundedRect(
-          shadow_x, shadow_y, owner_width, owner_height, corner_radius);
-
-      double normalized = 0.0;
-      if (shadow_distance > 0.0) {
-        normalized = shadow_distance / falloff;
-      }
-      if (normalized > 1.0) {
-        continue;
-      }
-
-      // A smooth, monotonic falloff avoids the visible seams produced by
-      // independent top/right/bottom/left gradient bands.
-      const double t = 1.0 - std::clamp(normalized, 0.0, 1.0);
-      const uint32_t alpha = static_cast<uint32_t>(std::lround(
-          static_cast<double>(max_alpha) * t * t * (3.0 - 2.0 * t)));
-      pixels[y * width + x] = (alpha << 24);  // PBGRA black.
+  const size_t pixel_count =
+      static_cast<size_t>(geometry.width) * geometry.height;
+  std::memset(pixels, 0, sizeof(uint32_t) * pixel_count);
+  for (int y = 0; y < geometry.height; ++y) {
+    for (int x = 0; x < geometry.width; ++x) {
+      const uint8_t alpha =
+          ComputeWindowShadowAlpha(geometry, x, y, opacity_percent);
+      pixels[static_cast<size_t>(y) * geometry.width + x] =
+          static_cast<uint32_t>(alpha) << 24;  // PBGRA black.
     }
   }
 }
@@ -304,6 +259,24 @@ bool GetWorkingAreaFromPointImpl(const POINT& point, RECT* working_area) {
   return true;
 }
 
+// Keep DPI virtualization local to each API call. Renderer windows remain PMv2.
+class ScopedThreadDpiContext {
+ public:
+  explicit ScopedThreadDpiContext(DPI_AWARENESS_CONTEXT context)
+      : previous_(::SetThreadDpiAwarenessContext(context)) {}
+  ScopedThreadDpiContext(const ScopedThreadDpiContext&) = delete;
+  ScopedThreadDpiContext& operator=(const ScopedThreadDpiContext&) = delete;
+  ~ScopedThreadDpiContext() {
+    if (previous_ != nullptr) {
+      ::SetThreadDpiAwarenessContext(previous_);
+    }
+  }
+  bool valid() const { return previous_ != nullptr; }
+
+ private:
+  DPI_AWARENESS_CONTEXT previous_;
+};
+
 class NativeWindowPositionAPI : public WindowPositionInterface {
  public:
   NativeWindowPositionAPI() = default;
@@ -338,6 +311,11 @@ class NativeWindowPositionAPI : public WindowPositionInterface {
     // DPI-unaware process are logical coordinates.  You can copy these
     // coordinates to a DPI-aware process and convert them to physical screen
     // coordinates by LogicalToPhysicalPoint API.
+    const ScopedThreadDpiContext context(
+        ::GetWindowDpiAwarenessContext(root_window_handle));
+    if (!context.valid()) {
+      return false;
+    }
     *physical_coordinate = logical_coordinate;
 
     // Despite its name, LogicalToPhysicalPoint API no longer converts
@@ -350,7 +328,15 @@ class NativeWindowPositionAPI : public WindowPositionInterface {
 
   // This method is not const to implement Win32WindowInterface.
   virtual bool GetWindowRect(HWND window_handle, RECT* rect) {
-    return (::GetWindowRect(window_handle, rect) != FALSE);
+    const ScopedThreadDpiContext context(
+        ::GetWindowDpiAwarenessContext(window_handle));
+    return context.valid() && ::GetWindowRect(window_handle, rect) != FALSE;
+  }
+
+  bool GetWindowRectInPhysicalCoords(HWND window_handle, RECT* rect) override {
+    const ScopedThreadDpiContext context(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    return context.valid() && ::GetWindowRect(window_handle, rect) != FALSE;
   }
 
   // This method is not const to implement Win32WindowInterface.
@@ -686,6 +672,170 @@ bool GetWorkingAreaFromPoint(const POINT& point, RECT* working_area) {
   return GetWorkingAreaFromPointImpl(point, working_area);
 }
 
+BYTE RendererWindowOpacityToAlpha(uint32_t opacity_percent) {
+  const uint32_t clamped =
+      std::clamp(opacity_percent, kMinOpacityPercent, kMaxOpacityPercent);
+  return static_cast<BYTE>(clamped * 255u / 100u);
+}
+
+int GetRendererWindowCornerRadiusInPixels(uint32_t logical_radius, uint32_t dpi,
+                                          int width, int height) {
+  if (logical_radius == 0 || width <= 0 || height <= 0) {
+    return 0;
+  }
+  const int scaled_radius =
+      std::max(0, ScaleLogicalPixel(static_cast<int>(logical_radius), dpi));
+  return std::min(scaled_radius, std::min(width, height) / 2);
+}
+
+HBITMAP CreateRendererLayeredWindowBitmap(HDC reference_dc, int width,
+                                          int height, uint32_t** pixels) {
+  if (pixels == nullptr) {
+    return nullptr;
+  }
+  *pixels = nullptr;
+  if (reference_dc == nullptr || width <= 0 || height <= 0) {
+    return nullptr;
+  }
+
+  BITMAPINFO bitmap_info = {};
+  bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+  bitmap_info.bmiHeader.biWidth = width;
+  bitmap_info.bmiHeader.biHeight = -height;  // top-down DIB
+  bitmap_info.bmiHeader.biPlanes = 1;
+  bitmap_info.bmiHeader.biBitCount = 32;
+  bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+  void* bits = nullptr;
+  HBITMAP bitmap = ::CreateDIBSection(reference_dc, &bitmap_info, DIB_RGB_COLORS,
+                                      &bits, nullptr, 0);
+  if (bitmap == nullptr || bits == nullptr) {
+    if (bitmap != nullptr) {
+      ::DeleteObject(bitmap);
+    }
+    return nullptr;
+  }
+
+  *pixels = static_cast<uint32_t*>(bits);
+  return bitmap;
+}
+
+bool PresentRendererLayeredWindowBitmap(HWND hwnd, HBITMAP bitmap, int width,
+                                        int height, BYTE opacity) {
+  if (hwnd == nullptr || !::IsWindow(hwnd) || bitmap == nullptr || width <= 0 ||
+      height <= 0) {
+    return false;
+  }
+
+  RECT window_rect = {};
+  if (!::GetWindowRect(hwnd, &window_rect)) {
+    return false;
+  }
+
+  HDC screen_dc = ::GetDC(nullptr);
+  if (screen_dc == nullptr) {
+    return false;
+  }
+  HDC memory_dc = ::CreateCompatibleDC(screen_dc);
+  if (memory_dc == nullptr) {
+    ::ReleaseDC(nullptr, screen_dc);
+    return false;
+  }
+
+  HGDIOBJ old_bitmap = ::SelectObject(memory_dc, bitmap);
+  if (old_bitmap == nullptr || old_bitmap == HGDI_ERROR) {
+    ::DeleteDC(memory_dc);
+    ::ReleaseDC(nullptr, screen_dc);
+    return false;
+  }
+
+  POINT destination = {window_rect.left, window_rect.top};
+  POINT source = {0, 0};
+  SIZE size = {width, height};
+  BLENDFUNCTION blend = {AC_SRC_OVER, 0, opacity, AC_SRC_ALPHA};
+  const BOOL updated = ::UpdateLayeredWindow(
+      hwnd, screen_dc, &destination, &size, memory_dc, &source, 0, &blend,
+      ULW_ALPHA);
+  const DWORD update_error = updated ? ERROR_SUCCESS : ::GetLastError();
+
+  ::SelectObject(memory_dc, old_bitmap);
+  ::DeleteDC(memory_dc);
+  ::ReleaseDC(nullptr, screen_dc);
+
+  if (!updated) {
+    LOG(ERROR) << "UpdateLayeredWindow failed. Error: " << update_error;
+    return false;
+  }
+  return true;
+}
+
+void ApplyRoundedRectAlphaAndBorder(uint32_t* pixels, int width, int height,
+                                    int corner_radius, int border_width,
+                                    COLORREF border_color) {
+  if (pixels == nullptr || width <= 0 || height <= 0) {
+    return;
+  }
+
+  const double outer_width = static_cast<double>(width);
+  const double outer_height = static_cast<double>(height);
+  const double radius = std::clamp(
+      static_cast<double>(corner_radius), 0.0,
+      std::min(outer_width, outer_height) / 2.0);
+  const double border = std::clamp(
+      static_cast<double>(border_width), 0.0,
+      std::min(outer_width, outer_height) / 2.0);
+  const double inner_width = std::max(0.0, outer_width - border * 2.0);
+  const double inner_height = std::max(0.0, outer_height - border * 2.0);
+  const double inner_radius = std::max(0.0, radius - border);
+
+  const double border_r = static_cast<double>(GetRValue(border_color));
+  const double border_g = static_cast<double>(GetGValue(border_color));
+  const double border_b = static_cast<double>(GetBValue(border_color));
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const double pixel_x = static_cast<double>(x) + 0.5;
+      const double pixel_y = static_cast<double>(y) + 0.5;
+      const double outer_coverage = RoundedRectCoverage(
+          pixel_x, pixel_y, outer_width, outer_height, radius);
+
+      double inner_coverage = 0.0;
+      if (border <= 0.0) {
+        inner_coverage = outer_coverage;
+      } else if (inner_width > 0.0 && inner_height > 0.0) {
+        inner_coverage = RoundedRectCoverage(
+            pixel_x - border, pixel_y - border, inner_width, inner_height,
+            inner_radius);
+        // Numerical noise must never make the nested inner shape cover more
+        // than the outer shape.
+        inner_coverage = std::min(inner_coverage, outer_coverage);
+      }
+
+      const double border_coverage = outer_coverage - inner_coverage;
+      const uint32_t source = pixels[y * width + x];
+      const double source_r = static_cast<double>((source >> 16) & 0xff);
+      const double source_g = static_cast<double>((source >> 8) & 0xff);
+      const double source_b = static_cast<double>(source & 0xff);
+
+      // PBGRA stores color channels already multiplied by alpha. The source
+      // candidate surface is opaque before this pass, so the two coverages can
+      // directly weight the content and analytical border colors.
+      const uint8_t alpha = ClampToByte(outer_coverage * 255.0);
+      const uint8_t red = ClampToByte(source_r * inner_coverage +
+                                      border_r * border_coverage);
+      const uint8_t green = ClampToByte(source_g * inner_coverage +
+                                        border_g * border_coverage);
+      const uint8_t blue = ClampToByte(source_b * inner_coverage +
+                                       border_b * border_coverage);
+
+      pixels[y * width + x] =
+          (static_cast<uint32_t>(alpha) << 24) |
+          (static_cast<uint32_t>(red) << 16) |
+          (static_cast<uint32_t>(green) << 8) | static_cast<uint32_t>(blue);
+    }
+  }
+}
+
 std::unique_ptr<WindowPositionEmulator> WindowPositionEmulator::Create() {
   return std::make_unique<WindowPositionEmulatorImpl>();
 }
@@ -717,10 +867,9 @@ void ApplyRendererWindowOpacity(HWND hwnd, uint32_t opacity_percent) {
   if (hwnd == nullptr) {
     return;
   }
-  opacity_percent = std::clamp(opacity_percent, kMinOpacityPercent,
-                               kMaxOpacityPercent);
+  const BYTE alpha = RendererWindowOpacityToAlpha(opacity_percent);
   LONG_PTR ex_style = ::GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-  if (opacity_percent >= 100) {
+  if (alpha >= 255) {
     if ((ex_style & WS_EX_LAYERED) != 0) {
       ::SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_LAYERED);
       ::RedrawWindow(hwnd, nullptr, nullptr,
@@ -732,8 +881,6 @@ void ApplyRendererWindowOpacity(HWND hwnd, uint32_t opacity_percent) {
   if ((ex_style & WS_EX_LAYERED) == 0) {
     ::SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED);
   }
-  const BYTE alpha = static_cast<BYTE>(
-      std::clamp(opacity_percent * 255u / 100u, 1u, 255u));
   ::SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
 }
 
@@ -753,8 +900,9 @@ void RendererShadowWindow::Hide() {
 }
 
 bool RendererShadowWindow::Update(HWND owner_window, const RECT& owner_rect,
-                                  uint32_t dpi, uint32_t owner_corner_radius,
-                                  const RendererWindowShadowStyle& style) {
+                                  uint32_t dpi, int owner_corner_radius_pixels,
+                                  const RendererWindowShadowStyle& style,
+                                  HWND z_order_anchor_window) {
   if (owner_window == nullptr || !::IsWindow(owner_window) ||
       !::IsWindowVisible(owner_window)) {
     Hide();
@@ -764,12 +912,12 @@ bool RendererShadowWindow::Update(HWND owner_window, const RECT& owner_rect,
   const int owner_width = owner_rect.right - owner_rect.left;
   const int owner_height = owner_rect.bottom - owner_rect.top;
   const uint32_t logical_shadow_size =
-      std::clamp(style.size, 0u, kMaxShadowSize);
+      std::clamp(style.size, 0u, kMaxWindowShadowSize);
   const uint32_t logical_shadow_distance =
-      std::clamp(style.distance, 0u, kMaxShadowDistance);
+      std::clamp(style.distance, 0u, kMaxWindowShadowDistance);
   const uint32_t shadow_angle = style.angle_degrees % 360u;
   const uint32_t shadow_opacity =
-      std::clamp(style.opacity_percent, 0u, kMaxShadowOpacityPercent);
+      std::clamp(style.opacity_percent, 0u, kMaxWindowShadowOpacityPercent);
   if (owner_width <= 0 || owner_height <= 0 || logical_shadow_size == 0 ||
       shadow_opacity == 0) {
     Hide();
@@ -795,23 +943,10 @@ bool RendererShadowWindow::Update(HWND owner_window, const RECT& owner_rect,
       ScaleLogicalPixel(logical_shadow_size, dpi));
   const int shadow_distance = static_cast<int>(
       ScaleLogicalPixel(logical_shadow_distance, dpi));
-  const double radians = static_cast<double>(shadow_angle) * kPi / 180.0;
-  const int shadow_dx =
-      static_cast<int>(std::lround(std::cos(radians) * shadow_distance));
-  const int shadow_dy =
-      static_cast<int>(std::lround(std::sin(radians) * shadow_distance));
-  const int left_margin = shadow_size + std::max(-shadow_dx, 0);
-  const int right_margin = shadow_size + std::max(shadow_dx, 0);
-  const int top_margin = shadow_size + std::max(-shadow_dy, 0);
-  const int bottom_margin = shadow_size + std::max(shadow_dy, 0);
-  const int corner_radius = static_cast<int>(
-      ScaleLogicalPixel(std::min(owner_corner_radius,
-                                 static_cast<uint32_t>(std::min(owner_width,
-                                                                owner_height) / 2)),
-                        dpi));
-  const int width = owner_width + left_margin + right_margin;
-  const int height = owner_height + top_margin + bottom_margin;
-  if (width <= 0 || height <= 0) {
+  const WindowShadowGeometry geometry = ComputeWindowShadowGeometry(
+      owner_width, owner_height, shadow_size, shadow_distance, shadow_angle,
+      owner_corner_radius_pixels);
+  if (!geometry.enabled()) {
     Hide();
     return true;
   }
@@ -826,34 +961,22 @@ bool RendererShadowWindow::Update(HWND owner_window, const RECT& owner_rect,
     return false;
   }
 
-  BITMAPINFO bitmap_info = {};
-  bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
-  bitmap_info.bmiHeader.biWidth = width;
-  bitmap_info.bmiHeader.biHeight = -height;  // top-down DIB
-  bitmap_info.bmiHeader.biPlanes = 1;
-  bitmap_info.bmiHeader.biBitCount = 32;
-  bitmap_info.bmiHeader.biCompression = BI_RGB;
-
-  void* bits = nullptr;
-  HBITMAP bitmap = ::CreateDIBSection(screen_dc, &bitmap_info, DIB_RGB_COLORS,
-                                      &bits, nullptr, 0);
-  if (bitmap == nullptr || bits == nullptr) {
-    if (bitmap != nullptr) {
-      ::DeleteObject(bitmap);
-    }
+  uint32_t* pixels = nullptr;
+  HBITMAP bitmap = CreateRendererLayeredWindowBitmap(
+      screen_dc, geometry.width, geometry.height, &pixels);
+  if (bitmap == nullptr || pixels == nullptr) {
     ::DeleteDC(memory_dc);
     ::ReleaseDC(nullptr, screen_dc);
     return false;
   }
 
-  DrawShadowBitmap(static_cast<uint32_t*>(bits), width, height, owner_width,
-                   owner_height, shadow_size, shadow_dx, shadow_dy, left_margin,
-                   top_margin, corner_radius, shadow_opacity);
+  DrawShadowBitmap(pixels, geometry, shadow_opacity);
 
   HGDIOBJ old_bitmap = ::SelectObject(memory_dc, bitmap);
-  POINT dst = {owner_rect.left - left_margin, owner_rect.top - top_margin};
+  POINT dst = {owner_rect.left - geometry.left_margin,
+               owner_rect.top - geometry.top_margin};
   POINT src = {0, 0};
-  SIZE size = {width, height};
+  SIZE size = {geometry.width, geometry.height};
   BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
   const BOOL updated = ::UpdateLayeredWindow(hwnd_, screen_dc, &dst, &size,
                                              memory_dc, &src, 0, &blend,
@@ -869,8 +992,21 @@ bool RendererShadowWindow::Update(HWND owner_window, const RECT& owner_rect,
     return false;
   }
 
-  ::SetWindowPos(hwnd_, owner_window, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  HWND z_order_anchor = owner_window;
+  if (z_order_anchor_window != nullptr &&
+      ::IsWindow(z_order_anchor_window) &&
+      ::IsWindowVisible(z_order_anchor_window)) {
+    z_order_anchor = z_order_anchor_window;
+  }
+  if (!::SetWindowPos(
+          hwnd_, z_order_anchor, 0, 0, 0, 0,
+          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+    const DWORD error = ::GetLastError();
+    LOG(ERROR) << "SetWindowPos failed for renderer shadow Z-order. Error: "
+               << error;
+    Hide();
+    return false;
+  }
   return true;
 }
 
@@ -881,6 +1017,21 @@ IndicatorWindowLayout::IndicatorWindowLayout() : is_vertical(false) {
 void IndicatorWindowLayout::Clear() {
   is_vertical = false;
   ::SetRect(&window_rect, 0, 0, 0, 0);
+}
+
+bool WindowPositionInterface::GetWindowRectInPhysicalCoords(HWND window_handle,
+                                                            RECT* rect) {
+  CRect logical;
+  CPoint top_left;
+  CPoint bottom_right;
+  if (rect == nullptr || !GetWindowRect(window_handle, &logical) ||
+      !LogicalToPhysicalPoint(window_handle, logical.TopLeft(), &top_left) ||
+      !LogicalToPhysicalPoint(window_handle, logical.BottomRight(),
+                              &bottom_right)) {
+    return false;
+  }
+  *rect = CRect(top_left, bottom_right);
+  return true;
 }
 
 void LayoutManager::GetPointInPhysicalCoords(HWND window_handle,
@@ -895,13 +1046,30 @@ void LayoutManager::GetPointInPhysicalCoords(HWND window_handle,
     return;
   }
 
-  // LogicalToPhysicalPoint API failed for some reason.
-  // Emulate the result based on the scaling factor.
-  const HWND root_window_handle =
-      window_position_->GetRootWindow(window_handle);
-  const double scale_factor = GetScalingFactor(root_window_handle);
-  result->x = point.x * scale_factor;
-  result->y = point.y * scale_factor;
+  // The native API rejects points outside the root window. Use an affine
+  // mapping anchored at that window, not at the primary monitor's (0, 0).
+  // This also handles monitors with negative/nonzero screen origins.
+  *result = point;
+  const HWND root = window_position_->GetRootWindow(window_handle);
+  CRect logical;
+  CRect physical;
+  if (!window_position_->GetWindowRect(root, &logical) ||
+      !window_position_->GetWindowRectInPhysicalCoords(root, &physical)) {
+    return;
+  }
+  const bool use_width = logical.Width() > logical.Height();
+  const int logical_extent = use_width ? logical.Width() : logical.Height();
+  const int physical_extent = use_width ? physical.Width() : physical.Height();
+  if (logical_extent <= 0 || physical_extent <= 0) {
+    return;
+  }
+  const double scale = static_cast<double>(physical_extent) / logical_extent;
+  result->x = physical.left +
+              static_cast<LONG>(std::lround(
+                  (static_cast<double>(point.x) - logical.left) * scale));
+  result->y =
+      physical.top + static_cast<LONG>(std::lround(
+                         (static_cast<double>(point.y) - logical.top) * scale));
 }
 
 void LayoutManager::GetRectInPhysicalCoords(HWND window_handle,
@@ -920,6 +1088,83 @@ void LayoutManager::GetRectInPhysicalCoords(HWND window_handle,
   GetPointInPhysicalCoords(window_handle, CPoint(rect.right, rect.bottom),
                            &bottom_right);
   *result = CRect(top_left, bottom_right);
+}
+
+bool LayoutManager::GetCompositionTargetInPhysicalCoords(
+    const commands::RendererCommand_ApplicationInfo& app_info,
+    uint32_t fallback_line_height, POINT* top_left, int* line_height) const {
+  if (top_left == nullptr || line_height == nullptr) {
+    return false;
+  }
+  *top_left = POINT{};
+  *line_height = 0;
+
+  if (!app_info.has_target_window_handle() ||
+      app_info.target_window_handle() == 0 ||
+      !app_info.has_composition_target()) {
+    return false;
+  }
+
+  const commands::RendererCommand::CharacterPosition& target =
+      app_info.composition_target();
+  if (!target.has_top_left() || !IsValidPoint(target.top_left())) {
+    return false;
+  }
+
+  const uint32_t logical_line_height =
+      target.has_line_height() ? target.line_height() : fallback_line_height;
+  if (logical_line_height == 0 ||
+      logical_line_height >
+          static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+
+  const int64_t logical_x = target.top_left().x();
+  const int64_t logical_y = target.top_left().y();
+  int64_t extent_x = logical_x;
+  int64_t extent_y = logical_y;
+  const bool is_vertical =
+      target.has_vertical_writing() && target.vertical_writing();
+  if (is_vertical) {
+    extent_x -= logical_line_height;
+  } else {
+    extent_y += logical_line_height;
+  }
+
+  constexpr int64_t kIntMin = std::numeric_limits<int>::min();
+  constexpr int64_t kIntMax = std::numeric_limits<int>::max();
+  if (extent_x < kIntMin || extent_x > kIntMax || extent_y < kIntMin ||
+      extent_y > kIntMax) {
+    return false;
+  }
+
+  const HWND target_window =
+      WinUtil::DecodeWindowHandle(app_info.target_window_handle());
+  CPoint physical_top_left;
+  GetPointInPhysicalCoords(
+      target_window,
+      CPoint(static_cast<int>(logical_x), static_cast<int>(logical_y)),
+      &physical_top_left);
+  CPoint physical_extent;
+  GetPointInPhysicalCoords(
+      target_window,
+      CPoint(static_cast<int>(extent_x), static_cast<int>(extent_y)),
+      &physical_extent);
+
+  int64_t physical_line_height =
+      is_vertical
+          ? static_cast<int64_t>(physical_top_left.x) - physical_extent.x
+          : static_cast<int64_t>(physical_extent.y) - physical_top_left.y;
+  if (physical_line_height < 0) {
+    physical_line_height = -physical_line_height;
+  }
+  if (physical_line_height <= 0 || physical_line_height > kIntMax) {
+    return false;
+  }
+
+  *top_left = physical_top_left;
+  *line_height = static_cast<int>(physical_line_height);
+  return true;
 }
 
 LayoutManager::LayoutManager()
@@ -996,20 +1241,11 @@ double LayoutManager::GetScalingFactor(HWND window_handle) const {
     return kDefaultValue;
   }
 
-  CPoint top_left_in_physical_coord;
-  if (!window_position_->LogicalToPhysicalPoint(
-          window_handle, window_rect_in_logical_coord.TopLeft(),
-          &top_left_in_physical_coord)) {
+  CRect window_rect_in_physical_coord;
+  if (!window_position_->GetWindowRectInPhysicalCoords(
+          window_handle, &window_rect_in_physical_coord)) {
     return kDefaultValue;
   }
-  CPoint bottom_right_in_physical_coord;
-  if (!window_position_->LogicalToPhysicalPoint(
-          window_handle, window_rect_in_logical_coord.BottomRight(),
-          &bottom_right_in_physical_coord)) {
-    return kDefaultValue;
-  }
-  const CRect window_rect_in_physical_coord(top_left_in_physical_coord,
-                                            bottom_right_in_physical_coord);
 
   if (window_rect_in_physical_coord == window_rect_in_logical_coord) {
     // No scaling.

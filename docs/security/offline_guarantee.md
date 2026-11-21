@@ -45,10 +45,19 @@ with the runtime through localhost only.
 
 ### macOS Zenz path
 
-macOS packages contain the arm64 scorer, GGUF model, and pinned CPU/Accelerate
-`llama-server` inside the signed package payload. Release CI loads the real
-model before signing and the scorer communicates with the runtime through
-localhost only.
+Since the sync to upstream Mozkey v1.0.0, macOS packages contain upstream
+Mozkey's runtime under `MozkeyIbG.app/Contents/Resources/ZenzRuntime` inside
+the signed package payload: the Universal `mozc_zenz_scorer` and
+`mozc_zenz_guard` helpers, the source-pinned and patched Universal
+`llama-server` (llama.cpp v0.7.0), the unmodified GGUF model, and
+`BUILD-CONTRACT.txt`. The converter talks to the scorer over a per-user Unix
+domain socket in a Mozkey IbG-specific directory
+(`/tmp/mozkey-ibg_zenz_<uid>`), never over the network, and the scorer
+communicates with `llama-server` through localhost only. `mozc_zenz_guard`
+supervises the worker so it exits when the scorer goes away. Release CI
+verifies the embedded build contract and completes a real inference request
+through the packaged scorer before signing
+(`src/mac/installer/zenz_runtime/verify_release_package.zsh`).
 
 ### Linux Zenz path
 
@@ -119,10 +128,15 @@ do not import common networking DLLs such as:
 - dnsapi.dll
 
 `mozc_zenz_scorer.exe` is a narrow local-only exception. It may import
-`winhttp.dll` only to call the bundled `llama-server.exe` through a
-`127.0.0.1` localhost endpoint. It must not use WinHTTP for external network
-access, must not use a release-build environment override for the runtime or
-model path, and must not expose the local inference endpoint externally.
+`winhttp.dll` to request inference from the bundled `llama-server.exe` on
+`127.0.0.1`, and `ws2_32.dll` to bind `127.0.0.1:0` temporarily for selecting
+a non-fixed loopback port. These exceptions apply only to the scorer; all
+other prohibited DLLs remain denied, including those imported by other Mozc
+runtime binaries. The scorer must not contact external hosts, accept a
+release-build environment override for runtime/model paths, or expose the
+inference endpoint externally. DLL import checks alone cannot prove this:
+installed-MSI loopback and connection audits remain required (see the
+release checklist).
 
 The check is implemented by:
 
@@ -168,10 +182,26 @@ The rules target Mozc executable files such as:
 - mozc_renderer.exe
 - mozc_broker.exe
 - mozc_cache_service.exe
+- mozc_zenz_scorer.exe
+- llama-server.exe
 
 The rules are outbound-only. They are removed during uninstall. Firewall rule
 creation and removal are best-effort operations; installation and uninstall do
 not fail solely because local policy rejects firewall changes.
+
+All seven rules must exist against the actual installed executable paths.
+With the rules enabled, the scorer-to-llama localhost path must still work,
+scorer-owned `llama-server.exe` must listen on loopback only, and the Zenz
+scorer / llama processes must have no non-loopback TCP connection; uninstall
+must remove the rules. Upstream Mozkey enforces this with a native ARM64
+installed-MSI CI gate. Mozkey IbG CI currently covers the MSI payload
+(`tools/release/check_windows_msi_offline.ps1`), the loopback-only listener of
+the packaged runtime (`tools/release/probe_windows_zenz_runtime.ps1`), and the
+firewall custom-action unit tests; the installed-MSI firewall and connection
+audit is not yet ported to the Mozkey IbG runtime and remains a manual
+release-checklist item
+(`.github/scripts/windows_zenz_arm64_installer_lifecycle_audit.ps1` carries
+the Mozkey IbG rule names for that port).
 
 The TIP DLL is not managed by a firewall rule because Windows Firewall program
 rules are executable-oriented. Instead, TIP DLL network capability is checked by

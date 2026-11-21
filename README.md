@@ -61,6 +61,11 @@ Mozkeyの由来やフォーク元のcreditを置き換えるものではあり�
 Mozkey自体はgoogle/mozcを基盤としているため、Mozcとそのコントリビューターへの
 著作権表示、ライセンス、attributionも引き続き保持します。
 
+現在のMozkey IbGは、フォーク元の**Mozkey v1.0.0**に追従しています。Mozkey v1.0.0までの
+変換・学習・UIの機能、修正、既定値を取り込んだうえで、Mozkey IbG固有の製品識別子、
+Grimodex連携、Linux / Fcitx5対応、セキュリティ強化を重ねています。Mozkey IbG自体の
+release versionはフォーク元とは独立しており、`src/version.bzl`で管理します。
+
 ## 名称と識別子
 
 | 用途 | 表記 |
@@ -177,10 +182,15 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
 ### ライブ変換と入力補助
 
 - 入力後の短いdelayを調整できるライブ変換
-- 変換前の読みを表示するruby風overlay（Windows）／候補欄上部表示（Linux Fcitx5）
+- 変換前の読みを表示するruby風overlay（Windows / macOS）／候補欄上部表示（Linux Fcitx5）
 - 最小文字数、装飾記号、入力途中の口語表現を考慮した過剰変換の抑制
 - ライブ変換を使わない場合の、初回変換操作での候補window表示
 - 曖昧なローマ字規則でも入力途中を表示できるオプション
+- カスタムローマ字テーブルの1規則あたりの出力をUTF-8で1024 bytes未満まで拡張
+  （入力・次入力は従来どおり300 bytes未満）
+- 「郵便番号変換」有効時に、`1000001`のようなハイフンなし7桁からも住所候補を取得。
+  ライブ変換ONでは数字表記を第1候補に保ち、住所は後続候補として残す
+- 日付・曜日の変換候補と、日常語彙・固有名詞・口語表現の補強
 
 ### 文脈を使った変換
 
@@ -194,6 +204,13 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
 - llama.cpp / `llama-server`を使うローカル推論
 - 外部AI serviceに入力を送らず、platformごとに分離したlocal helperで補正
 - delay、最小文字数、device、profile / topic / styleなどを設定可能
+- 通常のライブ変換結果を先に表示する方式に加え、Zenzの応答を一定時間待ってから
+  表示する方式も選択可能
+- Zenz候補が通常Mozc結果の明白な先頭・末尾の欠落になっている場合は拒否してMozc結果へ
+  戻す保護と、採用前にMozcで逆変換して読みを照合する「厳密な読み保持（実験的）」
+- 「Zenz学習（Mozc変換履歴）」と「Zenz学習（補正フィードバック）」を独立して設定
+- 短い読みではZenz feedbackを自動適用しない制限（既定ON、最小読み文字数7文字）。
+  記録は継続し、明示的な手動blockは読みの長さにかかわらず有効
 - accepted / rejected feedback、明示block、検索、import / export、削除UI
 - 通常Mozc候補を削除せず、local feedbackを保守的に順位へ反映
 
@@ -202,18 +219,50 @@ sudo env PREFIX=/usr ../scripts/install_mozkey_linux_bazel
 - 句読点・記号を入力した時点で未確定文字列を確定するオプション
 - 変換cancel後にそのまま確定したひらがな表記の学習
 - 確定直後のBackspace、Cancel、Undoを考慮した履歴学習の取り消し
+- 入力途中のサジェストを明示的に選んで確定した場合の、全文の読みと文節単位の学習
 - 1つのkeyへ`Commit → IMEOff`のような複数commandを順序付きで割り当て
+- 待機stepを挟める遅延command列と、手動Zenz補正command
+  （`ForceZenzLiveCorrection`、feedbackを無視する
+  `ForceZenzLiveCorrectionWithoutFeedback`）
+- 「ライブ変換中」（`LiveConversion`）と「Zenz補正中」（`ZenzConversion`）専用のkeymap状態
+- 選択中の候補を履歴から削除、または候補一覧から非表示にする`DeleteSelectedCandidate`
+  （標準keymapではPrediction / Conversionの`Ctrl+Delete`）
+- 顔文字・絵文字候補が選択履歴によって第1候補へ上がらないようにする抑制
+  （候補自体は第2候補以下に残る）
 - Windowsで選択文字列をSpace再変換するMS-IME風設定
-- 左右Shift / Ctrlの個別割り当て
+- 左右Shift / Ctrlの個別割り当て（Windows）
+- Shiftなどによる一時英数字入力から、`IMEOn`で未確定文字列を保ったままひらがなへ復帰
+  （Windows）
+- 変換中に別の文節区切りへ順に切り替える`CycleSegmentation` shortcut
+  （Mozkey IbG固有。標準では`Ctrl+Shift+Space`に割り当て済みで、設定画面の
+  Mozkey IbG tabから無効化可能）
 
-### Windows UI
+### Windows / macOS UI
 
-- 候補、suggest、ruby表示のlight / dark / custom theme
-- 色、font、size、corner radius、opacity、shadowの調整
-- 未確定文字の文字色、背景色、下線色の設定
-- IME mode indicatorのlight / dark theme追従
-- 既定IMEの設定と以前の設定へのrestore
-- 既定・monochrome black・monochrome whiteのIME icon
+- 候補、suggest、ruby表示のlight / dark / 自動（system themeに追従）/ custom theme。
+  新規設定では3項目とも「自動」が既定（Windows / macOS）
+- 色、size、corner radius、opacity、shadowの調整（Windows / macOS）。fontと文字の太さは
+  Windowsで調整可能
+- 未確定文字の近くに「入力中・Mozc・Zenz処理中・Zenz適用済み」を表示する
+  変換状態indicator（Windows / macOS）。配色・形状・位置を調整可能。macOSの新しい
+  indicatorは実機検証が未完了
+- 縦書き対応（Windows / macOS）: 候補、suggest、用例、rubyを縦組みに合わせて配置し、
+  対応するkeymapでは矢印keyを視覚方向に合わせて解釈。横書きの既存動作は維持
+- 未確定文字の文字色、背景色、下線色の設定と、変換規則の途中にある未確定ローマ字を
+  薄く表示するopt-in設定（Windows）
+- IME mode indicatorのlight / dark theme追従（Windows）
+- 既定IMEの設定と以前の設定へのrestore（Windows）
+- 既定・monochrome black・monochrome whiteのIME icon（Windows）
+- Windows Searchなどのimmersive TSF環境で、候補、suggest、rubyがhostの背面へ
+  隠れないようにする表示経路
+- TSF input scopeの`IS_PRIVATE`（Chrome Incognito、Edge InPrivateなど）を
+  private inputとして扱い、既存履歴の読み取りは維持したままMozc履歴とZenz feedbackへの
+  新規書き込みを停止。入力mode iconとindicatorに盾を重ねて表示
+
+各機能の詳細な仕様は、フォーク元
+[Mozkey v1.0.0のREADME](https://github.com/koyasi777/mozkey/blob/v1.0.0/README.md)
+にまとまっています。ただし、そこに書かれたdownload・install手順と製品識別子は
+フォーク元Mozkeyのものであり、Mozkey IbGには適用されません。
 
 ### Grimodex連携
 
@@ -239,6 +288,8 @@ Mozkey IbGは、通常のIME利用時に入力内容を外部Internet serviceへ
 - Windows向けにnetwork DLL import / string markerの検査toolと、Firewall ruleを確認する
   release checklistを提供
 - secure inputではsurrounding textを送らない
+- Secret / Incognito modeではZenz feedbackの参照と記録を停止し、WindowsのTSF
+  `IS_PRIVATE`では既存の学習を読み取り専用として新規の永続的な学習書き込みを停止
 
 localhost内部通信は、外部Internet通信とは別のローカルprocess境界として使用します。
 また、dependency、dictionary source、toolchainの取得を伴うbuild・test・release処理では
@@ -357,6 +408,12 @@ as part of the full lineage.
 `Integrated by Grimodex` credits the integration and maintenance performed in
 this downstream fork; it does not replace Mozkey's origin or upstream credit.
 
+Mozkey IbG currently tracks upstream **Mozkey v1.0.0**. It adopts the
+conversion, learning, and UI features, fixes, and defaults up to that release,
+and layers the Mozkey IbG product identity, Grimodex integration, Linux / Fcitx5
+support, and security hardening on top. Mozkey IbG keeps its own release version,
+independent of upstream, in `src/version.bzl`.
+
 ### Project identity
 
 | Purpose | Name |
@@ -425,14 +482,48 @@ for exact dependencies, attestation, rollback, and uninstall behavior.
 
 ### Highlights
 
-- Debounced live conversion with a Windows ruby overlay or Fcitx5 reading display
-- Local Zenz inference without an external AI service
+- Debounced live conversion with a Windows / macOS ruby overlay or Fcitx5
+  reading display
+- Local Zenz inference without an external AI service, shown either after the
+  immediate Mozc live conversion or after briefly waiting for Zenz
+- Obvious-omission guards that fall back to the Mozc result, plus an
+  experimental strict reading-preservation check before a Zenz result is adopted
 - Context-aware ranking while preserving user-dictionary and mixed-script forms
-- Conservative local feedback learning and explicit feedback management
-- Direct punctuation commit, multi-command key bindings, and correction-aware history
-- Configurable Windows candidate, suggestion, ruby, preedit, icon, and mode UI
+- Conservative local feedback learning and explicit feedback management, with
+  independent switches for Mozc-history learning and Zenz feedback, and no
+  automatic feedback reuse for short readings (on by default, minimum 7
+  characters)
+- Learning of complete readings and segment preferences from explicitly accepted
+  suggestions
+- Direct punctuation commit, multi-command key bindings with delay steps, manual
+  Zenz correction commands, dedicated `LiveConversion` / `ZenzConversion` keymap
+  states, and correction-aware history
+- Deleting a selected candidate from history or hiding it
+  (`DeleteSelectedCandidate`, `Ctrl+Delete` in the default keymaps), and keeping
+  emoticon and emoji candidates out of the top position
+- Hyphenless seven-digit postal-code conversion, custom romaji-table outputs up
+  to 1023 UTF-8 bytes per rule, and extended date and weekday candidates
+- Configurable candidate, suggestion, and ruby appearance on Windows and macOS
+  (light / dark / system / custom; new profiles default to system), plus
+  Windows font, preedit, pending-romaji dimming, icon, and mode UI
+- A conversion-status indicator on Windows and macOS (Reading, Mozc, Zenz
+  processing, Zenz applied); the new macOS indicator has not yet been verified
+  on native hardware
+- Vertical-writing layouts for candidate, suggestion, infolist, and ruby windows
+  on Windows and macOS, with keymap navigation that follows the visual direction
+- Windows Search / immersive TSF host support, TSF `IS_PRIVATE` private-input
+  handling that stops new history and feedback writes, and returning to hiragana
+  from temporary ASCII input with `IMEOn`
+- A `CycleSegmentation` shortcut that steps through alternative segmentations
+  during conversion (Mozkey IbG only; bound to `Ctrl+Shift+Space` by default and
+  switchable on the Mozkey IbG tab of the configuration tool)
 - Safe Grimodex project dictionaries with secure-input boundaries
 - Pinned public dictionary profile separated from local-evaluation data
+
+The detailed behavior of the inherited features is documented in the upstream
+[Mozkey v1.0.0 README](https://github.com/koyasi777/mozkey/blob/v1.0.0/README.md).
+Its download and installation instructions and product identifiers describe
+upstream Mozkey and do not apply to Mozkey IbG.
 
 Mozkey IbG aims to keep normal IME input off external Internet services. Local
 Zenz uses a loopback endpoint as an internal process boundary; build and release

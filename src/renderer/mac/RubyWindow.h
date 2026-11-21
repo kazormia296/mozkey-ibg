@@ -30,9 +30,11 @@
 #ifndef MOZC_RENDERER_MAC_RUBY_WINDOW_H_
 #define MOZC_RENDERER_MAC_RUBY_WINDOW_H_
 
+#include <cstdint>
 #include <string>
 
 #include "renderer/mac/RendererBaseWindow.h"
+#include "renderer/mac/mac_writing_direction.h"
 
 namespace mozc {
 namespace commands {
@@ -49,7 +51,15 @@ class RubyWindow : public RendererBaseWindow {
   RubyWindow &operator=(const RubyWindow &) = delete;
   ~RubyWindow() override;
 
+  void SetWritingDirection(WritingDirection writing_direction);
   bool Update(const commands::RendererCommand &command);
+
+  // Returns the scaled distance between the composition text and ruby window.
+  int32_t GetCompositionGap() const;
+
+  // Returns the vertical-writing inset from the ruby window's top edge to the
+  // Core Text frame that contains the first ruby glyph.
+  int32_t GetTextTopOffset() const;
 
  private:
   void InitWindow() override;
@@ -57,6 +67,10 @@ class RubyWindow : public RendererBaseWindow {
 
   bool BuildReadingText(const commands::RendererCommand &command,
                         std::string *reading) const;
+
+  WritingDirection writing_direction_ = WritingDirection::kHorizontal;
+  int32_t composition_gap_ = 4;
+  int32_t text_top_offset_ = 0;
 };
 
 }  // namespace mac

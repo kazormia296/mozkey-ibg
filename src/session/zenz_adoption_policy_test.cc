@@ -63,6 +63,209 @@ ProtectedConversionSpan BuildSpan(
   return span;
 }
 
+TEST(ZenzAdoptionPolicyTest, ClassifiesNumericLiteralSurfaces) {
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("1"),
+            ProtectedConversionSpan::Tier::kNumericLiteral);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("100"),
+            ProtectedConversionSpan::Tier::kNumericLiteral);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("-3"),
+            ProtectedConversionSpan::Tier::kNumericLiteral);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("+2"),
+            ProtectedConversionSpan::Tier::kNumericLiteral);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("3.14"),
+            ProtectedConversionSpan::Tier::kNumericLiteral);
+
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("Windows11"),
+            ProtectedConversionSpan::Tier::kIdentityCritical);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("GPT-5"),
+            ProtectedConversionSpan::Tier::kIdentityCritical);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("UTF-8"),
+            ProtectedConversionSpan::Tier::kIdentityCritical);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("C++17"),
+            ProtectedConversionSpan::Tier::kIdentityCritical);
+  EXPECT_EQ(ClassifyProtectedAsciiSurface("1.2.3"),
+            ProtectedConversionSpan::Tier::kIdentityCritical);
+}
+
+TEST(ZenzAdoptionPolicyTest, DoesNotPlaceholderNumericLiteral) {
+  ZenzAdoptionPolicy policy;
+  ZenzProtectedPromptInput input;
+  input.key = "1にちめのかれはてんてきです";
+  input.protected_spans = {
+      BuildSpan("1", "1", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false),
+  };
+
+  const ZenzProtectedPromptResult prompt = policy.ProtectPromptKey(input);
+  EXPECT_EQ(prompt.placeholder_count, 0);
+  EXPECT_EQ(prompt.key, "1にちめのかれはてんてきです");
+  ASSERT_EQ(prompt.protected_spans.size(), 1);
+  EXPECT_TRUE(prompt.protected_spans[0].placeholder.empty());
+}
+
+TEST(ZenzAdoptionPolicyTest, AcceptsNumericLiteralWithJapaneseContext) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "1にちめのかれはてんてきです";
+  input.mozc_value = "1日目の彼は点滴です";
+  input.zenz_value = "1日目の彼は天敵です";
+  input.protected_spans = {
+      BuildSpan("1", "1", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "1日目の彼は天敵です");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsNumericJapaneseNeighborToSymbol) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "100えん";
+  input.mozc_value = "100円";
+  input.zenz_value = "100¥";
+  input.protected_spans = {
+      BuildSpan("100", "100", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.value, "100円");
+  EXPECT_EQ(result.reason, "protected_numeric_literal_context_changed");
+}
+
+TEST(ZenzAdoptionPolicyTest, AcceptsNumericJapaneseNeighborRewrite) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "すまーとふぉん1だい";
+  input.mozc_value = "スマートフォン1代";
+  input.zenz_value = "スマートフォン1台";
+  input.protected_spans = {
+      BuildSpan("1", "1", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "スマートフォン1台");
+}
+
+TEST(ZenzAdoptionPolicyTest, AcceptsNumericBetweenJapaneseCharacters) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "だい1かいのしけん";
+  input.mozc_value = "第1回の試験";
+  input.zenz_value = "第1回のテスト";
+  input.protected_spans = {
+      BuildSpan("1", "1", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "第1回のテスト");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsNumericSymbolNeighborChange) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "100%せいこう";
+  input.mozc_value = "100%成功";
+  input.zenz_value = "100$成功";
+  input.protected_spans = {
+      BuildSpan("100", "100", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.reason, "protected_numeric_literal_context_changed");
+}
+
+TEST(ZenzAdoptionPolicyTest, AcceptsDecimalWithJapaneseContext) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "3.14ばいではたりない";
+  input.mozc_value = "3.14倍では足りない";
+  input.zenz_value = "3.14倍では不足です";
+  input.protected_spans = {
+      BuildSpan("3.14", "3.14",
+                ProtectedConversionSpan::Tier::kNumericLiteral, false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "3.14倍では不足です");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsNumericDelimiterChange) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "2026/09/23にじっし";
+  input.mozc_value = "2026/09/23に実施";
+  input.zenz_value = "2026-09-23に実施";
+  input.protected_spans = {
+      BuildSpan("2026", "2026",
+                ProtectedConversionSpan::Tier::kNumericLiteral, false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.reason, "protected_numeric_literal_context_changed");
+}
+
+TEST(ZenzAdoptionPolicyTest, PreservesRepeatedNumericContextsIndependently) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "2にちとHTTP/2";
+  input.mozc_value = "2日とHTTP/2";
+  input.zenz_value = "2台とHTTP/2";
+  ProtectedConversionSpan span =
+      BuildSpan("2", "2", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false);
+  span.required_occurrences = 2;
+  input.protected_spans = {span};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "2台とHTTP/2");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsRepeatedNumericTechnicalDelimiterChange) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "2にちとHTTP/2";
+  input.mozc_value = "2日とHTTP/2";
+  input.zenz_value = "2台とHTTP 2";
+  ProtectedConversionSpan span =
+      BuildSpan("2", "2", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false);
+  span.required_occurrences = 2;
+  input.protected_spans = {span};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.reason, "protected_numeric_literal_context_changed");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsChangedNumericLiteral) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "100えん";
+  input.mozc_value = "100円";
+  input.zenz_value = "百円";
+  input.protected_spans = {
+      BuildSpan("100", "100", ProtectedConversionSpan::Tier::kNumericLiteral,
+                false),
+  };
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.reason, "protected_numeric_literal_not_preserved");
+}
+
 TEST(ZenzAdoptionPolicyTest, ProtectPromptKeyAndRestorePlaceholder) {
   ZenzAdoptionPolicy policy;
   ZenzProtectedPromptInput input;
@@ -181,7 +384,6 @@ TEST(ZenzAdoptionPolicyTest, UserPreferredJapaneseSurfaceIsGuardedOnOutputSide) 
   EXPECT_EQ(result.value, "彼は辞書語の天敵です");
 }
 
-
 TEST(ZenzAdoptionPolicyTest, ProtectPromptKeyHandlesRepeatedSurface) {
   ZenzAdoptionPolicy policy;
   ZenzProtectedPromptInput input;
@@ -235,7 +437,6 @@ TEST(ZenzAdoptionPolicyTest, RepairsIdentityCriticalKanaSurface) {
   EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptWithRepair);
   EXPECT_EQ(result.value, "Mozkeyを使用しています");
 }
-
 
 TEST(ZenzAdoptionPolicyTest, AcceptsJapaneseUserDictionarySurfaceWithParticle) {
   ZenzAdoptionPolicy policy;
@@ -377,6 +578,142 @@ TEST(ZenzAdoptionPolicyTest, DoesNotRepairShortAsciiSurface) {
 
   const ZenzAdoptionResult result = policy.Decide(input);
   EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsUnsafeTransitionWithoutBaselineSegments) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "とうきょう";
+  input.mozc_value = "東京";
+  input.zenz_value = "Tokyo";
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.value, "東京");
+  EXPECT_EQ(result.reason,
+            "orthographic_transition_missing_baseline_segments");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsUnsafeTransitionWithStaleBaselineSegments) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "とうきょう";
+  input.mozc_value = "東京";
+  input.zenz_value = "Tokyo";
+  input.baseline_segments = {{"とうきょう", "大阪"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.value, "東京");
+  EXPECT_EQ(result.reason,
+            "orthographic_transition_stale_baseline_segments");
+}
+
+TEST(ZenzAdoptionPolicyTest, AllowsJapaneseRewriteWithoutBaselineSegments) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "てんてき";
+  input.mozc_value = "点滴";
+  input.zenz_value = "天敵";
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "天敵");
+}
+
+TEST(ZenzAdoptionPolicyTest, RepairsNewAlphabeticSurfacePerSegment) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "とうきょうにてんてき";
+  input.mozc_value = "東京に点滴";
+  input.zenz_value = "Tokyoに天敵";
+  input.baseline_segments = {
+      {"とうきょう", "東京"}, {"に", "に"}, {"てんてき", "点滴"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptWithRepair);
+  EXPECT_EQ(result.value, "東京に天敵");
+  EXPECT_EQ(result.reason, "orthographic_transition_repaired");
+}
+
+TEST(ZenzAdoptionPolicyTest, PreservesExistingLatinSurface) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "ぎっとはぶをつかう";
+  input.mozc_value = "GitHubを使う";
+  input.zenz_value = "GitHubを使用する";
+  input.baseline_segments = {{"ぎっとはぶをつかう", "GitHubを使う"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "GitHubを使用する");
+}
+
+TEST(ZenzAdoptionPolicyTest, PreservesMozcSelectedLatinBaseline) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "とうきょうにいく";
+  input.mozc_value = "Tokyoにいく";
+  input.zenz_value = "Tokyoに行く";
+  input.baseline_segments = {{"とうきょうにいく", "Tokyoにいく"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "Tokyoに行く");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsUnprojectableNewAlphabeticSurface) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "とうきょうおおさか";
+  input.mozc_value = "東京大阪";
+  input.zenz_value = "TokyoOsaka";
+  input.baseline_segments = {{"とうきょう", "東京"}, {"おおさか", "大阪"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.value, "東京大阪");
+  EXPECT_EQ(result.reason, "orthographic_transition_projection_failed");
+}
+
+TEST(ZenzAdoptionPolicyTest, AllowsUnprojectableJapaneseOnlyRewrite) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "とうきょうおおさか";
+  input.mozc_value = "東京大阪";
+  input.zenz_value = "首都関西";
+  input.baseline_segments = {{"とうきょう", "東京"}, {"おおさか", "大阪"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kAcceptAsIs);
+  EXPECT_EQ(result.value, "首都関西");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsMissingPhrasePrefixWithoutReverseCost) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "いっしょにいって";
+  input.mozc_value = "一緒に行って";
+  input.zenz_value = "行って";
+  input.baseline_segments = {{"いっしょに", "一緒に"}, {"いって", "行って"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.value, "一緒に行って");
+  EXPECT_EQ(result.reason, "obvious_surface_truncation");
+}
+
+TEST(ZenzAdoptionPolicyTest, RejectsOtherObservedOmission) {
+  ZenzAdoptionPolicy policy;
+  ZenzAdoptionInput input;
+  input.key = "なんとかなる";
+  input.mozc_value = "何とかなる";
+  input.zenz_value = "なる";
+  input.baseline_segments = {{"なんとか", "何とか"}, {"なる", "なる"}};
+
+  const ZenzAdoptionResult result = policy.Decide(input);
+  EXPECT_EQ(result.action, ZenzAdoptionResult::Action::kReject);
+  EXPECT_EQ(result.reason, "obvious_surface_truncation");
 }
 
 }  // namespace

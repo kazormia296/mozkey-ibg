@@ -2,19 +2,29 @@ package(default_visibility = ["//visibility:public"])
 
 _TARGET_COMPATIBLE_WITH = ["@platforms//os:windows"]
 
+# The arm64/ and x64/ llama-server.exe files and the un-normalized model are
+# the upstream Mozkey lock-pinned reference assets (see
+# WINDOWS_ZENZ_RUNTIME_CONTRACT.md and //zenz_runtime:llama_runtime.lock.json).
+# They are exported for the upstream lock/audit tooling only; the Mozkey IbG
+# installer consumes the generated filegroups below instead.
 exports_files([
+    "arm64/llama-server.exe",
+    "x64/llama-server.exe",
+    "models/zenz-v3.2-small-Q5_K_M.gguf",
     "licenses/THIRD_PARTY_NOTICES.md",
     "licenses/Apache-2.0.txt",
     "licenses/cpp-httplib-MIT.txt",
     "licenses/llama.cpp-MIT.txt",
     "licenses/nlohmann-json-MIT.txt",
     "licenses/zenz-v3.2-small-gguf.txt",
+    "WINDOWS_ZENZ_RUNTIME_CONTRACT.md",
 ])
 
 # Release inputs are generated from the checksum-pinned upstream source by
-# tools/release/prepare_windows_zenz_runtime.py.  Do not fall back to the
-# historical root-level PE files: their exact source revision/toolchain is not
-# known, and all of them are x86-64.
+# tools/release/prepare_windows_zenz_runtime.py.  Do not fall back to
+# checked-in PE files (the historical root-level binaries were removed; the
+# x64/ and arm64/ upstream reference binaries above are not built by this
+# project's release pipeline).
 filegroup(
     name = "llama_server",
     srcs = select({

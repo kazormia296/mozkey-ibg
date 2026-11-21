@@ -5,4 +5,5 @@
    Created by Jun Mukai on 09/09/15.
    Copyright 2009 Google Inc. All rights reserved.
  */
-CFBundleName = "Mozkey IbG の削除";
+CFBundleName = "${CF_BUNDLE_NAME_JA} の削除";
+CFBundleDisplayName = "${CF_BUNDLE_NAME_JA} の削除";

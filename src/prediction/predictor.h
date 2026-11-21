@@ -74,6 +74,9 @@ class Predictor : public PredictorInterface {
   // Reverts the last Finish operation.
   void Revert(uint32_t revert_id) override;
 
+  // Discards only rollback metadata for a confirmed Finish operation.
+  void DiscardRevert(uint32_t revert_id) override;
+
   // Clears all history data of UserHistoryPredictor.
   bool ClearAllHistory() override;
 
@@ -112,7 +115,8 @@ class Predictor : public PredictorInterface {
 
   // The results with WEAK_USER_HISTORY_PREDICTION are demoted so that they
   // are not ranked at the top.
-  static void DemoteWeakUserHistory(absl::Span<Result> results);
+  static void DemoteWeakUserHistory(const ConversionRequest& request,
+                                    absl::Span<Result> results);
 
   // Shared by dictionary_predictor and user_history_predictor.
   std::unique_ptr<RealtimeDecoder> realtime_decoder_;

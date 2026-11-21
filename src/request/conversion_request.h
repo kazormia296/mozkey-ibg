@@ -41,8 +41,10 @@
 
 #include "absl/base/attributes.h"
 #include "absl/log/check.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/string_view.h"
 #include "base/strings/assign.h"
+#include "base/strings/japanese.h"
 #include "base/util.h"
 #include "composer/composer.h"
 #include "config/config_handler.h"
@@ -177,9 +179,7 @@ class ConversionRequest {
   }
   // Returns options by value. Cheap to copy and avoids reference lifetime
   // issues.
-  Options options() const {
-    return options_;
-  }
+  Options options() const { return options_; }
   const prediction::Result& history_result() const
       ABSL_ATTRIBUTE_LIFETIME_BOUND {
     return *history_result_;
@@ -231,6 +231,29 @@ class ConversionRequest {
   // Returns the cost of the history if defined.
   int converter_history_cost() const { return history_result_->cost; }
 
+  // Returns normalized preceding and following surrounding context text.
+  // First: preceding context (left)
+  // Second: following context (right)
+  std::pair<std::string, std::string> GetSurroundingContext() const {
+    absl::string_view left_context_view = context_->preceding_text();
+    const auto lpos = left_context_view.find_last_of("\r\n");
+    if (lpos != absl::string_view::npos) {
+      left_context_view.remove_prefix(lpos + 1);
+    }
+    absl::string_view right_context_view = context_->following_text();
+    const auto rpos = right_context_view.find_first_of("\r\n");
+    if (rpos != absl::string_view::npos) {
+      right_context_view.remove_suffix(right_context_view.size() - rpos);
+    }
+    std::string left_context =
+        japanese::FullWidthAsciiToHalfWidthAscii(left_context_view);
+    std::string right_context =
+        japanese::FullWidthAsciiToHalfWidthAscii(right_context_view);
+    absl::StripAsciiWhitespace(&left_context);
+    absl::StripAsciiWhitespace(&right_context);
+    return std::make_pair(std::move(left_context), std::move(right_context));
+  }
+
   // Builder can access the private member for construction.
   friend class ConversionRequestBuilder;
 
@@ -275,6 +298,54 @@ class ConversionRequestBuilder {
       request_.key_ =
           GetKey(*request_.composer_data_, request_.options_.request_type,
                  request_.options_.composer_key_selection);
+    }
+
+    // Platform-private input is write-protected, not incognito. Preserve
+    // existing user history and user dictionary reads, but prevent this input
+    // from creating new Mozc history. Keep the policy request-local so the
+    // shared Config is never mutated.
+    if (request_.context().is_private_input() &&
+        request_.config().history_learning_level() ==
+            config::Config::DEFAULT_HISTORY) {
+      config::Config private_config = TrimConfig(request_.config());
+      private_config.set_history_learning_level(config::Config::READ_ONLY);
+      request_.config_.copy_from(private_config);
+    }
+
+    // Populate decoupled ConversionOptions fields from commands::Request and
+    // config::Config.
+    request_.options_.incognito_mode = request_.incognito_mode();
+    // SetOptions() replaces options_ wholesale, so the project dictionary
+    // pinned by this request is (re)published here.
+    request_.options_.project_dictionary = request_.project_dictionary_.get();
+    request_.options_.kana_modifier_insensitive_conversion =
+        request_.IsKanaModifierInsensitiveConversion();
+    request_.options_.use_spelling_correction =
+        request_.config().use_spelling_correction();
+    request_.options_.use_zip_code_conversion =
+        request_.config().use_zip_code_conversion();
+    // Allow postal aliases for full conversion requests, including live
+    // conversion. Lattice lookup enforces left ASCII-alphanumeric boundaries;
+    // prediction and realtime predictor conversion remain excluded.
+    request_.options_.enable_hyphenless_zipcode_alias =
+        request_.options_.use_zip_code_conversion &&
+        request_.options_.request_type == RequestType::CONVERSION &&
+        !request_.options_.used_in_predictor_realtime_conversion;
+    request_.options_.use_t13n_conversion =
+        request_.config().use_t13n_conversion();
+    if (request_.config().preedit_method() == config::Config::ROMAN) {
+      request_.options_.input_mode = ConversionOptions::InputMode::ROMAN;
+    } else {
+      request_.options_.input_mode = ConversionOptions::InputMode::KANA;
+    }
+    request_.options_.particle_omission_transition_cost_bonus =
+        request_.request()
+            .decoder_experiment_params()
+            .particle_omission_transition_cost_bonus();
+    if (request_.request()
+            .decoder_experiment_params()
+            .suppress_realtime_conversion_with_converter()) {
+      request_.options_.use_actual_converter_for_realtime_conversion = false;
     }
     return request_;
   }

@@ -285,12 +285,30 @@ bool FindMozkeyZenzRuntimeProcessGroups(uid_t uid,
     return false;
   }
 
-  constexpr char kScorerPath[] =
+  // Exact Mozkey IbG executable paths only; never a basename match, so an
+  // upstream Mozkey runtime running side by side is not signalled.  The
+  // ZenzRuntime entries are the bundled runtime layout; the Converter.app
+  // entries are the layout of Mozkey IbG v0.10.x and earlier.
+  static constexpr const char *kRuntimePaths[] = {
       "/Library/Input Methods/MozkeyIbG.app/Contents/Resources/"
-      "MozkeyIbGConverter.app/Contents/Resources/mozc_zenz_scorer";
-  constexpr char kLlamaServerPath[] =
+      "ZenzRuntime/mozc_zenz_scorer",
       "/Library/Input Methods/MozkeyIbG.app/Contents/Resources/"
-      "MozkeyIbGConverter.app/Contents/Resources/llama-server";
+      "ZenzRuntime/mozc_zenz_guard",
+      "/Library/Input Methods/MozkeyIbG.app/Contents/Resources/"
+      "ZenzRuntime/llama-server",
+      "/Library/Input Methods/MozkeyIbG.app/Contents/Resources/"
+      "MozkeyIbGConverter.app/Contents/Resources/mozc_zenz_scorer",
+      "/Library/Input Methods/MozkeyIbG.app/Contents/Resources/"
+      "MozkeyIbGConverter.app/Contents/Resources/llama-server",
+  };
+  const auto is_runtime_path = [](const std::string &path) {
+    for (const char *runtime_path : kRuntimePaths) {
+      if (path == runtime_path) {
+        return true;
+      }
+    }
+    return false;
+  };
   const pid_t uninstaller_process_group = getpgrp();
   for (const pid_t pid : pids) {
     if (pid <= 0) {
@@ -298,8 +316,7 @@ bool FindMozkeyZenzRuntimeProcessGroups(uid_t uid,
     }
     char path[PROC_PIDPATHINFO_MAXSIZE] = {};
     if (proc_pidpath(pid, path, sizeof(path)) <= 0 ||
-        (std::string(path) != kScorerPath &&
-         std::string(path) != kLlamaServerPath)) {
+        !is_runtime_path(path)) {
       continue;
     }
     const pid_t process_group = getpgid(pid);

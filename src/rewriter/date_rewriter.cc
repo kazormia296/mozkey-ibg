@@ -62,6 +62,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "base/clock.h"
+#include "base/date_util.h"
 #include "base/japanese_util.h"
 #include "base/number_util.h"
 #include "base/strings/unicode.h"
@@ -76,6 +77,7 @@
 #include "protocol/commands.pb.h"
 #include "protocol/config.pb.h"
 #include "request/conversion_request.h"
+#include "request/options.h"
 #include "rewriter/rewriter_interface.h"
 
 namespace mozc {
@@ -94,8 +96,10 @@ enum {
 constexpr DateRewriter::DateData kDateData[] = {
     // Date rewrites.
     {"きょう", "今日", "今日の日付", 0, DATE},
+    {"ほんじつ", "本日", "今日の日付", 0, DATE},
     {"あした", "明日", "明日の日付", 1, DATE},
     {"あす", "明日", "明日の日付", 1, DATE},
+    {"みょうにち", "明日", "明日の日付", 1, DATE},
     {"さくじつ", "昨日", "昨日の日付", -1, DATE},
     {"きのう", "昨日", "昨日の日付", -1, DATE},
     {"おととい", "一昨日", "2日前の日付", -2, DATE},
@@ -146,10 +150,6 @@ constexpr DateRewriter::DateData kDateData[] = {
     // Date and time rewrites.
     {"にちじ", "日時", "現在の日時", 0, DATE_AND_CURRENT_TIME},
     {"なう", "ナウ", "現在の日時", 0, DATE_AND_CURRENT_TIME}};
-
-// Absl::Weekday starts from Monday, while std::tm.tm_wday starts from Sunday.
-constexpr absl::string_view kWeekDayString[] = {"月", "火", "水", "木",
-                                                "金", "土", "日"};
 
 constexpr absl::string_view kDateDescription = "日付";
 constexpr absl::string_view kTimeDescription = "時刻";
@@ -563,6 +563,7 @@ std::string GetDescription(absl::string_view era, absl::string_view year,
                            : absl::StrCat(era, year);
 }
 
+// Extracts era year information from `key`.
 bool ExtractYearFromKey(const YearData& year_data, const absl::string_view key,
                         int* year, bool* has_suffix_out,
                         std::string* description) {
@@ -928,8 +929,8 @@ std::vector<std::string> GetConversions(
         results.push_back(
             absl::StrFormat("%s年%d月%d日", era[0], cm.month(), cm.day()));
       }
-      const int weekday = static_cast<int>(absl::GetWeekday(cm));
-      results.push_back(absl::StrFormat("%s曜日", kWeekDayString[weekday]));
+      results.push_back(absl::StrFormat(
+          "%s曜日", date_util::GetShortWeekdayString(absl::GetWeekday(cm))));
       break;
     }
 
@@ -973,6 +974,63 @@ std::vector<std::string> GetConversions(
 
   return results;
 }
+
+void AppendDateCandidateIfMissing(
+    std::string candidate, absl::string_view description,
+    std::vector<DateCandidate>* results) {
+  if (candidate.empty()) {
+    return;
+  }
+  const bool exists = std::any_of(
+      results->begin(), results->end(), [&](const DateCandidate& item) {
+        return item.candidate == candidate;
+      });
+  if (!exists) {
+    results->emplace_back(std::move(candidate), description);
+  }
+}
+
+std::vector<DateCandidate> GetWeekdayConversions(
+    const DateRewriter::DateData& data,
+    absl::Span<const std::string> extra_date_formats) {
+  DCHECK_EQ(data.type, WEEKDAY);
+
+  const absl::TimeZone tz = Clock::GetTimeZone();
+  const absl::CivilDay today = absl::ToCivilDay(Clock::GetAbslTime(), tz);
+  const int today_weekday = static_cast<int>(absl::GetWeekday(today));
+  const absl::CivilDay weekday_in_current_week =
+      today + (data.diff - today_weekday);
+
+  constexpr int kWeekOffsets[] = {0, 7, -7};
+  constexpr absl::string_view kDescriptions[] = {
+      "今週の日付", "来週の日付", "先週の日付"};
+
+  std::vector<DateCandidate> results;
+  for (size_t i = 0; i < std::size(kWeekOffsets); ++i) {
+    const absl::CivilDay day = weekday_in_current_week + kWeekOffsets[i];
+    const absl::Time at = absl::FromCivil(
+        absl::CivilSecond(day.year(), day.month(), day.day(), 0, 0, 0), tz);
+
+    for (const absl::string_view date_format : extra_date_formats) {
+      AppendDateCandidateIfMissing(absl::FormatTime(date_format, at, tz),
+                                   kDescriptions[i], &results);
+    }
+    for (std::string conversion : DateRewriter::ConvertDateWithYear(
+             day.year(), day.month(), day.day())) {
+      AppendDateCandidateIfMissing(std::move(conversion), kDescriptions[i],
+                                   &results);
+    }
+
+    std::vector<std::string> era;
+    if (DateRewriter::AdToEra(day.year(), day.month(), &era) && !era.empty()) {
+      AppendDateCandidateIfMissing(
+          absl::StrFormat("%s年%d月%d日", era[0], day.month(), day.day()),
+          kDescriptions[i], &results);
+    }
+  }
+
+  return results;
+}
 }  // namespace
 
 bool DateRewriter::RewriteDate(
@@ -987,8 +1045,15 @@ bool DateRewriter::RewriteDate(
   }
 
   const DateData& data = *rit;
-  std::vector<std::string> conversions =
-      GetConversions(data, extra_date_formats, extra_datetime_formats);
+  std::vector<DateCandidate> conversions;
+  if (data.type == WEEKDAY) {
+    conversions = GetWeekdayConversions(data, extra_date_formats);
+  } else {
+    for (std::string conversion :
+         GetConversions(data, extra_date_formats, extra_datetime_formats)) {
+      conversions.emplace_back(std::move(conversion), data.description);
+    }
+  }
   if (conversions.empty()) {
     return false;
   }
@@ -1011,9 +1076,10 @@ bool DateRewriter::RewriteDate(
   const converter::Candidate& base_cand = segment->candidate(cand_idx);
   std::vector<std::unique_ptr<converter::Candidate>> candidates;
   candidates.reserve(conversions.size());
-  for (std::string& conversion : conversions) {
-    candidates.push_back(CreateCandidate(base_cand, std::move(conversion),
-                                         std::string(data.description)));
+  for (DateCandidate& conversion : conversions) {
+    candidates.push_back(CreateCandidate(
+        base_cand, std::move(conversion.candidate),
+        std::string(conversion.description)));
   }
 
   // Date candidates are too many, therefore highest candidate show at most 3rd.
@@ -1079,47 +1145,6 @@ bool DateRewriter::RewriteEra(Segments::range segments_range,
   constexpr int kInsertPosition = 2;
   segment.insert_candidates(kInsertPosition, std::move(candidates));
 
-  num_done_out = has_suffix ? 1 : 2;
-  return true;
-}
-
-bool DateRewriter::RewriteAd(Segments::range segments_range,
-                             size_t& num_done_out) {
-  // Rewrite:
-  // * If the first segment ends with the `kNenKey`, or
-  // * If the second segment starts with the `kNenKey`.
-  Segment* segment = &segments_range.front();
-  absl::string_view key = segment->key();
-  const bool has_suffix = key.ends_with(kNenKey);
-  if (!has_suffix) {
-    if (segments_range.size() < 2 ||
-        !segments_range[1].key().starts_with(kNenKey)) {
-      return false;
-    }
-  }
-  if (segment->candidates_size() == 0) {
-    LOG(WARNING) << "No candidates are found";
-    return false;
-  }
-
-  // Try to convert era to AD.
-  const std::vector<std::pair<std::string, std::string>>
-      results_anddescriptions = EraToAd(key);
-  if (results_anddescriptions.empty()) {
-    return false;
-  }
-
-  const converter::Candidate& base_cand = segment->candidate(0);
-  std::vector<std::unique_ptr<converter::Candidate>> candidates;
-  candidates.reserve(results_anddescriptions.size());
-  for (auto& [result, description] : results_anddescriptions) {
-    candidates.push_back(
-        CreateCandidate(base_cand, std::move(result), std::move(description)));
-  }
-
-  // Insert position is the last of candidates
-  const int position = static_cast<int>(segment->candidates_size());
-  segment->insert_candidates(position, std::move(candidates));
   num_done_out = has_suffix ? 1 : 2;
   return true;
 }
@@ -1196,6 +1221,192 @@ DateRewriter::CheckResizeSegmentsForAd(const ConversionRequest& request,
 }
 
 namespace {
+// Rewrite AD for resized / single-segment inputs (legacy behavior).
+bool RewriteAdResized(Segments::range segments_range, size_t& num_done_out) {
+  // Rewrite:
+  // * If the first segment ends with the `kNenKey`, or
+  // * If the second segment starts with the `kNenKey`.
+  Segment& segment = segments_range.front();
+  absl::string_view key = segment.key();
+  const bool has_suffix = key.ends_with(kNenKey);
+  if (!has_suffix) {
+    if (segments_range.size() < 2 ||
+        !segments_range[1].key().starts_with(kNenKey)) {
+      return false;
+    }
+  }
+  if (segment.candidates_size() == 0) {
+    LOG(WARNING) << "No candidates are found";
+    return false;
+  }
+
+  // Try to convert era to AD.
+  const std::vector<std::pair<std::string, std::string>>
+      results_anddescriptions = DateRewriter::EraToAd(key);
+  if (results_anddescriptions.empty()) {
+    return false;
+  }
+
+  const converter::Candidate& base_cand = segment.candidate(0);
+  std::vector<std::unique_ptr<converter::Candidate>> candidates;
+  candidates.reserve(results_anddescriptions.size());
+  for (const auto& [ad_value, description] : results_anddescriptions) {
+    candidates.push_back(CreateCandidate(base_cand, ad_value, description));
+  }
+
+  // Insert position is the last of candidates
+  const int position = static_cast<int>(segment.candidates_size());
+  segment.insert_candidates(position, std::move(candidates));
+  num_done_out = has_suffix ? 1 : 2;
+  return true;
+}
+
+// Converts Japanese era representations to Christian Era (AD) and vice versa
+// (e.g., "へいせい23ねん" -> "2011年", "2011ねん" -> "平成23年").
+// Supports multi-segment candidate generation up to 6 segments.
+struct EraKeyInfo {
+  // Merged key for era conversion up to "ねん" (e.g. "へいせい23ねん").
+  std::string merged_key;
+
+  // Number of segments scanned (e.g. 3 for ["へいせい"] ["23"] ["ねん"]).
+  size_t segment_count = 0;
+
+  // Byte offset of "ねん" in the last segment (e.g. 0 for ["2011"] ["ねん"],
+  // 1 for "8ねんの").
+  size_t nen_pos_in_last_seg = absl::string_view::npos;
+};
+
+std::optional<EraKeyInfo> ExtractEraKey(Segments::range segments_range) {
+  constexpr size_t kMaxSegments = 6;
+  EraKeyInfo info;
+
+  for (const Segment& seg : segments_range) {
+    const absl::string_view key = seg.key();
+    ++info.segment_count;
+    const size_t pos = key.find(kNenKey);
+    if (pos != absl::string_view::npos) {
+      // Extract up to the end of `kNenKey` (e.g. "ねんです" -> "ねん").
+      absl::StrAppend(&info.merged_key, key.substr(0, pos + kNenKey.size()));
+      info.nen_pos_in_last_seg = pos;
+      return info;
+    }
+    absl::StrAppend(&info.merged_key, key);
+    if (info.segment_count >= kMaxSegments) {
+      break;
+    }
+  }
+
+  return std::nullopt;
+}
+
+// Extracts trailing functional key/value
+// e.g. {"の", "の"} from "れいわ8ねんの" from `last_segment` after stripping
+// "ねん" from key and "年" from value.
+std::pair<absl::string_view, absl::string_view> ExtractFunctionalSuffix(
+    const Segment& last_segment, const EraKeyInfo& info) {
+  if (last_segment.candidates_size() == 0) {
+    return {};
+  }
+  const converter::Candidate& last_cand = last_segment.candidate(0);
+
+  if (info.nen_pos_in_last_seg == absl::string_view::npos ||
+      last_segment.key().size() <= info.nen_pos_in_last_seg + kNenKey.size()) {
+    // No trailing suffix after "ねん" (e.g. ["2011"] ["ねん"]).
+    return {};
+  }
+
+  // Suffix exists in the same segment after "ねん"
+  // (e.g. "れいわ8ねんの" -> "の").
+  const absl::string_view suffix_key =
+      last_segment.key().substr(info.nen_pos_in_last_seg + kNenKey.size());
+
+  // Extract the suffix after "年" from the candidate value (e.g. "年の" ->
+  // "の").
+  const size_t pos_val = last_cand.value.find(kNenValue);
+  if (pos_val != absl::string_view::npos &&
+      last_cand.value.size() > pos_val + kNenValue.size()) {
+    const absl::string_view suffix_value =
+        absl::string_view(last_cand.value).substr(pos_val + kNenValue.size());
+    return {suffix_key, suffix_value};
+  }
+
+  // Fallback: use suffix_key as suffix_value if "年" was not found in value
+  // (e.g. in mock candidates or all-hiragana/katakana values).
+  return {suffix_key, suffix_key};
+}
+
+bool RewriteAdMultiSegmentCandidate(Segments::range segments_range,
+                                    size_t& num_done_out) {
+  Segment& segment = segments_range.front();
+  if (segment.candidates_size() == 0) {
+    LOG(WARNING) << "No candidates are found";
+    return false;
+  }
+
+  const std::optional<EraKeyInfo> era_info = ExtractEraKey(segments_range);
+  if (!era_info.has_value()) {
+    return false;
+  }
+
+  // `results` contains pairs of <AD year value, era description>
+  // (e.g. <"2026年", "令和8年">, <"２０２６年", "令和8年">).
+  const std::vector<std::pair<std::string, std::string>> results =
+      DateRewriter::EraToAd(era_info->merged_key);
+  if (results.empty()) {
+    return false;
+  }
+
+  // Extract trailing functional key/value (e.g. {"の", "の"} from ["れいわ"]
+  // ["8ねんの"]) from the last scanned segment containing "ねん".
+  // `functional_key` and `functional_value` are appended to the date candidate
+  // (e.g. key: "れいわ8ねん" + "の", value: "2026年" + "の") to preserve
+  // trailing particles/auxiliary words in the generated multi-segment
+  // candidate.
+  const Segment& last_segment = segments_range[era_info->segment_count - 1];
+  const auto [functional_key, functional_value] =
+      ExtractFunctionalSuffix(last_segment, *era_info);
+
+  const converter::Candidate& base_cand = segment.candidate(0);
+  std::vector<std::unique_ptr<converter::Candidate>> candidates;
+  candidates.reserve(results.size());
+  for (const auto& [ad_value, description] : results) {
+    std::unique_ptr<converter::Candidate> cand = CreateCandidate(
+        base_cand, absl::StrCat(ad_value, functional_value), description);
+    cand->content_value = ad_value;
+    cand->key = absl::StrCat(era_info->merged_key, functional_key);
+    cand->content_key = era_info->merged_key;
+    cand->converted_segment_count = era_info->segment_count;
+    candidates.push_back(std::move(cand));
+  }
+
+  // For multi-segment conversion (count > 1), boost the candidate to the top
+  // (index 2) so that it is easily discoverable. For single-segment conversion,
+  // append to the end of candidates.
+  const int position = era_info->segment_count > 1
+                           ? std::min<int>(2, segment.candidates_size())
+                           : static_cast<int>(segment.candidates_size());
+  segment.insert_candidates(position, std::move(candidates));
+  num_done_out = 1;
+  return true;
+}
+}  // namespace
+
+bool DateRewriter::RewriteAd(const ConversionRequest& request,
+                             Segments::range segments_range,
+                             size_t& num_done_out) {
+  if (segments_range.empty()) {
+    return false;
+  }
+
+  if (request.request()
+          .decoder_experiment_params()
+          .enable_multi_segment_candidate()) {
+    return RewriteAdMultiSegmentCandidate(segments_range, num_done_out);
+  }
+  return RewriteAdResized(segments_range, num_done_out);
+}
+
+namespace {
 std::optional<std::string> VaridateNDigits(absl::string_view value, int n) {
   static_assert(U'9' - U'0' == 9);
   static_assert(U'９' - U'０' == 9);
@@ -1262,10 +1473,224 @@ std::optional<std::string> GetNDigits(const composer::ComposerData& composer,
   // No trials succeeded.
   return std::nullopt;
 }
+
+struct ParsedDateExpression {
+  uint32_t year = 0;
+  uint32_t month = 0;
+  uint32_t day = 0;
+  bool has_year = false;
+};
+
+bool ParseDatePart(absl::string_view part, size_t min_digits, size_t max_digits,
+                   uint32_t* value) {
+  if (part.size() < min_digits || part.size() > max_digits) {
+    return false;
+  }
+  for (const char c : part) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  return absl::SimpleAtoi(part, value);
+}
+
+std::optional<ParsedDateExpression> ParseSeparatedDateExpression(
+    absl::string_view input) {
+  const std::string normalized =
+      japanese_util::FullWidthAsciiToHalfWidthAscii(input);
+  const absl::string_view value = normalized;
+
+  char separator = '\0';
+  size_t first = absl::string_view::npos;
+  size_t second = absl::string_view::npos;
+  for (size_t i = 0; i < value.size(); ++i) {
+    const char c = value[i];
+    if (c != '/' && c != '-' && c != '.') {
+      continue;
+    }
+    if (separator == '\0') {
+      separator = c;
+    } else if (separator != c) {
+      return std::nullopt;
+    }
+
+    if (first == absl::string_view::npos) {
+      first = i;
+    } else if (second == absl::string_view::npos) {
+      second = i;
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  if (first == absl::string_view::npos) {
+    return std::nullopt;
+  }
+
+  ParsedDateExpression parsed;
+  if (second == absl::string_view::npos) {
+    if (!ParseDatePart(value.substr(0, first), 1, 2, &parsed.month) ||
+        !ParseDatePart(value.substr(first + 1), 1, 2, &parsed.day) ||
+        !IsValidMonthAndDay(parsed.month, parsed.day)) {
+      return std::nullopt;
+    }
+    return parsed;
+  }
+
+  if (!ParseDatePart(value.substr(0, first), 4, 4, &parsed.year) ||
+      !ParseDatePart(value.substr(first + 1, second - first - 1), 1, 2,
+                     &parsed.month) ||
+      !ParseDatePart(value.substr(second + 1), 1, 2, &parsed.day) ||
+      !IsValidDate(parsed.year, parsed.month, parsed.day)) {
+    return std::nullopt;
+  }
+  parsed.has_year = true;
+  return parsed;
+}
+
+std::optional<RewriterInterface::ResizeSegmentsRequest>
+GetSeparatedDateResizeRequest(const ConversionRequest& request,
+                              const Segments& segments) {
+  if (segments.conversion_segments_size() <= 1) {
+    return std::nullopt;
+  }
+
+  std::string combined_key;
+  size_t raw_key_len = 0;
+  for (const Segment& segment : segments.conversion_segments()) {
+    combined_key.append(segment.key());
+    raw_key_len += segment.key_len();
+  }
+
+  const size_t key_len = Util::CharsLen(combined_key);
+  if (key_len == 0 || key_len > std::numeric_limits<uint8_t>::max()) {
+    return std::nullopt;
+  }
+
+  std::optional<ParsedDateExpression> parsed =
+      ParseSeparatedDateExpression(combined_key);
+  if (!parsed) {
+    parsed = ParseSeparatedDateExpression(
+        request.composer().GetRawSubString(0, raw_key_len));
+  }
+  if (!parsed) {
+    return std::nullopt;
+  }
+
+  if (!parsed->has_year) {
+    const absl::TimeZone tz = Clock::GetTimeZone();
+    const uint32_t current_year = static_cast<uint32_t>(
+        absl::ToCivilDay(Clock::GetAbslTime(), tz).year());
+    if (!IsValidDate(current_year, parsed->month, parsed->day)) {
+      return std::nullopt;
+    }
+  }
+
+  return RewriterInterface::ResizeSegmentsRequest{
+      .segment_index = 0,
+      .segment_sizes = {static_cast<uint8_t>(key_len), 0, 0, 0, 0, 0, 0, 0},
+  };
+}
+
+std::optional<ParsedDateExpression> GetSeparatedDateExpression(
+    const composer::ComposerData& composer, const Segments& segments) {
+  DCHECK_EQ(segments.conversion_segments_size(), 1);
+  const Segment& segment = segments.conversion_segment(0);
+
+  std::optional<ParsedDateExpression> parsed =
+      ParseSeparatedDateExpression(segment.key());
+  if (parsed) {
+    return parsed;
+  }
+
+  for (size_t i = 0; i < segment.meta_candidates_size(); ++i) {
+    parsed =
+        ParseSeparatedDateExpression(segment.meta_candidate(i).value);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const std::string raw = composer.GetRawSubString(0, segment.key_len());
+  return ParseSeparatedDateExpression(raw);
+}
+
+bool AppendFullDateCandidates(
+    uint32_t year, uint32_t month, uint32_t day,
+    absl::Span<const std::string> extra_date_formats,
+    bool include_month_day_candidates, std::vector<DateCandidate>* results) {
+  if (!IsValidDate(year, month, day)) {
+    return false;
+  }
+
+  const absl::TimeZone tz = Clock::GetTimeZone();
+  const absl::Time at =
+      absl::FromCivil(absl::CivilSecond(year, month, day, 0, 0, 0), tz);
+
+  for (const absl::string_view date_format : extra_date_formats) {
+    AppendDateCandidateIfMissing(absl::FormatTime(date_format, at, tz),
+                                 kDateDescription, results);
+  }
+
+  if (include_month_day_candidates) {
+    AppendDateCandidateIfMissing(absl::StrFormat("%d月%d日", month, day),
+                                 kDateDescription, results);
+    AppendDateCandidateIfMissing(absl::StrFormat("%02d/%02d", month, day),
+                                 kDateDescription, results);
+  }
+
+  for (std::string candidate :
+       DateRewriter::ConvertDateWithYear(year, month, day)) {
+    AppendDateCandidateIfMissing(std::move(candidate), kDateDescription,
+                                 results);
+  }
+
+  const absl::CivilDay civil_day(year, month, day);
+  const absl::string_view weekday_text =
+      date_util::GetShortWeekdayString(absl::GetWeekday(civil_day));
+  AppendDateCandidateIfMissing(
+      absl::StrFormat("%d/%02d/%02d(%s)", year, month, day, weekday_text),
+      kDateDescription, results);
+  AppendDateCandidateIfMissing(
+      absl::StrFormat("%d年%d月%d日(%s)", year, month, day, weekday_text),
+      kDateDescription, results);
+
+  std::vector<std::string> era;
+  if (DateRewriter::AdToEra(year, month, &era) && !era.empty()) {
+    AppendDateCandidateIfMissing(
+        absl::StrFormat("%s年%d月%d日", era[0], month, day), kDateDescription,
+        results);
+    AppendDateCandidateIfMissing(
+        absl::StrFormat("%s年%d月%d日(%s)", era[0], month, day, weekday_text),
+        kDateDescription, results);
+  }
+
+  return true;
+}
+
+bool RewriteConsecutiveEightDigits(
+    absl::string_view str, absl::Span<const std::string> extra_date_formats,
+    std::vector<DateCandidate>* results) {
+  DCHECK_EQ(str.size(), 8);
+
+  uint32_t year = 0;
+  uint32_t month = 0;
+  uint32_t day = 0;
+  if (!absl::SimpleAtoi(str.substr(0, 4), &year) ||
+      !absl::SimpleAtoi(str.substr(4, 2), &month) ||
+      !absl::SimpleAtoi(str.substr(6, 2), &day)) {
+    return false;
+  }
+
+  return AppendFullDateCandidates(year, month, day, extra_date_formats,
+                                  /*include_month_day_candidates=*/false,
+                                  results);
+}
 }  // namespace
 
 bool DateRewriter::RewriteConsecutiveDigits(
-    const composer::ComposerData& composer, int insert_position,
+    const composer::ComposerData& composer,
+    absl::Span<const std::string> extra_date_formats, int insert_position,
     Segments* segments) {
   if (segments->conversion_segments_size() != 1) {
     // This method rewrites a segment only when the segments has only
@@ -1283,10 +1708,30 @@ bool DateRewriter::RewriteConsecutiveDigits(
     return false;
   }
 
+  const std::string raw_input =
+      composer.GetRawSubString(0, segment->key_len());
+  const bool has_explicit_separated_date =
+      ParseSeparatedDateExpression(raw_input).has_value();
+
   // Generate candidates.  The results contain <candidate, description> pairs.
   std::optional<std::string> number_str;
   std::vector<DateCandidate> results;
-  if (number_str = GetNDigits(composer, *segments, 2); number_str) {
+  bool has_explicit_compact_date = false;
+  if (const std::optional<ParsedDateExpression> date_expression =
+          GetSeparatedDateExpression(composer, *segments);
+      date_expression) {
+    ParsedDateExpression parsed = *date_expression;
+    if (!parsed.has_year) {
+      const absl::TimeZone tz = Clock::GetTimeZone();
+      parsed.year = static_cast<uint32_t>(
+          absl::ToCivilDay(Clock::GetAbslTime(), tz).year());
+    }
+    if (!AppendFullDateCandidates(
+            parsed.year, parsed.month, parsed.day, extra_date_formats,
+            /*include_month_day_candidates=*/!parsed.has_year, &results)) {
+      return false;
+    }
+  } else if (number_str = GetNDigits(composer, *segments, 2); number_str) {
     if (!RewriteConsecutiveTwoDigits(number_str.value(), &results)) {
       return false;
     }
@@ -1298,9 +1743,70 @@ bool DateRewriter::RewriteConsecutiveDigits(
     if (!RewriteConsecutiveFourDigits(number_str.value(), &results)) {
       return false;
     }
+  } else if (number_str = GetNDigits(composer, *segments, 8); number_str) {
+    if (!RewriteConsecutiveEightDigits(number_str.value(), extra_date_formats,
+                                       &results)) {
+      return false;
+    }
+    const std::optional<std::string> key_digits =
+        VaridateNDigits(segment->key(), 8);
+    has_explicit_compact_date =
+        key_digits.has_value() && key_digits.value() == number_str.value();
   }
   if (results.empty()) {
     return false;
+  }
+
+  // An explicitly typed date is a strong surface-form signal.  Keep the
+  // literal input first, then place the semantic date expansions immediately
+  // after it.  This also restores '/' if the converter normalized it to '・'.
+  if (has_explicit_separated_date) {
+    results.erase(
+        std::remove_if(results.begin(), results.end(),
+                       [&](const DateCandidate& item) {
+                         return item.candidate == raw_input;
+                       }),
+        results.end());
+
+    int raw_candidate_index = -1;
+    for (size_t i = 0; i < segment->candidates_size(); ++i) {
+      if (segment->candidate(i).value == raw_input) {
+        raw_candidate_index = static_cast<int>(i);
+        break;
+      }
+    }
+
+    if (raw_candidate_index >= 0) {
+      if (raw_candidate_index > 0) {
+        segment->move_candidate(raw_candidate_index, 0);
+      }
+      insert_position = 1;
+    } else {
+      results.insert(results.begin(),
+                     DateCandidate(raw_input, kDateDescription));
+      insert_position = 0;
+    }
+  } else if (has_explicit_compact_date) {
+    int literal_candidate_index = -1;
+    for (size_t i = 0; i < segment->candidates_size(); ++i) {
+      if (segment->candidate(i).value == segment->key()) {
+        literal_candidate_index = static_cast<int>(i);
+        break;
+      }
+    }
+
+    if (literal_candidate_index >= 0) {
+      if (literal_candidate_index > 0) {
+        segment->move_candidate(literal_candidate_index, 0);
+      }
+      results.erase(
+          std::remove_if(results.begin(), results.end(),
+                         [&](const DateCandidate& item) {
+                           return item.candidate == segment->key();
+                         }),
+          results.end());
+      insert_position = 1;
+    }
   }
 
   // The existence of segment->candidate(0) or segment->meta_candidate(0) is
@@ -1498,8 +2004,7 @@ std::vector<std::string> GetExtraFormats(
     return TRAVERSE_DONE;
   });
 
-  ConversionRequest crequest;
-  dictionary->LookupExact(format_key, crequest, &cb);
+  dictionary->LookupExact(format_key, ConversionOptions{}, &cb);
   return extra_formats;
 }
 }  // namespace
@@ -1514,6 +2019,21 @@ DateRewriter::CheckResizeSegmentsRequest(const ConversionRequest& request,
 
   if (segments.resized()) {
     // If the given segments are resized by user, don't modify anymore.
+    return std::nullopt;
+  }
+
+  // Explicit separated dates have no multi-segment rewrite path.  Merge them
+  // before the generic multi-segment-candidate guard so inputs such as "9/8"
+  // work consistently even when that experiment is enabled.
+  if (std::optional<RewriterInterface::ResizeSegmentsRequest> resize_request =
+          GetSeparatedDateResizeRequest(request, segments);
+      resize_request.has_value()) {
+    return resize_request;
+  }
+
+  if (request.request()
+          .decoder_experiment_params()
+          .enable_multi_segment_candidate()) {
     return std::nullopt;
   }
 
@@ -1555,7 +2075,7 @@ bool DateRewriter::Rewrite(const ConversionRequest& request,
       return false;
     }
 
-    if (RewriteAd(rest_segments, num_done) ||
+    if (RewriteAd(request, rest_segments, num_done) ||
         RewriteDate(seg, extra_date_formats, extra_datetime_formats,
                     num_done) ||
         RewriteEra(rest_segments, num_done)) {
@@ -1581,8 +2101,8 @@ bool DateRewriter::Rewrite(const ConversionRequest& request,
     default:
       break;
   }
-  modified |=
-      RewriteConsecutiveDigits(request.composer(), insert_pos, segments);
+  modified |= RewriteConsecutiveDigits(
+      request.composer(), extra_date_formats, insert_pos, segments);
 
   return modified;
 }

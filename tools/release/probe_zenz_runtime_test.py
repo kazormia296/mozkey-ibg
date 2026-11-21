@@ -25,6 +25,10 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
             "256",
             "-t",
             "4",
+            "--parallel",
+            "1",
+            "--cache-ram",
+            "0",
             "--host",
             "127.0.0.1",
             "--port",
@@ -37,7 +41,7 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
         for flash_attention in ("auto", "on", "off"):
             with self.subTest(flash_attention=flash_attention):
                 candidate = list(arguments)
-                candidate[14] = flash_attention
+                candidate[18] = flash_attention
                 port, key = probe._inspect_llama_argv(
                     candidate,
                     expected_link=link,
@@ -65,6 +69,10 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
             "256",
             "-t",
             "4",
+            "--parallel",
+            "1",
+            "--cache-ram",
+            "0",
             "--host",
             "127.0.0.1",
             "--port",
@@ -75,7 +83,7 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
             "auto",
         ]
         exposed = list(base)
-        exposed[8] = "0.0.0.0"
+        exposed[12] = "0.0.0.0"
         with self.assertRaisesRegex(probe.ProbeFailure, "llama_host_invalid"):
             probe._inspect_llama_argv(
                 exposed, expected_link=link, expected_model=model
@@ -105,7 +113,7 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
                 expected_model=model,
             )
         invalid_flash_attention = list(base)
-        invalid_flash_attention[14] = "enabled"
+        invalid_flash_attention[18] = "enabled"
         with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
             probe._inspect_llama_argv(
                 invalid_flash_attention,
@@ -113,7 +121,7 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
                 expected_model=model,
             )
         invalid_flash_attention_flag = list(base)
-        invalid_flash_attention_flag[13] = "--flash-attention"
+        invalid_flash_attention_flag[17] = "--flash-attention"
         with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
             probe._inspect_llama_argv(
                 invalid_flash_attention_flag,
@@ -121,11 +129,28 @@ class ProbeZenzRuntimeTest(unittest.TestCase):
                 expected_model=model,
             )
         weak_key = list(base)
-        weak_key[12] = "not-a-release-key"
+        weak_key[16] = "not-a-release-key"
         with self.assertRaisesRegex(probe.ProbeFailure, "llama_api_key_invalid"):
             probe._inspect_llama_argv(
                 weak_key, expected_link=link, expected_model=model
             )
+        # Upstream Mozkey v1.0.0 execution contract: exactly one server slot
+        # and no global RAM prompt cache.
+        legacy_launch = base[:7] + base[11:]
+        with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
+            probe._inspect_llama_argv(
+                legacy_launch, expected_link=link, expected_model=model
+            )
+        for index, value in ((8, "4"), (10, "8192"), (7, "--cache-ram")):
+            with self.subTest(index=index, value=value):
+                unbounded = list(base)
+                unbounded[index] = value
+                with self.assertRaisesRegex(
+                    probe.ProbeFailure, "llama_arguments_invalid"
+                ):
+                    probe._inspect_llama_argv(
+                        unbounded, expected_link=link, expected_model=model
+                    )
         unsafe_device = list(base) + ["--device", "CUDA0 --host 0.0.0.0"]
         with self.assertRaisesRegex(probe.ProbeFailure, "llama_arguments_invalid"):
             probe._inspect_llama_argv(

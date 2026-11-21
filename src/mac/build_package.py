@@ -39,6 +39,7 @@ import plistlib
 import shutil
 import tempfile
 
+from build_tools import mozc_version
 from build_tools import util
 
 
@@ -48,6 +49,7 @@ def ParseArguments():
   parser.add_argument('--input')
   parser.add_argument('--output')
   parser.add_argument('--oss', action='store_true')
+  parser.add_argument('--version_file')
   parser.add_argument(
       '--codesign_identity',
       default='-',
@@ -76,6 +78,11 @@ def main():
   if args.oss:
     identifier = 'io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput'
     pkg_name = 'MozkeyIbG.pkg'
+    if not args.version_file:
+      raise ValueError('--version_file is required for Mozkey IbG OSS packages')
+    installer_version = mozc_version.MozcVersion(
+        args.version_file
+    ).GetMozkeyInstallerVersion()
   else:
     identifier = 'com.google.pkg.GoogleJapaneseInput'
     pkg_name = 'GoogleJapaneseInput.pkg'
@@ -102,6 +109,15 @@ def main():
       components = plistlib.load(f)
     for component in components:
       component['BundleOverwriteAction'] = ''
+      if args.oss:
+        # Keep Mozkey IbG's OSS input method at its canonical installation
+        # path.  Bundle-ID-based relocation can select another copy of
+        # MozkeyIbG.app.
+        component['BundleIsRelocatable'] = False
+        # Earlier Mozkey IbG bundles carried the Mozc 3.x build number, so the
+        # move to the Mozkey installer version is a version-number transition.
+        # Otherwise PackageKit skips both app bundles even on a successful pkg.
+        component['BundleIsVersionChecked'] = False
     with open(component_plist, 'wb') as f:
       plistlib.dump(components, f)
 
@@ -117,6 +133,8 @@ def main():
         'scripts/',
         pkg_name,  # pkg_name is configured in distribution.xml.
     ]
+    if args.oss:
+      pkgbuild_commands[1:1] = ['--version', installer_version]
     util.RunOrDie(pkgbuild_commands)
     productbuild_commands = [
         '/usr/bin/productbuild',

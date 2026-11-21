@@ -46,6 +46,7 @@
 #include "converter/converter_interface.h"
 #include "converter/immutable_converter_interface.h"
 #include "engine/modules.h"
+#include "prediction/decoder_util.h"
 #include "prediction/dictionary_predictor.h"
 #include "prediction/predictor_interface.h"
 #include "prediction/realtime_decoder.h"
@@ -159,6 +160,10 @@ void Predictor::CommitContext(const ConversionRequest& request) const {
 // to call DictionaryPredictor::Revert/Clear*/Finish methods.
 void Predictor::Revert(uint32_t revert_id) {
   user_history_predictor_->Revert(revert_id);
+}
+
+void Predictor::DiscardRevert(uint32_t revert_id) {
+  user_history_predictor_->DiscardRevert(revert_id);
 }
 
 bool Predictor::ClearAllHistory() {
@@ -279,17 +284,35 @@ std::vector<Result> Predictor::PredictForMixedConversion(
 }
 
 // static
-void Predictor::DemoteWeakUserHistory(absl::Span<Result> results) {
+void Predictor::DemoteWeakUserHistory(const ConversionRequest& request,
+                                      absl::Span<Result> results) {
   auto is_weak = [](const Result& result) {
-    return result.types & prediction::WEAK_USER_HISTORY_PREDICTION;
+    return result.attributes & prediction::WEAK_USER_HISTORY_PREDICTION;
   };
 
   if (results.empty() || !is_weak(results.front())) {
     return;
   }
 
-  if (auto first_no_weak = absl::c_find_if_not(results, is_weak);
-      first_no_weak != results.end()) {
+  // When the top candidate is weak (e.g., multi-segment prefix user history
+  // before reaching the last segment), promote only the first non-weak
+  // exact-match candidate (or first non-weak candidate if none matches
+  // request.key()) to position 0. This protects short exact-match visibility at
+  // rank 1 while preserving the user's learned multi-segment history at rank 2
+  // (ahead of unlearned dictionary homophones), matching the legacy
+  // UserSegmentHistoryRewriter behavior and
+  // converter_util.cc::MergePredictionResults.
+  //
+  // TODO(taku): Once the UserSegmentHistoryRewriter migration finishes,
+  // refactor and unify candidate scoring so explicit weak-candidate demotion is
+  // no longer needed.
+  auto first_no_weak = absl::c_find_if(results, [&](const Result& r) {
+    return !is_weak(r) && r.key == request.key();
+  });
+  if (first_no_weak == results.end()) {
+    first_no_weak = absl::c_find_if_not(results, is_weak);
+  }
+  if (first_no_weak != results.end()) {
     std::rotate(results.begin(), first_no_weak, std::next(first_no_weak));
   }
 }
@@ -297,6 +320,39 @@ void Predictor::DemoteWeakUserHistory(absl::Span<Result> results) {
 std::vector<Result> Predictor::MixCandidates(
     const ConversionRequest& request, std::vector<Result> user_history_results,
     std::vector<Result> dictionary_results) const {
+  if (request.request()
+          .decoder_experiment_params()
+          .enable_weekday_zero_query_prediction() &&
+      request.IsZeroQuerySuggestion()) {
+    // Standalone parenthesized weekday zero-query candidates (e.g., " (水)")
+    // are dynamically computed from the calendar date by ZeroQueryDecoder and
+    // must never be replayed from persistent user history.
+    user_history_results.erase(
+        std::remove_if(user_history_results.begin(), user_history_results.end(),
+                       [](const Result& r) {
+                         return IsStandaloneParenthesizedWeekday(r.value);
+                       }),
+        user_history_results.end());
+
+    const absl::string_view last_history_value =
+        request.converter_history_value(1);
+    const absl::string_view full_history_value =
+        request.converter_history_value(-1);
+    const absl::string_view preceding_text =
+        request.context().preceding_text();
+    if (EndsWithWeekdayExpression(last_history_value) ||
+        EndsWithWeekdayExpression(full_history_value) ||
+        (last_history_value.empty() &&
+         EndsWithWeekdayExpression(preceding_text))) {
+      dictionary_results.erase(
+          std::remove_if(dictionary_results.begin(), dictionary_results.end(),
+                         [](const Result& r) {
+                           return IsStandaloneParenthesizedWeekday(r.value);
+                         }),
+          dictionary_results.end());
+    }
+  }
+
   // Add NO_DELETABLE annotation when the top user history result is the same
   // as the top dictionary result.
   // when user_history_results.size() > 1, the decoder can still show the second
@@ -305,14 +361,14 @@ std::vector<Result> Predictor::MixCandidates(
       user_history_results.front().key == dictionary_results.front().key &&
       user_history_results.front().value == dictionary_results.front().value) {
     Result& result = user_history_results.front();
-    result.candidate_attributes |= converter::Attribute::NO_DELETABLE;
+    result.attributes |= converter::Attribute::NO_DELETABLE;
   }
 
   std::vector<Result> results;
   absl::c_move(user_history_results, std::back_inserter(results));
   absl::c_move(dictionary_results, std::back_inserter(results));
 
-  DemoteWeakUserHistory(absl::MakeSpan(results));
+  DemoteWeakUserHistory(request, absl::MakeSpan(results));
 
   return results;
 }
