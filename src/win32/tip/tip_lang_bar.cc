@@ -356,7 +356,8 @@ HRESULT TipLangBar::UninitLangBar() {
   return result;
 }
 
-HRESULT TipLangBar::UpdateMenu(bool enabled, uint32_t composition_mode) {
+HRESULT TipLangBar::UpdateMenu(bool enabled, uint32_t composition_mode,
+                               bool private_input) {
   wil::com_ptr_nothrow<TipLangBarToggleButton> input_button =
       input_button_menu_;
   wil::com_ptr_nothrow<TipLangBarToggleButton> input_mode_button =
@@ -368,9 +369,20 @@ HRESULT TipLangBar::UpdateMenu(bool enabled, uint32_t composition_mode) {
   const UINT menu_id = GetItemId(composition_mode);
   input_button->SelectMenuItem(menu_id);
   input_mode_button->SelectMenuItem(menu_id);
+  input_button->SetPrivateInput(private_input);
+  input_mode_button->SetPrivateInput(private_input);
   input_button->SetEnabled(enabled);
   tool_button->SetEnabled(enabled);
   input_mode_button->SetEnabled(enabled);
+  return S_OK;
+}
+HRESULT TipLangBar::RefreshInputModeIconForThemeChange() {
+  if (input_button_menu_) {
+    input_button_menu_->RefreshIconForThemeChange();
+  }
+  if (input_mode_button_for_win8_) {
+    input_mode_button_for_win8_->RefreshIconForThemeChange();
+  }
   return S_OK;
 }
 

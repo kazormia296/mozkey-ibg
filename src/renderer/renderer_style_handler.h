@@ -36,6 +36,10 @@
 #include "protocol/renderer_style.pb.h"
 
 namespace mozc {
+namespace commands {
+class CandidateWindow;
+}  // namespace commands
+
 namespace renderer {
 
 // this is pure static class
@@ -47,6 +51,12 @@ class RendererStyleHandler {
     kCandidate,
     kSuggestion,
   };
+
+  // Maps candidate-window categories to the appearance bucket used by both
+  // renderer platforms. PREDICTION and SUGGESTION share the suggestion
+  // appearance; the remaining categories use the candidate appearance.
+  static RendererStyleType GetRendererStyleTypeForCandidateWindow(
+      const commands::CandidateWindow& candidate_window);
 
   struct WindowShadowStyle {
     uint32_t size = 12;
@@ -61,12 +71,18 @@ class RendererStyleHandler {
   };
 
   struct RubyWindowStyle {
+    bool enabled = true;
     uint32_t background_color = 0xffffff;
     uint32_t text_color = 0x000000;
     uint32_t border_color = 0x969696;
     uint32_t corner_radius = 9;
     uint32_t size_percent = 100;
+    uint32_t font_weight = 400;
+    std::string font_name;
     uint32_t opacity_percent = 90;
+    uint32_t horizontal_padding = 14;
+    uint32_t vertical_padding = 6;
+    uint32_t composition_gap = 4;
     WindowShadowStyle shadow;
   };
 
@@ -99,7 +115,8 @@ class RendererStyleHandler {
       RendererStyleType type);
 
   // Returns the ruby-window appearance. Colors are 0xRRGGBB. Corner radius is
-  // a logical pixel radius at 100% DPI.
+  // a logical pixel radius at 100% DPI. Spacing values use the ruby window's
+  // 150% display design baseline and are scaled by size_percent at rendering.
   static RubyWindowStyle GetRubyWindowStyle();
 
   // Applies candidate window theme options to the given style.

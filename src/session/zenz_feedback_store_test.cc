@@ -4,9 +4,11 @@
 #include <string>
 #include <vector>
 
-#include "testing/gunit.h"
-
+#include "base/file/temp_dir.h"
+#include "base/file_util.h"
 #include "base/system_util.h"
+#include "testing/gunit.h"
+#include "testing/mozctest.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -15,34 +17,6 @@
 namespace mozc {
 namespace session {
 namespace {
-
-// Converts a wide string to UTF-8 for direct file access in tests.
-// This is a test-only helper, separate from the implementation's WideToUtf8.
-std::string WideToUtf8ForTest(const std::wstring& w) {
-  if (w.empty()) {
-    return "";
-  }
-  std::string out;
-  out.reserve(w.size() * 3 + 1);
-  for (const wchar_t wc : w) {
-    if (wc < 0x80) {
-      out.push_back(static_cast<char>(wc));
-    } else if (wc < 0x800) {
-      out.push_back(0xC0 | (wc >> 6));
-      out.push_back(0x80 | (wc & 0x3F));
-    } else if (wc < 0x10000) {
-      out.push_back(0xE0 | (wc >> 12));
-      out.push_back(0x80 | ((wc >> 6) & 0x3F));
-      out.push_back(0x80 | (wc & 0x3F));
-    } else if (wc < 0x200000) {
-      out.push_back(0xF0 | (wc >> 18));
-      out.push_back(0x80 | ((wc >> 12) & 0x3F));
-      out.push_back(0x80 | ((wc >> 6) & 0x3F));
-      out.push_back(0x80 | (wc & 0x3F));
-    }
-  }
-  return out;
-}
 
 #if defined(_WIN32)
 
@@ -126,20 +100,8 @@ class ScopedUserProfileForZenzFeedbackStoreTest {
     return JoinPath(mozc_dir, L"zenz_feedback.tsv");
   }
 
-  // For direct std::ofstream access (std::ofstream accepts std::wstring on Win32).
-  const std::wstring& feedback_wide_path() const { return feedback_path(); }
-  // For direct std::ofstream access on Linux.
-  std::string feedback_utf8_path() const {
-    return WideToUtf8ForTest(feedback_path());
-  }
-
-  std::wstring temp_file_path(const std::wstring& name) const {
-    return JoinPath(profile_dir_, name);
-  }
-
-  // UTF-8 path for std::ofstream on Linux.
-  std::string temp_file_utf8_path(const std::wstring& name) const {
-    return WideToUtf8ForTest(JoinPath(profile_dir_, name));
+  std::wstring temp_file_path(const std::string& name) const {
+    return JoinPath(profile_dir_, std::wstring(name.begin(), name.end()));
   }
 
  private:
@@ -151,78 +113,37 @@ class ScopedUserProfileForZenzFeedbackStoreTest {
 
 #else  // !defined(_WIN32)
 
+// Mozkey IbG persists Zenz feedback on every POSIX platform (macOS and Linux).
+
 class ScopedUserProfileForZenzFeedbackStoreTest {
  public:
-  ScopedUserProfileForZenzFeedbackStoreTest() {
-    // Save current Mozc user profile directory.
-    old_profile_ = SystemUtil::GetUserProfileDirectory();
-    has_old_profile_ = true;
-
-    // Create a temporary directory.
-    const std::string tmp_template =
-        std::string("/tmp/mozc_zenz_feedback_store_test_XXXXXX");
-    char* tmp_buf = strdup(tmp_template.c_str());
-    char* result = mkdtemp(tmp_buf);
-    if (result == nullptr) {
-      free(tmp_buf);
-      return;
+  ScopedUserProfileForZenzFeedbackStoreTest()
+      : old_profile_dir_(SystemUtil::GetUserProfileDirectory()),
+        profile_dir_(mozc::testing::MakeTempDirectoryOrDie()) {
+    ok_ = !profile_dir_.path().empty();
+    if (ok_) {
+      SystemUtil::SetUserProfileDirectory(profile_dir_.path());
     }
-    profile_dir_ = std::string(result);
-    free(tmp_buf);
-
-    SystemUtil::SetUserProfileDirectory(profile_dir_);
-    ok_ = true;
   }
 
   ~ScopedUserProfileForZenzFeedbackStoreTest() {
-    // Restore original profile directory.
-    if (has_old_profile_) {
-      SystemUtil::SetUserProfileDirectory(old_profile_);
-    }
-
-    // Clean up the feedback file and directory.
-    unlink(feedback_utf8_path().c_str());
-    rmdir(profile_dir_.c_str());
+    SystemUtil::SetUserProfileDirectory(old_profile_dir_);
   }
 
   bool ok() const { return ok_; }
 
-  std::wstring feedback_path() const {
-    std::string path = profile_dir_ + "/zenz_feedback.tsv";
-    // Widen for the wstring-based API.
-    std::wstring result;
-    result.reserve(path.size());
-    for (const char c : path) {
-      result.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
-    }
-    return result;
+  std::string feedback_path() const {
+    return FileUtil::JoinPath(profile_dir_.path(), "zenz_feedback.tsv");
   }
 
-  std::string feedback_utf8_path() const {
-    return profile_dir_ + "/zenz_feedback.tsv";
-  }
-
-  std::wstring temp_file_path(const std::wstring& name) const {
-    std::string name_utf8 = WideToUtf8ForTest(name);
-    std::string full_utf8 = profile_dir_ + "/" + name_utf8;
-    std::wstring result;
-    result.reserve(full_utf8.size());
-    for (const char c : full_utf8) {
-      result.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
-    }
-    return result;
-  }
-
-  std::string temp_file_utf8_path(const std::wstring& name) const {
-    std::string name_utf8 = WideToUtf8ForTest(name);
-    return profile_dir_ + "/" + name_utf8;
+  std::string temp_file_path(const std::string& name) const {
+    return FileUtil::JoinPath(profile_dir_.path(), name);
   }
 
  private:
   bool ok_ = false;
-  bool has_old_profile_ = false;
-  std::string old_profile_;
-  std::string profile_dir_;
+  std::string old_profile_dir_;
+  TempDirectory profile_dir_;
 };
 
 #endif  // defined(_WIN32)
@@ -293,6 +214,23 @@ TEST(ZenzFeedbackStoreTest, GetAcceptedCandidatesAllowsSingleAcceptedAndSorts) {
   EXPECT_EQ(candidates[3].reason, "feedback_preferred");
 }
 
+TEST(ZenzFeedbackStoreTest,
+     ManualHardRejectBypassesAutomaticLengthAndRespectsContext) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+  ZenzFeedbackStore store;
+  store.RecordRejected("あい", "japanese_only", "亜衣", "hard_reject");
+  store.RecordRejected("あい", "sensitive_like", "愛", "hard_reject");
+  store.RecordRejected("あい", "empty", "藍", "space_revert_zenz_to_mozc");
+
+  EXPECT_TRUE(store.IsManuallyBlocked("あい", "empty", "亜衣"));
+  EXPECT_TRUE(store.IsManuallyBlocked("あい", "japanese_only", "亜衣"));
+  EXPECT_FALSE(store.IsManuallyBlocked("あい", "empty", "愛"));
+  EXPECT_TRUE(store.IsManuallyBlocked("あい", "sensitive_like", "愛"));
+  EXPECT_FALSE(store.IsManuallyBlocked("あい", "empty", "藍"));
+  EXPECT_FALSE(store.IsManuallyBlocked("あい", "empty", "青"));
+}
+
 TEST(ZenzFeedbackStoreTest, DecideTreatsOrdinaryRejectedAsSoftSignal) {
   ScopedUserProfileForZenzFeedbackStoreTest profile;
   ASSERT_TRUE(profile.ok());
@@ -318,7 +256,28 @@ TEST(ZenzFeedbackStoreTest, DecideTreatsOrdinaryRejectedAsSoftSignal) {
 }
 
 TEST(ZenzFeedbackStoreTest,
-     DecideAutoBlockPolicySuppressesAfterThresholdDynamically) {
+     CancelVisibleZenzRejectUsesExplicitConversionWeight) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+
+  ZenzFeedbackStore store;
+  store.RecordAccepted("k", "empty", "v");
+  store.RecordRejected(
+      "k", "empty", "v", "cancel_visible_zenz_to_composition");
+
+  const ZenzFeedbackDecision decision =
+      store.Decide("k", "empty", "v");
+
+  EXPECT_EQ(decision.accepted_count, 1);
+  EXPECT_EQ(decision.rejected_count, 1);
+  EXPECT_EQ(decision.positive_score, 1000);
+  EXPECT_EQ(decision.negative_score, 400);
+  EXPECT_EQ(decision.total_score, 600);
+  EXPECT_EQ(decision.action, ZenzFeedbackAction::kPrefer);
+}
+
+TEST(ZenzFeedbackStoreTest,
+     DecideAutoBlockPolicyUsesMinimumRejectCountAndPercentageDynamically) {
   ScopedUserProfileForZenzFeedbackStoreTest profile;
   ASSERT_TRUE(profile.ok());
 
@@ -331,29 +290,63 @@ TEST(ZenzFeedbackStoreTest,
 
   ZenzFeedbackAutoBlockPolicy policy;
   policy.enabled = true;
-  policy.reject_threshold = 2;
+  policy.minimum_reject_count = 2;
+  policy.minimum_reject_percentage = 50;
 
+  // 2 / (3 + 2) = 40%, so the count is sufficient but the percentage is not.
   ZenzFeedbackDecision decision = store.Decide("k", "empty", "v", policy);
-  EXPECT_EQ(decision.action, ZenzFeedbackAction::kReject);
-  EXPECT_EQ(decision.reason, "feedback_auto_blocked");
-  EXPECT_TRUE(decision.auto_blocked);
-  EXPECT_FALSE(decision.hard_rejected);
+  EXPECT_EQ(decision.action, ZenzFeedbackAction::kPrefer);
+  EXPECT_EQ(decision.reason, "feedback_preferred");
+  EXPECT_FALSE(decision.auto_blocked);
   EXPECT_EQ(decision.accepted_count, 3);
   EXPECT_EQ(decision.rejected_count, 2);
   EXPECT_EQ(decision.auto_block_reject_count, 2);
 
-  policy.reject_threshold = 3;
+  policy.minimum_reject_percentage = 40;
+  decision = store.Decide("k", "empty", "v", policy);
+  EXPECT_EQ(decision.action, ZenzFeedbackAction::kReject);
+  EXPECT_EQ(decision.reason, "feedback_auto_blocked");
+  EXPECT_TRUE(decision.auto_blocked);
+
+  policy.minimum_reject_count = 3;
   decision = store.Decide("k", "empty", "v", policy);
   EXPECT_EQ(decision.action, ZenzFeedbackAction::kPrefer);
-  EXPECT_EQ(decision.reason, "feedback_preferred");
   EXPECT_FALSE(decision.auto_blocked);
 
   policy.enabled = false;
-  policy.reject_threshold = 1;
+  policy.minimum_reject_count = 1;
+  policy.minimum_reject_percentage = 1;
   decision = store.Decide("k", "empty", "v", policy);
   EXPECT_EQ(decision.action, ZenzFeedbackAction::kPrefer);
-  EXPECT_EQ(decision.reason, "feedback_preferred");
   EXPECT_FALSE(decision.auto_blocked);
+}
+
+TEST(ZenzFeedbackStoreTest, AutoBlockDefaultShapeSelfRecoversAfterMajorityMatches) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+
+  ZenzFeedbackStore store;
+  ZenzFeedbackAutoBlockPolicy policy;
+  policy.enabled = true;
+  policy.minimum_reject_count = 1;
+  policy.minimum_reject_percentage = 50;
+
+  store.RecordRejected("k", "empty", "v", "space_revert_zenz_to_mozc");
+  ZenzFeedbackDecision decision = store.Decide("k", "empty", "v", policy);
+  EXPECT_TRUE(decision.auto_blocked);
+
+  store.RecordAccepted("k", "empty", "v");
+  decision = store.Decide("k", "empty", "v", policy);
+  EXPECT_TRUE(decision.auto_blocked);  // 1 / 2 == 50%.
+
+  store.RecordAccepted("k", "empty", "v");
+  decision = store.Decide("k", "empty", "v", policy);
+  EXPECT_FALSE(decision.auto_blocked);  // 1 / 3 < 50%.
+  EXPECT_EQ(decision.action, ZenzFeedbackAction::kPrefer);
+
+  const std::vector<ZenzFeedbackEntry> entries = store.ListEntries(policy);
+  ASSERT_EQ(entries.size(), 1);
+  EXPECT_EQ(entries[0].auto_block_reject_percentage, 33);
 }
 
 TEST(ZenzFeedbackStoreTest,
@@ -396,7 +389,8 @@ TEST(ZenzFeedbackStoreTest, AutoBlockPolicyUsesExactContextClass) {
 
   ZenzFeedbackAutoBlockPolicy policy;
   policy.enabled = true;
-  policy.reject_threshold = 2;
+  policy.minimum_reject_count = 2;
+  policy.minimum_reject_percentage = 50;
 
   ZenzFeedbackDecision decision = store.Decide("k", "empty", "v", policy);
   EXPECT_EQ(decision.action, ZenzFeedbackAction::kPrefer);
@@ -422,6 +416,21 @@ TEST(ZenzFeedbackStoreTest, DecideAllowsFutureHardRejectReason) {
   EXPECT_EQ(decision.action, ZenzFeedbackAction::kReject);
   EXPECT_EQ(decision.reason, "feedback_hard_rejected");
   EXPECT_TRUE(decision.hard_rejected);
+}
+
+TEST(ZenzFeedbackStoreTest, ManualBlockIsPersistentAndIdempotent) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+  ZenzFeedbackStore store;
+  EXPECT_TRUE(store.RecordManualBlock("あいうえお", "empty", "愛上尾"));
+  EXPECT_TRUE(store.RecordManualBlock("あいうえお", "empty", "愛上尾"));
+  EXPECT_TRUE(store.IsManuallyBlocked("あいうえお", "empty", "愛上尾"));
+  EXPECT_FALSE(store.IsManuallyBlocked("あいうえお", "empty", "愛上緒"));
+  const auto entries = store.ListEntries();
+  ASSERT_EQ(entries.size(), 1);
+  EXPECT_TRUE(entries[0].hard_rejected);
+  EXPECT_EQ(entries[0].rejected_count, 1);
+  EXPECT_FALSE(store.RecordManualBlock("bad\nkey", "empty", "v"));
 }
 
 TEST(ZenzFeedbackStoreTest, DecideHardRejectOverridesAcceptedFeedback) {
@@ -477,7 +486,8 @@ TEST(ZenzFeedbackStoreTest,
 
   ZenzFeedbackAutoBlockPolicy policy;
   policy.enabled = true;
-  policy.reject_threshold = 2;
+  policy.minimum_reject_count = 2;
+  policy.minimum_reject_percentage = 40;
 
   std::vector<ZenzFeedbackCandidate> candidates =
       store.GetRankedCandidates("k", "empty", policy);
@@ -508,7 +518,8 @@ TEST(ZenzFeedbackStoreTest,
 
   ZenzFeedbackAutoBlockPolicy policy;
   policy.enabled = false;
-  policy.reject_threshold = 1;
+  policy.minimum_reject_count = 1;
+  policy.minimum_reject_percentage = 50;
 
   const std::vector<ZenzFeedbackCandidate> candidates =
       store.GetRankedCandidates("k", "empty", policy);
@@ -627,13 +638,13 @@ TEST(ZenzFeedbackStoreTest, GetAcceptedCandidatesAcceptsUtf8Bom) {
 
   ZenzFeedbackStore store;
 
-  // Create the Mozc directory first.  This test intentionally
+  // Create %USERPROFILE%\AppData\LocalLow\Mozc first.  This test intentionally
   // overwrites the TSV directly to simulate a file saved by tools/editors that
   // write UTF-8 with BOM.
   store.RecordAccepted("__mkdir__", "empty", "__mkdir__");
 
   {
-    std::ofstream file(profile.feedback_utf8_path(),
+    std::ofstream file(profile.feedback_path(),
                        std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(file);
     file << "\xEF\xBB\xBF"
@@ -743,6 +754,76 @@ TEST(ZenzFeedbackStoreTest,
   EXPECT_EQ(entries[0].rejected_count, 1);
 }
 
+TEST(ZenzFeedbackStoreTest, AcceptedAppendReportsSuccessAndValidationFailure) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+  ZenzFeedbackStore store;
+  EXPECT_TRUE(store.RecordAccepted("k", "empty", "v"));
+  // An unsafe record cannot be appended or later compensated.
+  EXPECT_FALSE(store.RecordAccepted("bad\nkey", "empty", "v"));
+  const ZenzFeedbackDecision decision = store.Decide("k", "empty", "v");
+  EXPECT_EQ(decision.accepted_count, 1);
+}
+
+#if defined(_WIN32)
+TEST(ZenzFeedbackStoreTest, AcceptedAppendReportsExclusiveFileLockFailure) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+  ZenzFeedbackStore store;
+  ASSERT_TRUE(store.RecordAccepted("k", "empty", "v"));
+
+  const std::wstring path = profile.feedback_path();
+  HANDLE lock = ::CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_NE(lock, INVALID_HANDLE_VALUE);
+  EXPECT_FALSE(store.RecordAccepted("k", "empty", "v"));
+  ::CloseHandle(lock);
+
+  const ZenzFeedbackDecision decision = store.Decide("k", "empty", "v");
+  EXPECT_EQ(decision.accepted_count, 1);
+}
+#endif  // _WIN32
+
+TEST(ZenzFeedbackStoreTest, AcceptedRollbackCancelsOnlyOneAcceptedObservation) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+
+  ZenzFeedbackStore store;
+  store.RecordAccepted("k", "empty", "v");
+  store.RecordAccepted("k", "empty", "v");
+  store.RecordAcceptedRollback("k", "empty", "v", "undo_after_commit");
+
+  const ZenzFeedbackDecision decision = store.Decide("k", "empty", "v");
+  EXPECT_EQ(decision.action, ZenzFeedbackAction::kPrefer);
+  EXPECT_EQ(decision.accepted_count, 1);
+  EXPECT_EQ(decision.rejected_count, 0);
+  EXPECT_GT(decision.total_score, 0);
+}
+
+TEST(ZenzFeedbackStoreTest, AcceptedRollbackDoesNotCreateNegativeEvidence) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+
+  ZenzFeedbackStore store;
+  store.RecordAccepted("k", "empty", "v");
+  store.RecordAcceptedRollback("k", "empty", "v", "backspace_after_commit");
+
+  const ZenzFeedbackDecision decision = store.Decide("k", "empty", "v");
+  EXPECT_EQ(decision.action, ZenzFeedbackAction::kNeutral);
+  EXPECT_EQ(decision.accepted_count, 0);
+  EXPECT_EQ(decision.rejected_count, 0);
+  EXPECT_EQ(decision.total_score, 0);
+  EXPECT_TRUE(store.ListEntries().empty());
+
+  // A later real acceptance must not be consumed by an older rollback marker.
+  store.RecordAccepted("k", "empty", "v");
+  const ZenzFeedbackDecision accepted_again =
+      store.Decide("k", "empty", "v");
+  EXPECT_EQ(accepted_again.action, ZenzFeedbackAction::kPrefer);
+  EXPECT_EQ(accepted_again.accepted_count, 1);
+  EXPECT_EQ(accepted_again.rejected_count, 0);
+}
+
 TEST(ZenzFeedbackStoreTest, DeleteEntryRemovesOnlyMatchingRawRecords) {
   ScopedUserProfileForZenzFeedbackStoreTest profile;
   ASSERT_TRUE(profile.ok());
@@ -803,7 +884,7 @@ TEST(ZenzFeedbackStoreTest, ClearAllRemovesAllEntries) {
   EXPECT_TRUE(store.ClearAll());
   EXPECT_TRUE(store.ListEntries().empty());
 
-  std::ifstream file(profile.feedback_utf8_path(), std::ios::binary);
+  std::ifstream file(profile.feedback_path(), std::ios::binary);
   EXPECT_FALSE(file);
 }
 
@@ -816,7 +897,7 @@ TEST(ZenzFeedbackStoreTest, ExportAndImportReplacePreservesRecords) {
   store.RecordAccepted("k", "empty", "v");
   store.RecordRejected("k", "empty", "v", "explicit_reject");
 
-  const std::wstring export_path = profile.temp_file_path(L"export.tsv");
+  const auto export_path = profile.temp_file_path("export.tsv");
   ASSERT_TRUE(store.ExportToFile(export_path));
 
   ASSERT_TRUE(store.ClearAll());
@@ -845,10 +926,9 @@ TEST(ZenzFeedbackStoreTest, ImportAppendKeepsExistingRecords) {
 
   store.RecordAccepted("existing", "empty", "既存");
 
-  const std::wstring import_path = profile.temp_file_path(L"import_append.tsv");
+  const auto import_path = profile.temp_file_path("import_append.tsv");
   {
-    std::ofstream file(profile.temp_file_utf8_path(L"import_append.tsv"),
-                       std::ios::binary | std::ios::trunc);
+    std::ofstream file(import_path, std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(file);
     file << "v2\taccepted\timported\tempty\t追加\t\n";
   }
@@ -873,11 +953,10 @@ TEST(ZenzFeedbackStoreTest, ImportRejectsMalformedFileWithoutChangingExisting) {
 
   store.RecordAccepted("existing", "empty", "既存");
 
-  const std::wstring import_path =
-      profile.temp_file_path(L"import_malformed.tsv");
+  const auto import_path =
+      profile.temp_file_path("import_malformed.tsv");
   {
-    std::ofstream file(profile.temp_file_utf8_path(L"import_malformed.tsv"),
-                       std::ios::binary | std::ios::trunc);
+    std::ofstream file(import_path, std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(file);
     file << "v2\tunknown_action\tk\tempty\tv\t\n";
   }
@@ -893,6 +972,106 @@ TEST(ZenzFeedbackStoreTest, ImportRejectsMalformedFileWithoutChangingExisting) {
   EXPECT_EQ(entries[0].value, "既存");
   EXPECT_EQ(entries[0].accepted_count, 1);
   EXPECT_EQ(entries[0].rejected_count, 0);
+}
+
+TEST(ZenzFeedbackStoreTest, MinimumKeyLengthExcludesAutomaticButRecordsRemain) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+
+  ZenzFeedbackStore store;
+  store.RecordAccepted("はし", "japanese_only", "橋");
+  store.RecordRejected("はし", "japanese_only", "橋",
+                       "space_revert_zenz_to_mozc");
+  store.RecordAccepted("おねがいします", "empty", "お願いします");
+
+  ZenzFeedbackReusePolicy policy;
+  policy.minimum_key_length_enabled = true;
+  policy.minimum_key_length = 7;
+  policy.auto_block_policy.enabled = true;
+  policy.auto_block_policy.minimum_reject_count = 1;
+  policy.auto_block_policy.minimum_reject_percentage = 50;
+
+  const auto short_decision = store.Decide("はし", "japanese_only", "橋", policy);
+  EXPECT_EQ(short_decision.action, ZenzFeedbackAction::kNeutral);
+  EXPECT_EQ(short_decision.reason, "feedback_key_length_excluded");
+  EXPECT_EQ(short_decision.accepted_count, 1);
+  EXPECT_EQ(short_decision.rejected_count, 1);
+  EXPECT_FALSE(short_decision.auto_blocked);
+  EXPECT_TRUE(store.GetRankedCandidates("はし", "empty", policy).empty());
+  EXPECT_TRUE(store.GetAcceptedCandidates("はし", "empty", policy).empty());
+
+  const auto long_decision = store.Decide("おねがいします", "empty",
+                                          "お願いします", policy);
+  EXPECT_EQ(long_decision.action, ZenzFeedbackAction::kPrefer);
+  EXPECT_EQ(store.GetRankedCandidates("おねがいします", "empty", policy).size(), 1);
+
+  const auto entries = store.ListEntries(policy);
+  ASSERT_EQ(entries.size(), 2);
+  for (const auto& entry : entries) {
+    EXPECT_EQ(entry.reuse_excluded, entry.key == "はし");
+  }
+}
+
+TEST(ZenzFeedbackStoreTest, MinimumKeyLengthBoundarySixAndSeven) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+
+  ZenzFeedbackStore store;
+  // Both keys are Unicode kana strings; this must not count UTF-8 bytes.
+  store.RecordAccepted("あしたはあめ", "empty", "明日は雨");  // 6 chars
+  store.RecordAccepted("おねがいします", "empty", "お願いします");  // 7 chars
+
+  ZenzFeedbackReusePolicy policy;
+  policy.minimum_key_length_enabled = true;
+  policy.minimum_key_length = 7;
+
+  EXPECT_TRUE(store.GetRankedCandidates("あしたはあめ", "empty", policy).empty());
+  EXPECT_EQ(store.Decide("あしたはあめ", "empty", "明日は雨", policy).action,
+            ZenzFeedbackAction::kNeutral);
+  EXPECT_EQ(store.GetRankedCandidates("おねがいします", "empty", policy).size(),
+            1);
+  EXPECT_EQ(store.Decide("おねがいします", "empty", "お願いします", policy).action,
+            ZenzFeedbackAction::kPrefer);
+
+  // Changing settings immediately reactivates the same persisted observation.
+  policy.minimum_key_length = 6;
+  EXPECT_EQ(store.GetRankedCandidates("あしたはあめ", "empty", policy).size(), 1);
+}
+
+TEST(ZenzFeedbackStoreTest, ManualHardRejectOverridesMinimumKeyLength) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+  ZenzFeedbackStore store;
+  store.RecordAccepted("はし", "empty", "橋");
+  store.RecordRejected("はし", "empty", "橋", "hard_reject");
+
+  ZenzFeedbackReusePolicy policy;
+  policy.minimum_key_length_enabled = true;
+  policy.minimum_key_length = 7;
+  const auto decision = store.Decide("はし", "empty", "橋", policy);
+  EXPECT_TRUE(decision.hard_rejected);
+  EXPECT_EQ(decision.action, ZenzFeedbackAction::kReject);
+  EXPECT_EQ(decision.reason, "feedback_hard_rejected");
+  EXPECT_TRUE(store.GetRankedCandidates("はし", "empty", policy).empty());
+  const auto entries = store.ListEntries(policy);
+  ASSERT_EQ(entries.size(), 1);
+  EXPECT_FALSE(entries[0].reuse_excluded);
+}
+
+TEST(ZenzFeedbackStoreTest, ThresholdCanBeDisabledOrChangedWithoutDataLoss) {
+  ScopedUserProfileForZenzFeedbackStoreTest profile;
+  ASSERT_TRUE(profile.ok());
+  ZenzFeedbackStore store;
+  store.RecordAccepted("はし", "empty", "橋");
+  ZenzFeedbackReusePolicy policy;
+  policy.minimum_key_length_enabled = true;
+  policy.minimum_key_length = 7;
+  EXPECT_TRUE(store.GetRankedCandidates("はし", "empty", policy).empty());
+  policy.minimum_key_length = 2;
+  EXPECT_EQ(store.GetRankedCandidates("はし", "empty", policy).size(), 1);
+  policy.minimum_key_length = 7;
+  policy.minimum_key_length_enabled = false;
+  EXPECT_EQ(store.GetRankedCandidates("はし", "empty", policy).size(), 1);
 }
 
 }  // namespace

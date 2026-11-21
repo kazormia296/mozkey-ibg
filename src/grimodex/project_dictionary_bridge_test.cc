@@ -65,8 +65,8 @@ DictionaryEntryDto Entry(absl::string_view yomi, absl::string_view surface,
 class CollectTokens final : public dictionary::DictionaryInterface::Callback {
  public:
   ResultType OnToken(absl::string_view, absl::string_view,
-                     const dictionary::Token& token) override {
-    tokens.push_back(token);
+                     dictionary::Token token) override {
+    tokens.push_back(std::move(token));
     return TRAVERSE_CONTINUE;
   }
 

@@ -16,6 +16,9 @@ enum class RendererCallbackKind {
   kUnsupported,
   kSelect,
   kHighlight,
+  // SUBMIT_CANDIDATE: commits a candidate that was never focused (mouse commit
+  // of a passive suggestion). Validated like kSelect.
+  kSubmit,
 };
 
 enum class RendererCallbackCandidateDisposition {
@@ -39,7 +42,8 @@ RendererCallbackKind GetRendererCallbackKind(
 // Maps a native message identifier to its callback operation. Zero or
 // colliding registered-message identifiers are rejected.
 RendererCallbackKind GetRendererCallbackKindForMessage(
-    uint32_t message, uint32_t select_message, uint32_t highlight_message);
+    uint32_t message, uint32_t select_message, uint32_t highlight_message,
+    uint32_t submit_message);
 
 // Checks both capability freshness and whether the token can be transported
 // losslessly by the target ABI (for example, in a Windows WPARAM).

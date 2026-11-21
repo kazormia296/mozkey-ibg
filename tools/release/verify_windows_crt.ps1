@@ -70,7 +70,7 @@ $expectedRedistVersion = Split-Path -Leaf $sourceRoot
 if ($expectedRedistVersion -notmatch '^\d+\.\d+\.\d+$') {
   throw "VCToolsRedistDir is not a versioned CRT root: $sourceRoot"
 }
-$expectedFileVersion = "14.51.36247.0"
+$expectedFileVersion = "14.52.37029.0"
 $architectureRoot = Join-Path $sourceRoot $Architecture
 if (-not (Test-Path -LiteralPath $architectureRoot -PathType Container)) {
   throw "Pinned CRT architecture directory is missing: $architectureRoot"

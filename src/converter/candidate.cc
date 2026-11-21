@@ -59,6 +59,7 @@ void Candidate::Clear() {
   content_value.clear();
   content_key.clear();
   consumed_key_size = 0;
+  converted_segment_count = 1;
   prefix.clear();
   suffix.clear();
   description.clear();
@@ -72,9 +73,11 @@ void Candidate::Clear() {
   rid = 0;
   usage_id = 0;
   attributes = 0;
+  ranking_constraints = RankingConstraint::NONE;
   style = NumberUtil::NumberString::DEFAULT_STYLE;
   command = DEFAULT_COMMAND;
   inner_segment_boundary.clear();
+  proper_noun_spans.clear();
 #ifdef MOZC_CANDIDATE_DEBUG
   log.clear();
 #endif  // MOZC_CANDIDATE_DEBUG
@@ -93,7 +96,8 @@ std::string Candidate::DebugString() const {
      << " cval=" << content_value << " cost=" << cost
      << " scost=" << structure_cost << " wcost=" << wcost << " lid=" << lid
      << " rid=" << rid << " attributes=" << std::bitset<16>(attributes)
-     << " consumed_key_size=" << consumed_key_size;
+     << " consumed_key_size=" << consumed_key_size
+     << " converted_segment_count=" << converted_segment_count;
   if (!prefix.empty()) {
     os << " prefix=" << prefix;
   }

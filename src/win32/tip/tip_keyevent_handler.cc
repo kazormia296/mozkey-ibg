@@ -34,12 +34,15 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "base/win32/wide_char.h"
 #include "client/client_interface.h"
+#include "grimodex/client_context.h"
 #include "protocol/commands.pb.h"
-#include "session/key_info_util.h"
 #include "win32/base/conversion_mode_util.h"
 #include "win32/base/deleter.h"
 #include "win32/base/input_state.h"
@@ -49,10 +52,14 @@
 #include "win32/tip/tip_edit_session.h"
 #include "win32/tip/tip_grimodex_context_util.h"
 #include "win32/tip/tip_input_mode_manager.h"
+#include "win32/tip/tip_mode_indicator_key.h"
 #include "win32/tip/tip_private_context.h"
 #include "win32/tip/tip_status.h"
+#include "win32/tip/tip_surrounding_text.h"
 #include "win32/tip/tip_text_service.h"
 #include "win32/tip/tip_thread_context.h"
+#include "win32/tip/tip_writing_direction.h"
+#include "win32/tip/tip_zenz_context_request.h"
 
 namespace mozc {
 namespace win32 {
@@ -111,27 +118,12 @@ void ShowModeIndicatorAndUpdateUI(TipTextService* text_service,
   }
 }
 
-bool IsNoOpModeIndicatorKey(const InputBehavior& behavior,
-                            const InputState& current_state,
-                            const KeyEventHandlerResult& result) {
-  if (!result.has_key_information) {
-    return false;
-  }
-
-  if (current_state.open) {
-    return KeyInfoUtil::ContainsKeyInformation(
-        behavior.active_mode_ime_on_keys, result.key_information);
-  }
-
-  return KeyInfoUtil::ContainsKeyInformation(
-      behavior.direct_mode_ime_off_keys, result.key_information);
-}
-
 bool UpdateNoOpModeIndicatorKeyState(
     TipTextService* text_service, TipPrivateContext* private_context,
-    TipInputModeManager* input_mode_manager, bool is_key_down,
-    const InputBehavior& behavior, const InputState& current_state,
-    const KeyEventHandlerResult& result, bool is_on_key) {
+    TipInputModeManager* input_mode_manager, const VirtualKey& key,
+    bool is_key_down, const InputBehavior& behavior,
+    const InputState& current_state, const KeyEventHandlerResult& result,
+    bool is_on_key) {
   if (!result.has_key_information) {
     if (is_key_down) {
       private_context->ClearPendingModeIndicatorKey();
@@ -140,15 +132,40 @@ bool UpdateNoOpModeIndicatorKeyState(
   }
 
   if (is_key_down) {
-    if (IsNoOpModeIndicatorKey(behavior, current_state, result)) {
-      private_context->SetPendingModeIndicatorKey(result.key_information);
+    KeyInformation matched_key = 0;
+    if (IsNoOpModeIndicatorKey(
+            key, behavior, current_state, result.has_key_information,
+            result.key_information,
+            result.key_information_lookup_candidates, &matched_key)) {
+      // Keep the semantic configured binding as the pending identity rather
+      // than the current physical modifier snapshot.  For example, a
+      // configured generic Shift continues to mean the same binding when the
+      // physical state moves from LeftShift to LeftShift+RightShift.
+      //
+      // This identifies the configured binding only.  It intentionally does
+      // not define which key-up ends a modifier-only chord when both physical
+      // sides of the same modifier family are held; that edge case depends on
+      // the TSF key-up event flow and is outside the guaranteed binding
+      // semantics.
+      private_context->SetPendingModeIndicatorKey(matched_key);
     } else {
       private_context->ClearPendingModeIndicatorKey();
     }
     return false;
   }
 
-  if (!private_context->IsPendingModeIndicatorKey(result.key_information)) {
+  bool is_pending_mode_indicator_key =
+      private_context->IsPendingModeIndicatorKey(result.key_information);
+  if (!is_pending_mode_indicator_key) {
+    for (const KeyInformation candidate :
+         result.key_information_lookup_candidates) {
+      if (private_context->IsPendingModeIndicatorKey(candidate)) {
+        is_pending_mode_indicator_key = true;
+        break;
+      }
+    }
+  }
+  if (!is_pending_mode_indicator_key) {
     return false;
   }
 
@@ -217,6 +234,18 @@ void FillMozcContextCommon(TipTextService* text_service, ITfContext* context,
 
   *mozc_context = BuildTsfMozcContext(text_service, context,
                                       include_surrounding_text);
+
+  // Commit 12 keeps a positive vertical-writing snapshot in TipPrivateContext
+  // across TSF hosts that temporarily lose their direction attributes during
+  // composition. Propagate only that positive state. Horizontal and unknown
+  // intentionally remain false so no key behavior changes without evidence.
+  const std::shared_ptr<TipPrivateContext> private_context =
+      text_service->GetPrivateContext(context);
+  if (private_context != nullptr &&
+      private_context->composition_writing_direction() ==
+          WritingDirection::kVertical) {
+    mozc_context->set_vertical_writing(true);
+  }
 }
 
 HRESULT OnTestKey(TipTextService* text_service, ITfContext* context,
@@ -231,17 +260,24 @@ HRESULT OnTestKey(TipTextService* text_service, ITfContext* context,
   }
   const TsfFocusSnapshot test_domain =
       CaptureTsfFocusSnapshot(thread_context.get());
+  const std::shared_ptr<TipPrivateContext> private_context =
+      text_service->GetPrivateContext(context);
+  // A TestKey path can return before reaching the server. Reset first so a
+  // request from an older physical key can never leak into this key's OnKey.
+  // This precedes the focus-domain guard below, which is also an early return.
+  if (private_context != nullptr) {
+    private_context->mutable_zenz_context_request_state()->Reset();
+  }
   if (!IsTsfContextFocusedForSnapshot(text_service, context, test_domain,
                                       /*require_nonsecure=*/false)) {
     *eaten = TRUE;
     return S_OK;
   }
-  const std::shared_ptr<TipPrivateContext> private_context =
-      text_service->GetPrivateContext(context);
   if (private_context == nullptr) {
     *eaten = FALSE;
     return S_OK;
   }
+
   const uint64_t key_transaction_generation =
       private_context->ReserveKeyTransactionForFocusDomain(
           test_domain.focus_epoch, test_domain.focus_revision);
@@ -386,6 +422,12 @@ HRESULT OnTestKey(TipTextService* text_service, ITfContext* context,
     *eaten = TRUE;
     return S_OK;
   }
+
+  // Missing request fields mean 0/0, so this also keeps non-server and
+  // old-server behavior safely disabled after the reset above.
+  private_context->mutable_zenz_context_request_state()->UpdateFromOutput(
+      temporal_output);
+
   *private_context->mutable_last_down_key() = next_state.last_down_key;
 
   if (result.should_be_sent_to_server && temporal_output.has_consumed()) {
@@ -418,7 +460,8 @@ HRESULT OnTestKey(TipTextService* text_service, ITfContext* context,
     return S_OK;
   }
   if (UpdateNoOpModeIndicatorKeyState(
-          text_service, private_context.get(), input_mode_manager, is_key_down,
+          text_service, private_context.get(), input_mode_manager, vk,
+          is_key_down,
           behavior, input_state, result,
           /*is_on_key=*/false)) {
     if (!is_test_transaction_current()) {
@@ -437,10 +480,173 @@ HRESULT OnTestKey(TipTextService* text_service, ITfContext* context,
   return S_OK;
 }
 
-void FillMozcContextForOnKey(TipTextService* text_service, ITfContext* context,
-                             Context* mozc_context) {
-  FillMozcContextCommon(text_service, context,
-                        /*include_surrounding_text=*/true, mozc_context);
+void FillMozcContextForOnKey(
+    TipTextService* text_service, ITfContext* context,
+    const TipSurroundingTextInfo* generic_info,
+    const TipZenzContextRequest& zenz_context_request, Context* mozc_context) {
+  if (mozc_context == nullptr) {
+    return;
+  }
+
+  // The legacy generic surrounding-text read is performed by OnKey before the
+  // fallback TestSendKey decision. Reuse that exact result here so moving the
+  // read earlier does not add another synchronous TSF edit session.
+  //
+  // Password scope is detected inside the same TSF read edit session before
+  // any surrounding text is retrieved, so such a result never carries text.
+  const bool has_generic_text =
+      generic_info != nullptr && !generic_info->is_password_input_scope &&
+      (generic_info->has_preceding_text || generic_info->has_following_text);
+
+  std::string generic_preceding;
+  std::string generic_following;
+  if (has_generic_text) {
+    if (generic_info->has_preceding_text) {
+      generic_preceding =
+          WideToUtf8(LimitTsfPrecedingText(generic_info->preceding_text));
+    }
+    if (generic_info->has_following_text) {
+      generic_following =
+          WideToUtf8(LimitTsfFollowingText(generic_info->following_text));
+    }
+  }
+
+  const std::shared_ptr<TipThreadContext> thread_context =
+      text_service->GetThreadContextLease();
+  if (!has_generic_text || !thread_context) {
+    // BuildTsfMozcContext fails closed by itself when the thread context is
+    // gone.  No surrounding-text provider is needed here.
+    FillMozcContextCommon(text_service, context,
+                          /*include_surrounding_text=*/false, mozc_context);
+  } else {
+    // Hand the already acquired text to the typed Grimodex context builder
+    // through its guarded provider boundary.  The builder still resolves the
+    // secure-input state first and discards the text (returning a secure
+    // context) if the focus domain changed since the text was read.
+    *mozc_context = BuildTsfMozcContextFromProviders(
+        thread_context.get(), /*include_surrounding_text=*/true,
+        [context]() { return GetAttachedProgram(context); },
+        [&]() -> std::optional<grimodex::SurroundingText> {
+          grimodex::SurroundingText surrounding_text;
+          surrounding_text.preceding_text = generic_preceding;
+          surrounding_text.following_text = generic_following;
+          return surrounding_text;
+        });
+    const std::shared_ptr<TipThreadContext> current_thread_context =
+        text_service->GetThreadContextLease();
+    if (!current_thread_context ||
+        current_thread_context.get() != thread_context.get()) {
+      // The text service was deactivated or reactivated reentrantly.  A null
+      // ITfContext makes the builder return its fail-closed secure context.
+      *mozc_context = BuildTsfMozcContext(text_service, /*context=*/nullptr,
+                                          /*include_surrounding_text=*/false);
+    }
+    const std::shared_ptr<TipPrivateContext> private_context =
+        text_service->GetPrivateContext(context);
+    if (private_context != nullptr &&
+        private_context->composition_writing_direction() ==
+            WritingDirection::kVertical) {
+      mozc_context->set_vertical_writing(true);
+    }
+  }
+
+  if (generic_info == nullptr) {
+    return;
+  }
+
+  // IS_PRIVATE is a learning-policy signal, not a text-access restriction.
+  // Preserve generic/Zenz surrounding context while propagating the private
+  // origin to the server.
+  if (generic_info->is_private_input_scope) {
+    mozc_context->set_is_private_input(true);
+  }
+
+  // Propagate the password field type to the server as a second privacy layer
+  // and never attach generic or extended text.  The server treats PASSWORD on
+  // a typed Grimodex context as a fail-closed secure-input request for the
+  // current focus epoch.  Keep the typed context self-consistent
+  // (grimodex::IsValidClientContext): PASSWORD always travels with
+  // secure_input=true and without surrounding text.
+  if (generic_info->is_password_input_scope) {
+    mozc_context->set_input_field_type(Context::PASSWORD);
+    if (mozc_context->has_grimodex()) {
+      mozc_context->mutable_grimodex()->set_secure_input(true);
+    }
+    mozc_context->clear_preceding_text();
+    mozc_context->clear_following_text();
+    mozc_context->clear_zenz_preceding_text();
+    mozc_context->clear_zenz_following_text();
+    return;
+  }
+
+  // The typed context builder may have failed closed (secure input or a focus
+  // domain change).  Application text must not be attached in that case.
+  if (mozc_context->input_field_type() == Context::PASSWORD ||
+      mozc_context->grimodex().secure_input()) {
+    return;
+  }
+
+  // The IMM32 document-feed fallback has no TSF InputScope signal. Preserve
+  // its generic Mozc context for compatibility, but explicitly prevent Zenz
+  // from falling back to those generic fields.
+  if (generic_info->used_legacy_imm32_fallback) {
+    SetZenzContextUnavailable(mozc_context);
+    return;
+  }
+
+  if (zenz_context_request.empty()) {
+    return;
+  }
+
+  const bool needs_extended_acquisition =
+      (zenz_context_request.preceding_length > 0 &&
+       (!generic_info->has_preceding_text ||
+        !HasAtLeastZenzContextCharacters(
+            generic_preceding, zenz_context_request.preceding_length))) ||
+      (zenz_context_request.following_length > 0 &&
+       (!generic_info->has_following_text ||
+        !HasAtLeastZenzContextCharacters(
+            generic_following, zenz_context_request.following_length)));
+
+  TipSurroundingTextInfo extended_info;
+  const TipZenzTsfNativeAcquisitionLengths native_lengths =
+      GetZenzTsfNativeAcquisitionLengths(zenz_context_request);
+  const bool has_extended_info =
+      needs_extended_acquisition &&
+      TipSurroundingText::GetForZenzContext(
+          text_service, context, native_lengths.preceding,
+          native_lengths.following, &extended_info);
+  const bool has_trusted_extended_info =
+      has_extended_info && !extended_info.used_legacy_imm32_fallback &&
+      !extended_info.is_password_input_scope;
+
+  if (zenz_context_request.preceding_length > 0) {
+    const bool use_extended_preceding =
+        has_trusted_extended_info && extended_info.has_preceding_text;
+    if (use_extended_preceding || generic_info->has_preceding_text) {
+      const std::string source =
+          use_extended_preceding
+              ? WideToUtf8(extended_info.preceding_text)
+              : generic_preceding;
+      mozc_context->set_zenz_preceding_text(
+          TakeTrailingZenzContextCharacters(
+              source, zenz_context_request.preceding_length));
+    }
+  }
+
+  if (zenz_context_request.following_length > 0) {
+    const bool use_extended_following =
+        has_trusted_extended_info && extended_info.has_following_text;
+    if (use_extended_following || generic_info->has_following_text) {
+      const std::string source =
+          use_extended_following
+              ? WideToUtf8(extended_info.following_text)
+              : generic_following;
+      mozc_context->set_zenz_following_text(
+          TakeLeadingZenzContextCharacters(
+              source, zenz_context_request.following_length));
+    }
+  }
 }
 
 HRESULT OnKey(TipTextService* text_service, ITfContext* context,
@@ -461,6 +667,17 @@ HRESULT OnKey(TipTextService* text_service, ITfContext* context,
     *eaten = FALSE;
     return S_OK;
   }
+
+  // Consume the TestKey result immediately. Any subsequent early return must
+  // not leave it available for a later, unrelated key event. Presence is
+  // separate from the request values because an authoritative server result
+  // can legitimately request 0/0.
+  TipZenzContextRequestState* zenz_context_request_state =
+      private_context->mutable_zenz_context_request_state();
+  const bool has_test_key_result = zenz_context_request_state->has_result();
+  TipZenzContextRequest zenz_context_request =
+      zenz_context_request_state->Take();
+
   if (!IsTsfContextFocusedForSnapshot(text_service, context, output_domain,
                                       /*require_nonsecure=*/false)) {
     *eaten = TRUE;
@@ -672,6 +889,52 @@ HRESULT OnKey(TipTextService* text_service, ITfContext* context,
     ime_state.open = open;
     ime_state.last_down_key = private_context->last_down_key();
 
+    // Acquire the legacy generic context once before the fallback decision.
+    // For TSF, this same read also reports whether an ITfComposition currently
+    // exists. This is a stronger boundary signal than cached server output.
+    TipSurroundingTextInfo generic_info;
+    const bool has_generic_info =
+        TipSurroundingText::Get(text_service, context, &generic_info);
+
+    // Some TSF hosts deliver OnKey without the matching OnTestKey. Synthesize
+    // TestSendKey only for trusted TSF surrounding text outside an existing
+    // composition. Legacy IMM32 document-feed text is never acquired for Zenz,
+    // so it does not need a synthetic context-length request.
+    if (!generic_info.is_password_input_scope &&
+        ShouldRunZenzContextRequestFallback(
+            has_test_key_result, has_generic_info,
+            has_generic_info && generic_info.in_composition,
+            generic_info.used_legacy_imm32_fallback)) {
+      Context test_mozc_context;
+      FillMozcContextCommon(text_service, context,
+                            /*include_surrounding_text=*/false,
+                            &test_mozc_context);
+      if (!is_key_output_transaction_current()) {
+        *eaten = TRUE;
+        return S_OK;
+      }
+
+      InputState test_next_state;
+      commands::Output test_output;
+      std::unique_ptr<Win32KeyboardInterface> test_keyboard(
+          Win32KeyboardInterface::CreateDefault());
+
+      const KeyEventHandlerResult test_result = KeyEventHandler::ImeProcessKey(
+          vk, key_info.GetScanCodeForMapVirtualKey(), is_key_down,
+          keyboard_status, behavior, ime_state, test_mozc_context,
+          private_context->GetClient(), test_keyboard.get(), &test_next_state,
+          &test_output);
+      if (!is_key_output_transaction_current()) {
+        *eaten = TRUE;
+        return S_OK;
+      }
+      if (test_result.succeeded) {
+        TipZenzContextRequestState fallback_request_state;
+        fallback_request_state.UpdateFromOutput(test_output);
+        zenz_context_request = fallback_request_state.Take();
+      }
+    }
+
     // This call is placed in OnKey instead on OnTestKey because VK_DBE_ROMAN
     // and VK_DBE_NOROMAN are handled as preserved keys in TSF Mozc.
     // See b/3118905 for why this is necessary.
@@ -686,7 +949,9 @@ HRESULT OnKey(TipTextService* text_service, ITfContext* context,
         Win32KeyboardInterface::CreateDefault());
 
     Context mozc_context;
-    FillMozcContextForOnKey(text_service, context, &mozc_context);
+    FillMozcContextForOnKey(
+        text_service, context, has_generic_info ? &generic_info : nullptr,
+        zenz_context_request, &mozc_context);
     if (!is_key_output_transaction_current()) {
       *eaten = TRUE;
       return S_OK;
@@ -736,7 +1001,7 @@ HRESULT OnKey(TipTextService* text_service, ITfContext* context,
     }
     const bool handled_noop_mode_indicator_key =
         UpdateNoOpModeIndicatorKeyState(
-            text_service, private_context.get(), input_mode_manager,
+            text_service, private_context.get(), input_mode_manager, vk,
             is_key_down,
             behavior, ime_state, result,
             /*is_on_key=*/true);
@@ -766,9 +1031,19 @@ HRESULT OnKey(TipTextService* text_service, ITfContext* context,
 
   // TSF spec guarantees that key event handling can always be a synchronous
   // operation.
+  //
+  // Ordinary key pass-through uses should_be_eaten=false. For
+  // RECONVERT_SELECTION_OR_INSERT_SPACE, the server supplies an explicit
+  // fallback Space result when nothing is selected. If reconversion handles
+  // selected text, the callback also requires the physical key to be eaten.
+  bool callback_consumed_key_event = false;
   TipEditSession::OnOutputReceivedSync(
       text_service, context, temporal_output, output_domain.focus_epoch,
-      output_domain.focus_revision, output_application_generation);
+      output_domain.focus_revision, output_application_generation,
+      &callback_consumed_key_event);
+  if (callback_consumed_key_event) {
+    ignore_this_keyevent = false;
+  }
   *eaten = !ignore_this_keyevent ? TRUE : FALSE;
 
   return S_OK;

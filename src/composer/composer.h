@@ -77,6 +77,12 @@ class ComposerData {
 
   transliteration::TransliterationType GetInputMode() const;
 
+  // Returns the input field type captured when ComposerData was created.
+  // This is authoritative even if commands::Context omits input_field_type.
+  commands::Context::InputFieldType GetInputFieldType() const {
+    return input_field_type_;
+  }
+
   // Returns a preedit string with user's preferences.
   std::string GetStringForPreedit() const;
 
@@ -226,6 +232,26 @@ class Composer final {
 
   // Returns a preedit string with user's preferences.
   std::string GetStringForPreedit() const;
+
+  // Returns the number of unresolved Roman-table input characters in the
+  // trailing chunk. Unlike GetPendingRomanDisplayLength(), this is semantic
+  // input state and does not depend on the dim-pending-romaji UI setting.
+  size_t GetPendingRomanInputLength() const;
+
+  // Returns true when the unresolved Roman-table input is the initial input of
+  // the composition. Once any fixed reading exists before the pending suffix,
+  // this returns false even if the suffix itself is only one character long.
+  bool IsPendingRomanInputAtCompositionStart() const;
+
+  // True when the pending Roman-table suffix is displayed as a meaningful
+  // ambiguous conversion result rather than raw unresolved Roman letters.
+  bool HasTrailingDisplayedAmbiguousRomanResult() const;
+
+  // Returns the number of trailing preedit characters that represent
+  // unresolved Roman-table input and should use the subdued presentation.
+  // This is presentation metadata only; the preedit string itself is not
+  // modified.
+  size_t GetPendingRomanDisplayLength() const;
 
   // Returns a submit string with user's preferences.  The difference
   // from the preedit string is the handling of the last 'n'.

@@ -41,9 +41,10 @@ TEST(ConsumerRuntimeCapabilityTest, RequiresTheCompleteMacosRuntime) {
   EXPECT_TRUE(HasCompleteMacosZenzRuntime(probe));
   for (const char *path : {
            "mozc_zenz_scorer",
+           "mozc_zenz_guard",
            "llama-server",
            "models/zenz-v3.2-small-Q5_K_M.gguf",
-           "zenz-runtime-manifest.json",
+           "BUILD-CONTRACT.txt",
        }) {
     missing = {std::string(path)};
     EXPECT_FALSE(HasCompleteMacosZenzRuntime(probe)) << path;

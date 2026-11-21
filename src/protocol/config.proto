@@ -268,6 +268,8 @@ message Config {
     DIRECT_COMMIT_CLOSE_BRACKET = 128;
     DIRECT_COMMIT_MIDDLE_DOT = 256;
   }
+  // Mozkey enables direct commit by default in ConfigHandler and initially
+  // selects `、。？！「」`.
   optional bool use_direct_commit = 1001 [default = false];
 
   // can't use DirectCommitKey as a type since
@@ -321,6 +323,7 @@ message Config {
   // Use live conversion.
   // If this is true, the current composition is converted on every character
   // input without committing the previous live conversion result.
+  // Mozkey enables this by default in ConfigHandler.
   optional bool use_live_conversion = 69 [default = false];
 
   // Delay in milliseconds before applying live conversion after character input.
@@ -334,7 +337,7 @@ message Config {
 
   // When live conversion is disabled, the initial Convert command in
   // composition mode opens the conversion candidate window without advancing
-  // the focused candidate.
+  // the focused candidate. Mozkey enables this by default in ConfigHandler.
   optional bool show_candidate_window_on_initial_conversion = 72
       [default = false];
 
@@ -350,8 +353,24 @@ message Config {
   optional bool use_zenz_live_correction = 1003 [default = false];
 
   // Debounce in milliseconds before submitting a zenz live correction request
-  // after normal live conversion has become visible.
-  optional uint32 zenz_live_correction_delay_msec = 1004 [default = 1000];
+  // after normal live conversion has been computed. Normally the Mozc result is
+  // already visible during this delay; deferred presentation can keep the
+  // previous preedit visible instead.
+  optional uint32 zenz_live_correction_delay_msec = 1004 [default = 700];
+
+  // Keep the pre-Zenz preedit visible while Zenz live correction is pending.
+  // Mozc conversion still runs first and remains the validation baseline and
+  // fallback. If Zenz is not scheduled or its result is not adopted, the Mozc
+  // result is shown.
+  optional bool defer_live_conversion_display_until_zenz_result = 1026
+      [default = false];
+
+  // Maximum time to keep the normal Mozc live-conversion result hidden after a
+  // Zenz request has actually been submitted. This is used only by deferred
+  // presentation. If the deadline expires, the pending Zenz generation is
+  // abandoned and the already-computed Mozc result is revealed.
+  optional uint32 zenz_deferred_presentation_timeout_msec = 1028
+      [default = 250];
 
   // Timeout in milliseconds for one zenz live correction request.
   optional uint32 zenz_live_correction_timeout_msec = 1005 [default = 180];
@@ -375,21 +394,61 @@ message Config {
   // Debug logging for zenz live correction.
   optional bool zenz_live_correction_debug = 1010 [default = false];
 
-  // Experimental: record and reuse local feedback for zenz live correction.
-  // This stores only local TSV data and never sends feedback outside the machine.
-  // Raw left context is not stored.
+  // Legacy combined Zenz feedback switch (recording, automatic reuse, and
+  // Zenz-to-Mozc history learning). Keep field 1011 for configuration backward
+  // compatibility. The three independent fields below inherit this value
+  // when absent; do not reuse or renumber this field.
+  // The legacy runtime and settings dialog continue to use 1011 in Phase 1.
   optional bool use_zenz_feedback_learning = 1011 [default = false];
+
+  // Independent learning permissions. ConfigHandler applies the legacy setting
+  // to each missing field, or enables all three for a fresh Mozkey profile.
+  // Raw left context is never stored by the feedback TSV.
+  // Automatic recording of accepted and rejected Zenz observations.
+  optional bool use_zenz_feedback_recording = 1041 [default = false];
+
+  // Automatic use of saved feedback for ranking, fast reuse and auto-block.
+  // Explicit user hard blocks are outside this switch.
+  optional bool use_zenz_feedback_reuse = 1042 [default = false];
+
+  // Additional Mozc user-history learning from explicitly accepted Zenz
+  // corrections. The Mozc history and input-privacy policies still apply.
+  optional bool use_zenz_mozc_history_learning = 1043 [default = false];
+
+  // Experimental opt-in: reverse-check the final adopted Zenz surface against
+  // the complete typed reading. OFF by default, including existing profiles.
+  // Additional reverse-conversion work is performed only when enabled.
+  optional bool use_zenz_strict_reading_preservation = 1044 [default = false];
+
+  // Opt in to allowing Zenz to create, replace, or remove emoji. When off,
+  // only the user's existing emoji sequences may appear in adopted Zenz output.
+  // Independent of ordinary Mozc emoji conversion candidates (field 89).
+  optional bool allow_zenz_emoji_changes = 1050 [default = false];
+
+  // Exclude short full-sequence readings from automatic Zenz feedback
+  // promotion, fast reuse, and rejection. Explicit manual hard blocks
+  // remain effective. Recording and Mozc history are not affected.
+  optional bool use_zenz_feedback_min_key_length = 1039 [default = true];
+  optional uint32 zenz_feedback_min_key_length = 1040 [default = 7];
 
   // When enabled, repeated divergent commits of the same full-sequence Zenz
   // correction dynamically suppress that correction as an effective block.
-  // This does not write an irreversible hard-reject record; changing this
-  // setting or the threshold re-evaluates existing feedback data.
+  // This does not write an irreversible hard-reject record; changing the
+  // settings re-evaluates existing feedback data.
   optional bool use_zenz_auto_block_rejected_correction = 1018
       [default = false];
 
-  // Number of ordinary rejected observations required before the auto-block
-  // policy suppresses the same key/context/value correction.
-  optional uint32 zenz_auto_block_reject_threshold = 1019 [default = 3];
+  // Minimum number of ordinary rejected observations required before the
+  // auto-block policy may suppress the same key/context/value correction.
+  // The field name is retained for config compatibility; this is a minimum
+  // reject count, not the complete auto-block condition.
+  optional uint32 zenz_auto_block_reject_threshold = 1019 [default = 1];
+
+  // Minimum percentage of ordinary rejects among accepted + ordinary rejected
+  // observations required for auto-block. The ratio is evaluated only within
+  // the exact key/context/value bucket used by the auto-block policy.
+  optional uint32 zenz_auto_block_minimum_reject_percentage = 1027
+      [default = 50];
 
   // Zenzai v3/v3.2 condition fields. Empty values are omitted from the prompt.
   // These are not chat prompts; they are mapped to zenz special-token fields:
@@ -400,17 +459,25 @@ message Config {
   optional string zenz_live_correction_settings = 1015 [default = ""];
 
   // Zenzai v3.2 right-context support. The actual text is taken from
-  // commands::Context::following_text when the client supplies it.
+  // commands::Context::following_text when the client supplies it. Mozkey keeps
+  // this enabled in its product defaults.
   optional bool use_zenz_live_correction_right_context = 1016
       [default = true];
   optional uint32 zenz_live_correction_right_context_length = 1017
-      [default = 24];
+      [default = 6];
 
   // llama.cpp backend device used by the local Zenz runtime. Empty means
   // automatic selection with GPU offload preferred; "none" forces CPU-only
   // inference. Other values are device names reported by llama-server
   // --list-devices, such as CUDA0 or Vulkan0.
-  optional string zenz_live_correction_device = 1020 [default = ""];
+  //
+  // Mozkey IbG-specific fields use the 2000+ range so they cannot collide
+  // with upstream Mozkey's 1000+ range. This field used tag 1020 through
+  // Mozkey IbG v0.10.x; upstream Mozkey v1.0.0 assigned 1020 to
+  // ruby_window_horizontal_padding. The wire types differ (string vs varint),
+  // so a stale device value is skipped as an unknown field and the device
+  // falls back to automatic selection.
+  optional string zenz_live_correction_device = 2001 [default = ""];
 
   //////////////////////////////////////////////////////////////
   //
@@ -462,7 +529,7 @@ message Config {
   // you haven't typed before.
   optional bool use_dictionary_suggest = 101 [default = true];
 
-  // Use realtime conversion feature.
+  // Include realtime conversion candidates in suggestions.
   optional bool use_realtime_conversion = 102 [default = true];
 
   // Size of suggestions.
@@ -475,10 +542,81 @@ message Config {
   // Use mode indicator feature.
   optional bool use_mode_indicator = 120 [default = true];
 
+  // Windows input-mode indicator color theme. SYSTEM follows the current
+  // Windows app appearance; explicit DARK/LIGHT remain fixed until changed by
+  // the user. CUSTOM uses windows_mode_indicator_custom_style.
+  enum WindowsModeIndicatorTheme {
+    WINDOWS_MODE_INDICATOR_THEME_SYSTEM = 0;
+    WINDOWS_MODE_INDICATOR_THEME_DARK = 1;
+    WINDOWS_MODE_INDICATOR_THEME_LIGHT = 2;
+    WINDOWS_MODE_INDICATOR_THEME_CUSTOM = 3;
+  }
+  optional WindowsModeIndicatorTheme windows_mode_indicator_theme = 1029
+      [default = WINDOWS_MODE_INDICATOR_THEME_SYSTEM];
+
+  message WindowsModeIndicatorCustomStyle {
+    // Color values are stored as 0xRRGGBB, not Windows COLORREF.
+    optional uint32 ascii_background_color = 1 [default = 0xf5f8fc];
+    optional uint32 ascii_border_color = 2 [default = 0x5c7491];
+    optional uint32 ascii_text_color = 3 [default = 0x1c2634];
+    optional uint32 ascii_shadow_color = 4 [default = 0x788291];
+
+    optional uint32 hiragana_background_color = 5 [default = 0xebfcf8];
+    optional uint32 hiragana_border_color = 6 [default = 0x24968c];
+    optional uint32 hiragana_text_color = 7 [default = 0x124e48];
+    optional uint32 hiragana_shadow_color = 8 [default = 0x69918a];
+
+    optional uint32 katakana_background_color = 9 [default = 0xf4f4ff];
+    optional uint32 katakana_border_color = 10 [default = 0x626cd7];
+    optional uint32 katakana_text_color = 11 [default = 0x303469];
+    optional uint32 katakana_shadow_color = 12 [default = 0x78789b];
+
+    // Geometry values are logical pixels at 96 DPI unless otherwise noted.
+    optional uint32 width = 13 [default = 36];
+    optional uint32 height = 14 [default = 28];
+    optional uint32 corner_radius = 15 [default = 8];
+    // Label size is in points.
+    optional uint32 label_size = 16 [default = 12];
+    optional uint32 border_thickness = 17 [default = 1];
+    optional uint32 shadow_blur = 18 [default = 4];
+    optional uint32 shadow_opacity_percent = 19 [default = 22];
+    optional int32 shadow_offset_x = 20 [default = 0];
+    optional int32 shadow_offset_y = 21 [default = 1];
+  }
+  optional WindowsModeIndicatorCustomStyle
+      windows_mode_indicator_custom_style = 1030;
+
   // Use dark mode for candidate window and ruby overlay on Windows.
   // Deprecated UI-wise. Newer clients should use the per-window appearance
   // settings below and keep this field synchronized for backward compatibility.
   optional bool use_dark_mode_candidate_window = 121 [default = false];
+
+  // On Windows TSF, render unresolved trailing Roman input with a subdued
+  // system appearance. This changes presentation only; composer state and
+  // submitted text are unchanged.
+  optional bool dim_pending_roman_input = 1031 [default = false];
+
+  // User-visible dimness of unresolved Roman input. 0 keeps high contrast,
+  // while larger values move the text closer to the sampled background.
+  // Windows UI/runtime clamps the supported value to 0..100.
+  optional uint32 pending_roman_dimness_percent = 1032 [default = 85];
+
+  // Presentation colors for an applied Zenz live correction.
+  // These settings are currently consumed by Windows TSF. Color values are
+  // stored as 0xRRGGBB. When a custom flag is false, Windows preserves the
+  // existing target/live-conversion presentation for that color channel.
+  optional bool use_custom_zenz_live_correction_text_color = 1033
+      [default = false];
+  optional uint32 zenz_live_correction_text_color = 1034
+      [default = 0x000000];
+  optional bool use_custom_zenz_live_correction_background_color = 1035
+      [default = false];
+  optional uint32 zenz_live_correction_background_color = 1036
+      [default = 0xddeeff];
+  optional bool use_custom_zenz_live_correction_underline_color = 1037
+      [default = true];
+  optional uint32 zenz_live_correction_underline_color = 1038
+      [default = 0xc4dc6c];
 
   // Customize preedit display attributes on Windows TSF.
   // Color values are stored as 0xRRGGBB, not Windows COLORREF.
@@ -517,6 +655,8 @@ message Config {
     RENDERER_WINDOW_COLOR_DARK = 1;
     RENDERER_WINDOW_COLOR_CUSTOM = 2;
     RENDERER_WINDOW_COLOR_FOLLOW_CANDIDATE = 3;
+    // Follow the current desktop application appearance on Windows/macOS.
+    RENDERER_WINDOW_COLOR_AUTO = 4;
   }
 
   message CandidateWindowColorPalette {
@@ -543,22 +683,23 @@ message Config {
     optional uint32 border_color = 3 [default = 0x969696];
   }
 
-  // Candidate, prediction/suggestion, and ruby window appearance on Windows.
+  // Candidate, prediction/suggestion, and ruby window appearance on desktop
+  // renderers (Windows and macOS).
   // CONVERSION, TRANSLITERATION, and USAGE use the candidate window appearance.
   // PREDICTION and SUGGESTION use the suggest window appearance.
   // RubyWindow has its own compact palette.
   optional RendererWindowColorTheme candidate_window_color_theme = 136
-      [default = RENDERER_WINDOW_COLOR_LIGHT];
+      [default = RENDERER_WINDOW_COLOR_AUTO];
   optional CandidateWindowColorPalette candidate_window_custom_color_palette =
       137;
 
   optional RendererWindowColorTheme suggest_window_color_theme = 138
-      [default = RENDERER_WINDOW_COLOR_FOLLOW_CANDIDATE];
+      [default = RENDERER_WINDOW_COLOR_AUTO];
   optional CandidateWindowColorPalette suggest_window_custom_color_palette =
       139;
 
   optional RendererWindowColorTheme ruby_window_color_theme = 140
-      [default = RENDERER_WINDOW_COLOR_FOLLOW_CANDIDATE];
+      [default = RENDERER_WINDOW_COLOR_AUTO];
   optional RubyWindowColorPalette ruby_window_custom_color_palette = 141;
 
   // Window corner radius. 0 means square corners.
@@ -581,26 +722,107 @@ message Config {
   // the custom shadow. Size and distance are logical pixels and are DPI-scaled
   // by the renderer. Angle is screen-space degrees: 0=right, 45=down-right,
   // 90=down. Distance 0 creates an even shadow on all sides.
-  optional uint32 candidate_window_shadow_size = 151 [default = 12];
-  optional uint32 candidate_window_shadow_opacity_percent = 152 [default = 30];
+  optional uint32 candidate_window_shadow_size = 151 [default = 5];
+  optional uint32 candidate_window_shadow_opacity_percent = 152 [default = 10];
   optional uint32 candidate_window_shadow_angle_degrees = 153 [default = 45];
   optional uint32 candidate_window_shadow_distance = 154 [default = 6];
-  optional uint32 suggest_window_shadow_size = 155 [default = 12];
-  optional uint32 suggest_window_shadow_opacity_percent = 156 [default = 30];
+  optional uint32 suggest_window_shadow_size = 155 [default = 5];
+  optional uint32 suggest_window_shadow_opacity_percent = 156 [default = 10];
   optional uint32 suggest_window_shadow_angle_degrees = 157 [default = 45];
   optional uint32 suggest_window_shadow_distance = 158 [default = 6];
-  optional uint32 ruby_window_shadow_size = 159 [default = 10];
-  optional uint32 ruby_window_shadow_opacity_percent = 160 [default = 28];
-  optional uint32 ruby_window_shadow_angle_degrees = 161 [default = 90];
-  optional uint32 ruby_window_shadow_distance = 162 [default = 4];
+  optional uint32 ruby_window_shadow_size = 159 [default = 5];
+  optional uint32 ruby_window_shadow_opacity_percent = 160 [default = 8];
+  optional uint32 ruby_window_shadow_angle_degrees = 161 [default = 45];
+  optional uint32 ruby_window_shadow_distance = 162 [default = 3];
+
+  // Do not reuse these tags. A locally tested build assigned Ruby spacing to
+  // them and could reinterpret unknown fields preserved in existing configs.
+  reserved 164, 165, 166;
+
+  // Ruby window spacing. These are Mozkey-specific logical design values at
+  // the 150% (144 DPI) baseline and are additionally scaled by
+  // ruby_window_size_percent. Mozkey-specific fields use the 1000+ range.
+  optional uint32 ruby_window_horizontal_padding = 1020 [default = 14];
+  optional uint32 ruby_window_vertical_padding = 1021 [default = 6];
+  optional uint32 ruby_window_composition_gap = 1022 [default = 4];
+
+  // Font weights use the Windows LOGFONT scale. The settings UI exposes
+  // 100-step values from 100 (Thin) through 900 (Black). 400 matches the
+  // upstream Mozc candidate/suggestion text weight and is also used for ruby.
+  optional uint32 candidate_window_font_weight = 1023 [default = 400];
+  optional uint32 suggest_window_font_weight = 1024 [default = 400];
+  optional uint32 ruby_window_font_weight = 1025 [default = 400];
+
+  // Independent font families for candidate/suggestion/live-ruby windows.
+  // Missing fields inherit the legacy candidate_ruby_font_name (tag 134).
+  // Explicitly present empty strings request the platform's default font.
+  optional string candidate_window_font_name = 1047 [default = ""];
+  optional string suggest_window_font_name = 1048 [default = ""];
+  optional string ruby_window_font_name = 1049 [default = ""];
 
   enum WindowsImeIconStyle {
     WINDOWS_IME_ICON_DEFAULT = 0;
     WINDOWS_IME_ICON_MONOCHROME_BLACK = 1;
     WINDOWS_IME_ICON_MONOCHROME_WHITE = 2;
+    WINDOWS_IME_ICON_MONOCHROME_HIGH_CONTRAST = 3;
   }
   optional WindowsImeIconStyle windows_ime_icon_style = 163
       [default = WINDOWS_IME_ICON_DEFAULT];
+
+  // Independent conversion status overlay, shared by Windows and macOS.
+  // Field numbers are Mozkey-specific and must never be reused.
+  enum ConversionStatusIndicatorShape {
+    CONVERSION_STATUS_PILL = 0;
+    CONVERSION_STATUS_CIRCLE = 1;
+    CONVERSION_STATUS_ROUNDED_RECT = 2;
+  }
+  enum ConversionStatusIndicatorLabel {
+    CONVERSION_STATUS_FULL_LABEL = 0;
+    CONVERSION_STATUS_SYMBOL = 1;
+    CONVERSION_STATUS_COLOR_ONLY = 2;
+  }
+  enum ConversionStatusIndicatorPlacement {
+    CONVERSION_STATUS_AUTO = 0;
+    CONVERSION_STATUS_RUBY_SIDE = 1;
+    CONVERSION_STATUS_RUBY_ABOVE = 2;
+    CONVERSION_STATUS_PREEDIT_ABOVE = 3;
+    CONVERSION_STATUS_PREEDIT_BELOW = 4;
+  }
+  message ConversionStatusIndicatorStyle {
+    optional ConversionStatusIndicatorShape shape = 1
+        [default = CONVERSION_STATUS_PILL];
+    optional ConversionStatusIndicatorLabel label = 2
+        [default = CONVERSION_STATUS_FULL_LABEL];
+    optional ConversionStatusIndicatorPlacement placement = 3
+        [default = CONVERSION_STATUS_AUTO];
+    // Colors are 0xRRGGBB. "Pending" describes the asynchronous operation,
+    // not necessarily the provenance of the visible preedit.
+    optional uint32 mozc_color = 4 [default = 0x586b85];
+    optional uint32 zenz_pending_color = 5 [default = 0x847438];
+    optional uint32 zenz_color = 6 [default = 0x338d85];
+    optional uint32 reading_color = 7 [default = 0x747d8c];
+    optional uint32 text_color = 8 [default = 0xffffff];
+    optional uint32 border_color = 9 [default = 0x354357];
+    optional uint32 width = 10 [default = 56];
+    optional uint32 height = 11 [default = 22];
+    optional uint32 font_size = 12 [default = 11];
+    optional uint32 corner_radius = 13 [default = 7];
+    optional uint32 border_width = 14 [default = 0];
+    optional uint32 opacity_percent = 15 [default = 93];
+    optional uint32 shadow_size = 16 [default = 3];
+    optional uint32 shadow_opacity_percent = 17 [default = 12];
+    optional uint32 shadow_angle_degrees = 18 [default = 45];
+    optional uint32 shadow_distance = 19 [default = 2];
+    optional int32 offset_x = 20 [default = 0];
+    optional int32 offset_y = 21 [default = 0];
+    optional uint32 gap = 22 [default = 5];
+    // Empty selects the native system font; UTF-8 family name otherwise.
+    optional string font_family = 23 [default = ""];
+  }
+  // Enabled by default only when the setting is absent. An explicitly saved
+  // false value continues to be honored for existing user configurations.
+  optional bool show_conversion_status_indicator = 1045 [default = true];
+  optional ConversionStatusIndicatorStyle conversion_status_indicator_style = 1046;
 
   //////////////////////////////////////////////////////////////
   //

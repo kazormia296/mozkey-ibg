@@ -32,9 +32,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -42,6 +44,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "base/container/serialized_string_array.h"
@@ -52,8 +55,10 @@
 #include "config/character_form_manager.h"
 #include "converter/attribute.h"
 #include "converter/candidate.h"
+#include "converter/inner_segment.h"
 #include "converter/segments.h"
 #include "dictionary/pos_matcher.h"
+#include "prediction/number_decoder.h"
 #include "protocol/commands.pb.h"
 #include "protocol/config.pb.h"
 #include "request/conversion_request.h"
@@ -65,6 +70,8 @@ namespace {
 
 using ::mozc::config::CharacterFormManager;
 using ::mozc::dictionary::PosMatcher;
+
+constexpr int kMaxLenForPhoneticNumber = 6;
 
 // Rewrite type
 enum RewriteType {
@@ -78,11 +85,6 @@ struct RewriteCandidateInfo {
   int position;                    // Base (arabic number) candidate position
   converter::Candidate candidate;  // Base candidate
 };
-
-bool IsNumberStyleLearningEnabled(const ConversionRequest& request) {
-  // Enabled in mobile (software keyboard & hardware keyboard)
-  return request.request().kana_modifier_insensitive_conversion();
-}
 
 // Returns RewriteCandidateInformation if available.
 // base_candidate_pos: the index of the base candidate.
@@ -163,7 +165,6 @@ std::vector<RewriteCandidateInfo> GetRewriteCandidateInfos(
     const SerializedStringArray& suffix_array, const Segment& seg,
     const PosMatcher& pos_matcher) {
   std::vector<RewriteCandidateInfo> rewrite_candidate_info;
-  constexpr int kMaxLenForPhoneticNumber = 6;  // "100000" (じゅうまん)
 
   // Use the higher ranked candidate for deciding the insertion position.
   absl::flat_hash_set<std::string> seen;
@@ -324,6 +325,8 @@ void MergeCandidateInfoInternal(const converter::Candidate& base_cand,
   cand->rid = base_cand.rid;
   cand->style = result_cand.style;
   cand->description.assign(result_cand.description);
+  // Carry inner segmentation from the source (validated by inner_segments()).
+  cand->inner_segment_boundary = base_cand.inner_segment_boundary;
 
   // Don't want to have FULL_WIDTH form for Hex/Oct/BIN..etc.
   if (cand->style == NumberUtil::NumberString::NUMBER_HEX ||
@@ -441,6 +444,182 @@ std::vector<NumberUtil::NumberString> GetNumbersInDefaultOrder(
   return output;
 }
 
+bool HasNumberCandidate(const SerializedStringArray& suffix_array,
+                        const PosMatcher& pos_matcher,
+                        const Segment& segment) {
+  for (size_t i = 0; i < segment.candidates_size(); ++i) {
+    if (number_compound_util::IsNumber(suffix_array, pos_matcher,
+                                       segment.candidate(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsAsciiAlphabet(absl::string_view value) {
+  if (value.empty()) {
+    return false;
+  }
+
+  for (const unsigned char c : value) {
+    if (!(('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HasAsciiCounterSuffixCandidate(const PosMatcher& pos_matcher,
+                                    const Segment& segment) {
+  for (size_t i = 0; i < segment.candidates_size(); ++i) {
+    const converter::Candidate& candidate = segment.candidate(i);
+    if (pos_matcher.IsCounterSuffixWord(candidate.lid) &&
+        IsAsciiAlphabet(candidate.value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<std::string> DecodeFullArabicNumber(
+    const PosMatcher& pos_matcher, absl::string_view key) {
+  const prediction::NumberDecoder decoder(pos_matcher);
+
+  for (const prediction::NumberDecoderResult& result : decoder.Decode(key)) {
+    if (result.consumed_key_byte_len == key.size() &&
+        Util::GetScriptType(result.candidate) == Util::NUMBER) {
+      return result.candidate;
+    }
+  }
+
+  return std::nullopt;
+}
+
+std::optional<int> FindDecodedNumberSemanticBaseCandidate(
+    const Segment& segment, absl::string_view decoded_number,
+    const PosMatcher& pos_matcher) {
+  std::optional<int> fallback;
+
+  for (size_t i = 0; i < segment.candidates_size(); ++i) {
+    const converter::Candidate& candidate = segment.candidate(i);
+
+    std::string kanji_number;
+    std::string arabic_number;
+    std::string number_suffix;
+
+    if (!NumberUtil::NormalizeNumbersWithSuffix(
+            candidate.content_value,
+            false,  // trim_reading_zeros
+            &kanji_number, &arabic_number, &number_suffix) ||
+        !number_suffix.empty() || arabic_number != decoded_number) {
+      continue;
+    }
+
+    // Prefer a candidate that is already recognized as numeric.  A
+    // surface-normalizable candidate is kept only as a fallback because the
+    // converter can classify a valid number surface under a lexical POS.
+    if (IsNumberCandidate(candidate, pos_matcher)) {
+      return static_cast<int>(i);
+    }
+
+    if (!fallback.has_value()) {
+      fallback = static_cast<int>(i);
+    }
+  }
+
+  return fallback;
+}
+
+bool PromoteDecodedArabicNumber(const PosMatcher& pos_matcher,
+                                Segment* segment) {
+  if (segment == nullptr || segment->candidates_size() == 0) {
+    return false;
+  }
+
+  const std::optional<std::string> decoded =
+      DecodeFullArabicNumber(pos_matcher, segment->key());
+
+  if (!decoded.has_value()) {
+    return false;
+  }
+
+  // Prefer an exact half-width Arabic candidate that already exists.
+  // NumberRewriter normally generates such candidates for simple numeric
+  // segments, so moving the existing candidate avoids creating duplicates.
+  int exact_pos = -1;
+  for (size_t i = 0; i < segment->candidates_size(); ++i) {
+    const converter::Candidate& candidate = segment->candidate(i);
+    if (candidate.value == *decoded &&
+        candidate.content_value == *decoded &&
+        IsNumberCandidate(candidate, pos_matcher)) {
+      exact_pos = static_cast<int>(i);
+      break;
+    }
+  }
+
+  if (exact_pos >= 0) {
+    if (exact_pos != 0) {
+      segment->move_candidate(exact_pos, 0);
+    }
+
+    converter::Candidate* promoted = segment->mutable_candidate(0);
+    promoted->lid = pos_matcher.GetNumberId();
+    promoted->rid = pos_matcher.GetNumberId();
+
+    promoted->attributes |= converter::Attribute::NO_VARIANTS_EXPANSION;
+    return true;
+  }
+
+  const std::optional<int> semantic_base_pos =
+      FindDecodedNumberSemanticBaseCandidate(*segment, *decoded, pos_matcher);
+
+  converter::Candidate decoded_candidate;
+  decoded_candidate.value = *decoded;
+  decoded_candidate.content_value = *decoded;
+  decoded_candidate.style = NumberUtil::NumberString::DEFAULT_STYLE;
+  decoded_candidate.attributes |=
+      converter::Attribute::NO_VARIANTS_EXPANSION;
+
+  if (semantic_base_pos.has_value()) {
+    // Preserve the normal NumberRewriter insertion path when the converter
+    // already has a semantically matching numeric surface.
+    const converter::Candidate semantic_base =
+        segment->candidate(*semantic_base_pos);
+
+    InsertCandidate(segment, 0, semantic_base, decoded_candidate);
+
+    converter::Candidate* inserted = segment->mutable_candidate(0);
+    inserted->lid = pos_matcher.GetNumberId();
+    inserted->rid = pos_matcher.GetNumberId();
+    inserted->attributes |=
+        converter::Attribute::NO_VARIANTS_EXPANSION;
+    return true;
+  }
+
+  // A fully decodable compound reading can lack a numeric surface after
+  // boundary resize.  For example, "じゅうきゅう" can have "中９" but no
+  // "十九" or "19".  NumberDecoder is the semantic authority here.
+  //
+  // Candidate 0 contributes only its contextual cost.  Do not inherit its
+  // lexical POS, consumed-key state, learning attributes, or surface.
+  const int cost_donor_cost = segment->candidate(0).cost;
+
+  converter::Candidate* inserted = segment->insert_candidate(0);
+  inserted->key = std::string(segment->key());
+  inserted->content_key = std::string(segment->key());
+  inserted->value = *decoded;
+  inserted->content_value = *decoded;
+  inserted->consumed_key_size = 0;
+  inserted->cost = cost_donor_cost;
+  inserted->lid = pos_matcher.GetNumberId();
+  inserted->rid = pos_matcher.GetNumberId();
+  inserted->style = NumberUtil::NumberString::DEFAULT_STYLE;
+  inserted->attributes = 0;
+  inserted->attributes |= converter::Attribute::NO_VARIANTS_EXPANSION;
+
+  return true;
+}
+
 }  // namespace
 
 NumberRewriter::NumberRewriter(absl::string_view counter_suffix_data,
@@ -460,6 +639,82 @@ int NumberRewriter::capability(const ConversionRequest& request) const {
   return RewriterInterface::CONVERSION;
 }
 
+std::optional<RewriterInterface::ResizeSegmentsRequest>
+NumberRewriter::CheckResizeSegmentsRequest(
+    const ConversionRequest& request, const Segments& segments) const {
+  if (!request.config().use_number_conversion() ||
+      request.request_type() != ConversionRequest::CONVERSION ||
+      segments.resized() || segments.conversion_segments_size() <= 2) {
+    return std::nullopt;
+  }
+
+  const size_t segment_count = segments.conversion_segments_size();
+
+  // Search from right to left.  A numeric reading itself can also have a
+  // CounterSuffixWord candidate (e.g. "ご" -> "語"), so choosing the first
+  // suffix from the left can split the numeric prefix at a wrong position.
+  for (size_t suffix_index = segment_count; suffix_index-- > 1;) {
+    const Segment& suffix_segment =
+        segments.conversion_segment(suffix_index);
+
+    if (!HasAsciiCounterSuffixCandidate(pos_matcher_, suffix_segment)) {
+      continue;
+    }
+
+    size_t number_begin = suffix_index;
+    while (number_begin > 0 &&
+           HasNumberCandidate(
+               suffix_array_, pos_matcher_,
+               segments.conversion_segment(number_begin - 1))) {
+      --number_begin;
+    }
+
+    const size_t number_segment_count = suffix_index - number_begin;
+
+    // Nothing to repair when the numeric prefix is already one segment.
+    // We only repair an actually split numeric prefix:
+    //
+    //   じゅう | ご | あんぺあ
+    //      -> じゅうご | あんぺあ
+    //
+    // Do not merge the counter suffix itself into the numeric segment.
+    if (number_segment_count < 2) {
+      continue;
+    }
+
+    std::string number_key;
+    for (size_t i = number_begin; i < suffix_index; ++i) {
+      number_key += segments.conversion_segment(i).key();
+    }
+
+    if (!DecodeFullArabicNumber(pos_matcher_, number_key).has_value()) {
+      continue;
+    }
+
+    const absl::string_view suffix_key = suffix_segment.key();
+
+    const size_t number_size = Util::CharsLen(number_key);
+    const size_t suffix_size = Util::CharsLen(suffix_key);
+
+    if (number_size == 0 || suffix_size == 0 ||
+        number_size > std::numeric_limits<uint8_t>::max() ||
+        suffix_size > std::numeric_limits<uint8_t>::max()) {
+      continue;
+    }
+
+    ResizeSegmentsRequest resize_request = {
+        .segment_index = number_begin,
+        .segment_sizes = {
+            static_cast<uint8_t>(number_size),
+            static_cast<uint8_t>(suffix_size),
+            0, 0, 0, 0, 0, 0},
+    };
+    return resize_request;
+  }
+
+  return std::nullopt;
+}
+
 bool NumberRewriter::Rewrite(const ConversionRequest& request,
                              Segments* segments) const {
   DCHECK(segments);
@@ -470,11 +725,114 @@ bool NumberRewriter::Rewrite(const ConversionRequest& request,
 
   bool modified = false;
 
-  for (Segment& segment : segments->conversion_segments()) {
-    modified |= RewriteOneSegment(request, &segment, segments);
+  Segments::range conversion_segments = segments->conversion_segments();
+
+  for (auto it = conversion_segments.begin();
+       it != conversion_segments.end(); ++it) {
+    Segment* segment = &*it;
+
+    auto next = it;
+    ++next;
+
+    const bool should_promote_decoded_number =
+        request.request_type() == ConversionRequest::CONVERSION &&
+        next != conversion_segments.end() &&
+        HasAsciiCounterSuffixCandidate(pos_matcher_, *next);
+
+    modified |= RewriteOneSegment(request, segment, segments);
+
+    if (should_promote_decoded_number) {
+      modified |= PromoteDecodedArabicNumber(pos_matcher_, segment);
+    }
+  }
+
+  // The realtime decoder may return a single candidate composed of several
+  // inner segments.  Rewriting each inner segment can still present the Kanji
+  // number for a phonetic number + counter compound.
+  if (request.request_type() != ConversionRequest::PARTIAL_SUGGESTION &&
+      request.request_type() != ConversionRequest::PARTIAL_PREDICTION &&
+      request.request()
+          .decoder_experiment_params()
+          .suppress_realtime_conversion_with_converter() &&
+      segments->conversion_segments_size() > 0) {
+    modified |= RewriteTopCandidateForSuggestion(
+        segments->mutable_conversion_segment(0));
   }
 
   return modified;
+}
+
+namespace {
+// Per-inner-segment POS IDs are unavailable, so this surface-based heuristic
+// cannot reliably distinguish native readings such as みっか / ふたつ from
+// Sino-Japanese compound readings.  See upstream's documented limitation.
+std::optional<std::string> RewriteInnerContentToKanji(
+    const SerializedStringArray& suffix_array, absl::string_view key,
+    absl::string_view content_value) {
+  if (Util::GetFirstScriptType(key) == Util::NUMBER ||
+      Util::GetFirstScriptType(content_value) != Util::NUMBER) {
+    return std::nullopt;
+  }
+  absl::string_view number, suffix;
+  uint32_t script_type = 0;
+  if (!number_compound_util::SplitStringIntoNumberAndCounterSuffix(
+          suffix_array, content_value, &number, &suffix, &script_type) ||
+      number.empty()) {
+    return std::nullopt;
+  }
+  std::string kanji_number, arabic_number;
+  if (!NumberUtil::NormalizeNumbers(number, false, &kanji_number,
+                                    &arabic_number) ||
+      kanji_number.empty() ||
+      Util::CharsLen(arabic_number) > kMaxLenForPhoneticNumber) {
+    return std::nullopt;
+  }
+  return absl::StrCat(kanji_number, suffix);
+}
+}  // namespace
+
+bool NumberRewriter::RewriteTopCandidateForSuggestion(Segment* seg) const {
+  if (seg == nullptr || seg->candidates_size() == 0) {
+    return false;
+  }
+  const converter::Candidate& top = seg->candidate(0);
+  if (!(top.attributes & converter::Attribute::REALTIME_CONVERSION) ||
+      (top.attributes & converter::Attribute::USER_DICTIONARY)) {
+    return false;
+  }
+
+  bool modified = false;
+  std::string new_value;
+  converter::InnerSegmentBoundaryBuilder builder;
+  for (const auto& iter : top.inner_segments()) {
+    std::string content(iter.GetContentValue());
+    std::string value(iter.GetValue());
+    if (std::optional<std::string> kanji_content =
+            RewriteInnerContentToKanji(suffix_array_, iter.GetKey(), content);
+        kanji_content.has_value() && *kanji_content != content) {
+      content = std::move(*kanji_content);
+      value = absl::StrCat(content, iter.GetFunctionalValue());
+      modified = true;
+    }
+    absl::StrAppend(&new_value, value);
+    builder.Add(iter.GetKey().size(), value.size(),
+                iter.GetContentKey().size(), content.size());
+  }
+  if (!modified) {
+    return false;
+  }
+
+  converter::Candidate* inserted = seg->insert_candidate(0);
+  *inserted = seg->candidate(1);
+  inserted->value = std::move(new_value);
+  inserted->inner_segment_boundary =
+      builder.Build(inserted->key, inserted->value);
+  std::tie(inserted->content_key, inserted->content_value) =
+      inserted->inner_segments().GetMergedContentKeyAndValue();
+  // The following VariantsRewriter updates the top candidate in place instead
+  // of inserting another intermediate suggestion.
+  inserted->attributes |= converter::Attribute::NO_EXTRA_DESCRIPTION;
+  return true;
 }
 
 namespace {
@@ -520,7 +878,10 @@ bool NumberRewriter::RewriteOneSegment(const ConversionRequest& request,
         japanese_util::FullWidthToHalfWidth(info.candidate.content_value);
     if (Util::GetScriptType(arabic_content_value) != Util::NUMBER) {
       if (Util::GetFirstScriptType(arabic_content_value) == Util::NUMBER) {
-        // Rewrite for number suffix
+        // Rewrite for number suffix. Avoid creating duplicate Arabic values.
+        if (IsAlreadyUpdated({info.candidate}, *seg)) {
+          continue;
+        }
         const int insert_pos =
             std::min<int>(info.position + 1, seg->candidates_size());
         InsertCandidate(seg, insert_pos, info.candidate, info.candidate);
@@ -536,8 +897,16 @@ bool NumberRewriter::RewriteOneSegment(const ConversionRequest& request,
                                  arabic_content_value);
     SetNumberInfoToExistingCandidates(output, pos_matcher_, seg);
 
+    // Phonetic (KANJI_FIRST) candidates must not inherit the previous
+    // Arabic number style: doing so promotes Arabic candidates over Kanji and
+    // marks them NO_VARIANTS_EXPANSION before VariantsRewriter runs.
+    // User dictionary candidates must retain their explicitly chosen form.
+    const bool should_rerank_candidate =
+        should_rerank && info.type == ARABIC_FIRST &&
+        !(info.candidate.attributes & converter::Attribute::USER_DICTIONARY);
     const std::vector<converter::Candidate> number_candidates =
-        GenerateCandidatesToInsert(info.candidate, output, should_rerank);
+        GenerateCandidatesToInsert(request, info.candidate, output,
+                                   should_rerank_candidate);
 
     // If all the candidates are already in the segment, do nothing.
     if (IsAlreadyUpdated(number_candidates, *seg)) {
@@ -560,7 +929,20 @@ bool NumberRewriter::RewriteOneSegment(const ConversionRequest& request,
   return modified;
 }
 
+namespace {
+config::Config::CharacterForm GetConfiguredNumberCharacterForm(
+    const ConversionRequest& request) {
+  for (const auto& rule : request.config().character_form_rules()) {
+    if (rule.group() == "0") {
+      return rule.conversion_character_form();
+    }
+  }
+  return config::Config::LAST_FORM;
+}
+}  // namespace
+
 std::vector<converter::Candidate> NumberRewriter::GenerateCandidatesToInsert(
+    const ConversionRequest& request,
     const converter::Candidate& arabic_candidate,
     absl::Span<const NumberUtil::NumberString> numbers,
     bool should_rerank) const {
@@ -571,17 +953,13 @@ std::vector<converter::Candidate> NumberRewriter::GenerateCandidatesToInsert(
   }
   SetCandidatesInfo(arabic_candidate, &converted_numbers);
   if (should_rerank) {
-    RerankCandidates(converted_numbers);
+    RerankCandidates(request, converted_numbers);
   }
   return converted_numbers;
 }
 
 bool NumberRewriter::ShouldRerankCandidates(const ConversionRequest& request,
                                             const Segments& segments) const {
-  if (!IsNumberStyleLearningEnabled(request)) {
-    MOZC_VLOG(2) << "number style learning is not enabled.";
-    return false;
-  }
   if (request.incognito_mode()) {
     MOZC_VLOG(2) << "incognito mode";
     return false;
@@ -604,27 +982,67 @@ bool NumberRewriter::ShouldRerankCandidates(const ConversionRequest& request,
 }
 
 void NumberRewriter::RerankCandidates(
+    const ConversionRequest& request,
     std::vector<converter::Candidate>& candidates) const {
   std::optional<const CharacterFormManager::NumberFormStyle> stored_entry =
       CharacterFormManager::GetCharacterFormManager()->GetLastNumberStyle();
   if (!stored_entry.has_value()) {
     return;
   }
-  const NumberUtil::NumberString::Style style = stored_entry->style;
-  const config::Config::CharacterForm form = stored_entry->form;
+  NumberUtil::NumberString::Style style = stored_entry->style;
+  config::Config::CharacterForm form = stored_entry->form;
 
-  auto top_number_entry = candidates.begin();
-  for (auto itr = candidates.begin(); itr != candidates.end(); ++itr) {
-    if (itr->style != style) {
-      continue;
+  // If an explicit character form rule (HALF_WIDTH or FULL_WIDTH) is configured
+  // for numbers, adapt form and width-dependent styles accordingly.
+  const config::Config::CharacterForm config_form =
+      GetConfiguredNumberCharacterForm(request);
+  if (config_form == config::Config::HALF_WIDTH ||
+      config_form == config::Config::FULL_WIDTH) {
+    form = config_form;
+    if (style == NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH ||
+        style == NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH) {
+      style = (config_form == config::Config::HALF_WIDTH)
+                  ? NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH
+                  : NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH;
+    } else if (
+        style == NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_HALFWIDTH ||
+        style == NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_FULLWIDTH) {
+      style = (config_form == config::Config::HALF_WIDTH)
+                  ? NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_HALFWIDTH
+                  : NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_FULLWIDTH;
     }
-    if (style == NumberUtil::NumberString::DEFAULT_STYLE &&
-        ((Util::GetFormType(itr->value) == Util::HALF_WIDTH) !=
-         (form == config::Config::HALF_WIDTH))) {
-      continue;
+  }
+
+  auto find_candidate = [&](NumberUtil::NumberString::Style target_style) {
+    for (auto itr = candidates.begin(); itr != candidates.end(); ++itr) {
+      if (itr->style != target_style) {
+        continue;
+      }
+      const absl::string_view content =
+          itr->content_value.empty() ? itr->value : itr->content_value;
+      if (target_style == NumberUtil::NumberString::DEFAULT_STYLE &&
+          ((Util::GetFormType(content) == Util::HALF_WIDTH) !=
+           (form == config::Config::HALF_WIDTH))) {
+        continue;
+      }
+      return itr;
     }
-    top_number_entry = itr;
-    break;
+    return candidates.end();
+  };
+
+  auto top_number_entry = find_candidate(style);
+  // Short numbers (e.g., "123") do not have distinct separated or Arabic+Kanji
+  // candidates because their surfaces match the plain DEFAULT_STYLE candidates.
+  // Fall back to DEFAULT_STYLE with the stored character form.
+  if (top_number_entry == candidates.end() &&
+      (style == NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH ||
+       style == NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH ||
+       style == NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_HALFWIDTH ||
+       style == NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_FULLWIDTH)) {
+    top_number_entry = find_candidate(NumberUtil::NumberString::DEFAULT_STYLE);
+  }
+  if (top_number_entry == candidates.end()) {
+    return;
   }
 
   // Rerank `top_number_entry` to top.
@@ -634,8 +1052,10 @@ void NumberRewriter::RerankCandidates(
 
 void NumberRewriter::Finish(const ConversionRequest& request,
                             const Segments& segments) {
-  if (!IsNumberStyleLearningEnabled(request)) {
-    MOZC_VLOG(2) << "number style learning is not enabled.";
+  if (request.options().reversible_external_learning) {
+    // Phase 2 external Zenz learning is a reversible user-history transaction.
+    // Number style is stored as a global CharacterFormManager preference and
+    // has no per-commit rollback snapshot, so keep it outside this transaction.
     return;
   }
 
@@ -669,11 +1089,47 @@ void NumberRewriter::Finish(const ConversionRequest& request,
 
 void NumberRewriter::RememberNumberStyle(
     const converter::Candidate& candidate) {
-  const Util::FormType form = Util::GetFormType(candidate.value);
-  CharacterFormManager::NumberFormStyle entry = {
-      form == Util::HALF_WIDTH ? config::Config::HALF_WIDTH
-                               : config::Config::FULL_WIDTH,
-      candidate.style};
-  CharacterFormManager::GetCharacterFormManager()->SetLastNumberStyle(entry);
+  const absl::string_view content = candidate.content_value.empty()
+                                        ? candidate.value
+                                        : candidate.content_value;
+  const Util::FormType form = Util::GetFormType(content);
+  if (candidate.style == NumberUtil::NumberString::DEFAULT_STYLE) {
+    if (Util::GetScriptType(content) != Util::NUMBER ||
+        (form != Util::HALF_WIDTH && form != Util::FULL_WIDTH)) {
+      return;
+    }
+  } else {
+    const absl::string_view key =
+        candidate.content_key.empty() ? candidate.key : candidate.content_key;
+    if (Util::GetScriptType(content) != Util::NUMBER &&
+        Util::GetScriptType(key) != Util::NUMBER) {
+      return;
+    }
+  }
+  auto* manager = CharacterFormManager::GetCharacterFormManager();
+  config::Config::CharacterForm number_form = config::Config::FULL_WIDTH;
+  switch (candidate.style) {
+    case NumberUtil::NumberString::DEFAULT_STYLE:
+      number_form = (form == Util::HALF_WIDTH) ? config::Config::HALF_WIDTH
+                                               : config::Config::FULL_WIDTH;
+      break;
+    case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH:
+    case NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_HALFWIDTH:
+      number_form = config::Config::HALF_WIDTH;
+      break;
+    case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH:
+    case NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_FULLWIDTH:
+      number_form = config::Config::FULL_WIDTH;
+      break;
+    default:
+      // A non-Arabic (Kanji, circled, radix...) style has no numeric surface
+      // width.  Preserve the existing preference instead of forcing FULL.
+      if (manager->GetConversionCharacterForm("0") ==
+          config::Config::HALF_WIDTH) {
+        number_form = config::Config::HALF_WIDTH;
+      }
+      break;
+  }
+  manager->SetLastNumberStyle({number_form, candidate.style});
 }
 }  // namespace mozc

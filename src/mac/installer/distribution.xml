@@ -37,8 +37,7 @@
     </allowed-os-versions>
     <pkg-ref id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput"/>
     <domains enable_localSystem="true"/>
-    <options rootVolumeOnly="true"/>
-    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <options rootVolumeOnly="true" customize="never" require-scripts="false" hostArchitectures="arm64"/>
     <choices-outline>
         <line choice="default">
             <line choice="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput"/>
@@ -48,5 +47,5 @@
     <choice id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" visible="false">
         <pkg-ref id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput"/>
     </choice>
-    <pkg-ref id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" version="0" onConclusion="none">MozkeyIbG.pkg</pkg-ref>
+    <pkg-ref id="io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" onConclusion="RequireLogout">MozkeyIbG.pkg</pkg-ref>
 </installer-gui-script>

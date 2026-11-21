@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "model": {
+    "repository": "Miwa-Keita/zenz-v3.2-small-gguf",
+    "revision": "c67e03e07d215c869f591b274c1631170d3e11fe",
+    "remote_file": "ggml-model-Q5_K_M.gguf",
+    "file": "zenz-v3.2-small-Q5_K_M.gguf",
+    "windows_file": "src/win32/installer/zenz_runtime/models/zenz-v3.2-small-Q5_K_M.gguf",
+    "sha256": "29C223D4C23327B80FD13EBB5AB2555057A46317997D5DA391584FFBEF0DB673"
+  },
+  "patches": {
+    "tokenizer": {
+      "file": "src/mac/installer/zenz_runtime/patches/llama-vocab-gpt2-small-japanese-char.patch",
+      "sha256": "6DB5C11B2DA8415D6B37200EC6AA4F3FDCDDE8EFB1E7A71375FE331A7B0E829A"
+    },
+    "dual_liveness": {
+      "file": "src/mac/installer/zenz_runtime/patches/llama-server-mozkey-dual-liveness.patch",
+      "sha256": "3267E978F61456C32DFB83B15BF0F3A75393C5F98C946EE7A2846F7121B36DDA"
+    }
+  },
+  "windows": {
+    "upstream": {
+      "repository": "https://github.com/ggml-org/llama.cpp.git",
+      "tag": "v0.7.0",
+      "commit": "620d2225cc436ab0b001e3200e590e3b286ef9ab"
+    },
+    "patched_vocab_sha256": "2CEF3BDD758D9F2EB4CB80C1FC149C75461E9E32AF06E03D67D99E36FF69BBED",
+    "x64": {
+      "path": "src/win32/installer/zenz_runtime/x64/llama-server.exe",
+      "pe_machine": "0x8664",
+      "sha256": "35B953C97F870CBD7426DC865783BE36090F841C273AE779BD098E9F080F3735",
+      "source_patches": ["tokenizer", "dual_liveness"],
+      "patched_main_sha256": "2D4D4E782D33296A138F0B7D25528912529F6B7768200753D12B159613BC2DD3"
+    },
+    "arm64": {
+      "path": "src/win32/installer/zenz_runtime/arm64/llama-server.exe",
+      "pe_machine": "0xAA64",
+      "sha256": "6BDE0FAF466261C8233298ECB2BDF01A78AAEBE9729C03BA4EA95F045F772737",
+      "source_patches": ["tokenizer"],
+      "ggml_native": false,
+      "ggml_cpu_arm_arch": "armv8-a"
+    }
+  },
+  "macos": {
+    "upstream": {
+      "repository": "https://github.com/ggml-org/llama.cpp.git",
+      "tag": "v0.7.0",
+      "commit": "620d2225cc436ab0b001e3200e590e3b286ef9ab"
+    },
+    "patched_vocab_sha256": "3a65249edbcaf4a21742e44f89a2be810a75e53c892bb5905e1a5dc71227184d",
+    "patched_main_sha256": "2197ffc83775b865b97b35528a99f1daa692cf25eb4e952509e46e2cfebbf976",
+    "minimum_os": "12.0",
+    "architectures": "x86_64,arm64"
+  }
+}

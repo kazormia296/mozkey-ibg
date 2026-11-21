@@ -30,6 +30,7 @@
 #ifndef MOZC_REWRITER_NUMBER_REWRITER_H_
 #define MOZC_REWRITER_NUMBER_REWRITER_H_
 
+#include <optional>
 #include <vector>
 
 #include "absl/types/span.h"
@@ -54,6 +55,10 @@ class NumberRewriter : public RewriterInterface {
 
   int capability(const ConversionRequest& request) const override;
 
+  std::optional<ResizeSegmentsRequest> CheckResizeSegmentsRequest(
+      const ConversionRequest& request,
+      const Segments& segments) const override;
+
   bool Rewrite(const ConversionRequest& request,
                Segments* segments) const override;
 
@@ -61,16 +66,19 @@ class NumberRewriter : public RewriterInterface {
               const Segments& segments) override;
 
  private:
+  bool RewriteTopCandidateForSuggestion(Segment* segment) const;
   bool RewriteOneSegment(const ConversionRequest& request, Segment* segment,
                          Segments* segments) const;
   void RememberNumberStyle(const converter::Candidate& candidate);
   std::vector<converter::Candidate> GenerateCandidatesToInsert(
+      const ConversionRequest& request,
       const converter::Candidate& arabic_candidate,
       absl::Span<const NumberUtil::NumberString> numbers,
       bool should_rerank) const;
   bool ShouldRerankCandidates(const ConversionRequest& request,
                               const Segments& segments) const;
-  void RerankCandidates(std::vector<converter::Candidate>& candidates) const;
+  void RerankCandidates(const ConversionRequest& request,
+                        std::vector<converter::Candidate>& candidates) const;
 
   SerializedStringArray suffix_array_;
   const dictionary::PosMatcher pos_matcher_;

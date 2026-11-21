@@ -32,17 +32,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <memory>
 #include <string>
 
 #include "absl/strings/string_view.h"
 #include "base/text_normalizer.h"
 #include "base/util.h"
+#include "composer/composer.h"
+#include "composer/table.h"
 #include "converter/attribute.h"
 #include "converter/candidate.h"
 #include "converter/segments.h"
 #include "engine/candidate_list.h"
 #include "protocol/candidate_window.pb.h"
 #include "protocol/commands.pb.h"
+#include "protocol/config.pb.h"
+#include "transliteration/transliteration.h"
 #include "testing/gunit.h"
 
 namespace mozc {
@@ -65,6 +70,33 @@ void FillDummySegment(const DummySegment* dummy_segments, const size_t num,
     cand->usage_title = dummy_segments[i].usage_title;
     cand->usage_description = dummy_segments[i].usage_description;
   }
+}
+
+TEST(EngineOutputTest, FillPreeditMarksOnlyPendingRomanTail) {
+  auto table = std::make_shared<composer::Table>();
+  table->AddRule("ta", "た", "");
+  table->AddRule("tt", "っ", "t");
+
+  auto request = std::make_shared<commands::Request>();
+  auto config = std::make_shared<config::Config>();
+  config->set_preedit_method(config::Config::ROMAN);
+  config->set_dim_pending_roman_input(true);
+
+  composer::Composer composer(table, request, config);
+  composer.SetInputMode(transliteration::HIRAGANA);
+  composer.InsertCharacter("t");
+  composer.InsertCharacter("t");
+
+  commands::Preedit preedit;
+  output::FillPreedit(composer, &preedit);
+
+  ASSERT_EQ(preedit.segment_size(), 2);
+  EXPECT_FALSE(preedit.segment(0).is_pending_roman());
+  EXPECT_TRUE(preedit.segment(1).is_pending_roman());
+  EXPECT_EQ(preedit.segment(1).value_length(), 1);
+  EXPECT_EQ(preedit.segment(0).value() + preedit.segment(1).value(),
+            TextNormalizer::NormalizeText(composer.GetStringForPreedit()));
+  EXPECT_EQ(preedit.cursor(), composer.GetCursor());
 }
 
 TEST(EngineOutputTest, FillCandidate) {
@@ -90,6 +122,9 @@ TEST(EngineOutputTest, FillCandidate) {
   segment.mutable_candidate(42)->suffix = kSuffix42;
   segment.mutable_candidate(42)->description = kDescription42;
   segment.mutable_candidate(42)->display_value = kDisplayValue42;
+  segment.mutable_candidate(42)->key = "key42";
+  segment.mutable_candidate(42)->attributes |=
+      converter::Attribute::USER_DICTIONARY;
 
   candidate.set_id(13);
   output::FillCandidate(segment, candidate, &candidate_proto);
@@ -108,6 +143,7 @@ TEST(EngineOutputTest, FillCandidate) {
   EXPECT_EQ(candidate_proto.annotation().suffix(), kSuffix42);
   EXPECT_EQ(candidate_proto.annotation().description(), kDescription42);
   EXPECT_EQ(candidate_proto.annotation().display_value(), kDisplayValue42);
+  EXPECT_TRUE(candidate_proto.annotation().suppressible());
 
   candidate.Clear();
   candidate_proto.Clear();
@@ -390,9 +426,10 @@ TEST(EngineOutputTest, FillAllCandidateWords_Attributes) {
       converter::Attribute::USER_HISTORY_PREDICTION |
       converter::Attribute::NO_DELETABLE;
   segment.mutable_candidate(6)->attributes =
-      converter::Attribute::PROJECT_DICTIONARY |
       converter::Attribute::NO_LEARNING |
       converter::Attribute::NO_MODIFICATION;
+  segment.mutable_candidate(6)->ranking_constraints =
+      converter::RankingConstraint::PROJECT_DICTIONARY;
 
   candidate_list.set_focused(true);
   candidate_list.MoveToId(0);
@@ -430,9 +467,11 @@ TEST(EngineOutputTest, FillAllCandidateWords_Attributes) {
   EXPECT_EQ(candidates_proto.candidates(4).attributes(0),
             commands::CandidateAttribute::TYPING_CORRECTION);
 
-  EXPECT_EQ(1, candidates_proto.candidates(5).attributes_size());
+  EXPECT_EQ(2, candidates_proto.candidates(5).attributes_size());
   EXPECT_EQ(candidates_proto.candidates(5).attributes(0),
             commands::CandidateAttribute::USER_HISTORY);
+  EXPECT_EQ(candidates_proto.candidates(5).attributes(1),
+            commands::CandidateAttribute::DELETABLE);
 
   EXPECT_EQ(1, candidates_proto.candidates(6).attributes_size());
   EXPECT_EQ(candidates_proto.candidates(6).attributes(0),
@@ -748,14 +787,14 @@ TEST(EngineOutputTest, FillFooter) {
   EXPECT_TRUE(candidate_window.has_footer());
   EXPECT_FALSE(candidate_window.footer().has_label());
   EXPECT_TRUE(candidate_window.footer().index_visible());
-  EXPECT_TRUE(candidate_window.footer().logo_visible());
+  EXPECT_FALSE(candidate_window.footer().logo_visible());
 
   candidate_window.Clear();
   EXPECT_TRUE(output::FillFooter(commands::CONVERSION, &candidate_window));
   EXPECT_TRUE(candidate_window.has_footer());
   EXPECT_FALSE(candidate_window.footer().has_label());
   EXPECT_TRUE(candidate_window.footer().index_visible());
-  EXPECT_TRUE(candidate_window.footer().logo_visible());
+  EXPECT_FALSE(candidate_window.footer().logo_visible());
 
   candidate_window.Clear();
   EXPECT_FALSE(
@@ -772,30 +811,36 @@ TEST(EngineOutputTest, FillFooter) {
     c->set_index(i);
     c->set_value("dummy");
     c->set_id(i);
-    // Candidates with even Id can be deleted.
+    // Even candidates represent history deletion. Odd candidates
+    // represent ordinary suppressible candidates.
     c->mutable_annotation()->set_deletable(i % 2 == 0);
+    c->mutable_annotation()->set_suppressible(true);
   }
   for (int i = 0; i < 20; ++i) {
     candidate_window.clear_footer();
     candidate_window.set_focused_index(i);
     EXPECT_TRUE(output::FillFooter(commands::PREDICTION, &candidate_window));
+    ASSERT_TRUE(candidate_window.has_footer());
+    ASSERT_TRUE(candidate_window.footer().has_label());
+    EXPECT_FALSE(candidate_window.footer().logo_visible());
     if (i % 2 == 0) {
-      ASSERT_TRUE(candidate_window.has_footer());
-      ASSERT_TRUE(candidate_window.footer().has_label());
 #if defined(__APPLE__)
-      constexpr char kDeleteInstruction[] = "control+fn+deleteで履歴から削除";
+      constexpr char kInstruction[] = "control+fn+deleteで履歴削除";
 #elif defined(OS_CHROMEOS)
-      constexpr char kDeleteInstruction[] = "ctrl+alt+backspaceで履歴から削除";
+      constexpr char kInstruction[] = "ctrl+alt+backspaceで履歴削除";
 #else   // !__APPLE__ && !OS_CHROMEOS
-      constexpr char kDeleteInstruction[] = "Ctrl+Delで履歴から削除";
+      constexpr char kInstruction[] = "Ctrl+Delで履歴削除";
 #endif  // __APPLE__ || OS_CHROMEOS
-      EXPECT_EQ(candidate_window.footer().label(), kDeleteInstruction);
-#if defined(CHANNEL_DEV) && defined(GOOGLE_JAPANESE_INPUT_BUILD)
+      EXPECT_EQ(candidate_window.footer().label(), kInstruction);
     } else {
-      EXPECT_FALSE(candidate_window.footer().has_label());
-      EXPECT_TRUE(candidate_window.footer().has_sub_label());
-      EXPECT_EQ(candidate_window.footer().sub_label().find("build "), 0);
-#endif  // CHANNEL_DEV && GOOGLE_JAPANESE_INPUT_BUILD
+#if defined(__APPLE__)
+      constexpr char kInstruction[] = "control+fn+deleteで候補非表示";
+#elif defined(OS_CHROMEOS)
+      constexpr char kInstruction[] = "ctrl+alt+backspaceで候補非表示";
+#else   // !__APPLE__ && !OS_CHROMEOS
+      constexpr char kInstruction[] = "Ctrl+Delで候補非表示";
+#endif  // __APPLE__ || OS_CHROMEOS
+      EXPECT_EQ(candidate_window.footer().label(), kInstruction);
     }
   }
 }
@@ -982,6 +1027,84 @@ TEST(EngineOutputTest, FillRemovedCandidateWords) {
 
   // Execute FillAllCandidateWords
   output::FillRemovedCandidates(segment, &candidates_proto);
+}
+
+TEST(EngineOutputTest, FillConversion_MultiSegmentSpan) {
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("わたしは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "私";
+  cand0->key = "わたし";
+
+  converter::Candidate* cand1 = seg0->push_back_candidate();
+  cand1->value = "私は";
+  cand1->key = "わたしは";
+  cand1->converted_segment_count = 2;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("は");
+  converter::Candidate* cand2 = seg1->push_back_candidate();
+  cand2->value = "は";
+  cand2->key = "は";
+
+  // When candidate 0 (normal) is selected: 2 segments rendered
+  {
+    commands::Preedit preedit;
+    output::FillConversion(segments, 0, 0, &preedit);
+    EXPECT_EQ(preedit.segment_size(), 2);
+    EXPECT_EQ(preedit.segment(0).value(), "私");
+    EXPECT_EQ(preedit.segment(1).value(), "は");
+  }
+
+  // When candidate 1 (converted_segment_count = 2) is selected: only 1 segment
+  // rendered
+  {
+    commands::Preedit preedit;
+    output::FillConversion(segments, 0, 1, &preedit);
+    EXPECT_EQ(preedit.segment_size(), 1);
+    EXPECT_EQ(preedit.segment(0).value(), "私は");
+    EXPECT_EQ(preedit.segment(0).key(), "わたしは");
+    EXPECT_EQ(preedit.segment(0).annotation(),
+              commands::Preedit::Segment::HIGHLIGHT);
+    EXPECT_EQ(preedit.cursor(), Util::CharsLen("私は"));
+  }
+
+  // When candidate 1 (converted_segment_count = 2) is candidate(0) on seg0,
+  // and focus is on seg1 (focused_segment_index = 1):
+  // current_index (0) < focused_index (1) and current_index + count (2) >
+  // focused_index (1), so span is truncated to 1.
+  {
+    Segments segs_with_multi_top;
+    Segment* s0 = segs_with_multi_top.add_segment();
+    s0->set_key("わたしは");
+    converter::Candidate* c0 = s0->push_back_candidate();
+    c0->value = "私は";
+    c0->key = "わたしは";
+    c0->converted_segment_count = 2;
+
+    Segment* s1 = segs_with_multi_top.add_segment();
+    s1->set_key("なかのです");
+    converter::Candidate* c1 = s1->push_back_candidate();
+    c1->value = "中野です";
+    c1->key = "なかのです";
+
+    commands::Preedit preedit;
+    output::FillConversion(segs_with_multi_top, 1, 0, &preedit);
+    EXPECT_EQ(preedit.segment_size(), 2);
+    EXPECT_EQ(preedit.segment(0).value(), "私は");
+    EXPECT_EQ(preedit.segment(1).value(), "中野です");
+    EXPECT_EQ(preedit.segment(1).annotation(),
+              commands::Preedit::Segment::HIGHLIGHT);
+  }
+
+  // Empty conversion segments returns early without error.
+  {
+    Segments empty_segments;
+    commands::Preedit preedit;
+    output::FillConversion(empty_segments, 0, 0, &preedit);
+    EXPECT_EQ(preedit.segment_size(), 0);
+  }
 }
 
 }  // namespace engine

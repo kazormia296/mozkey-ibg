@@ -52,6 +52,7 @@
 
 #import "mac/KeyCodeMap.h"
 #import "mac/renderer_receiver.h"
+#include "mac/zenz_context_acquisition.h"
 
 #include "absl/log/log.h"
 #include "absl/strings/string_view.h"
@@ -85,6 +86,8 @@ using SetOfString = std::set<std::string, std::less<>>;
 - (void)cancelDelayedSessionCommand;
 - (void)delayedInvokeSessionCommandFromTimer:(NSTimer *)timer;
 - (void)dispatchSessionCommand:(const SessionCommand *)command client:(id)sender;
+- (BOOL)isSecureEventInputEnabledForContext;
+- (void)applyClientHintsToContext:(mozc::commands::Context *)context;
 - (BOOL)refreshSecureInputState;
 - (BOOL)isCurrentGrimodexEpoch:(uint64_t)focusEpoch;
 - (BOOL)isCurrentNonSecureTextQueryEpoch:(uint64_t)focusEpoch;
@@ -98,7 +101,10 @@ using SetOfString = std::set<std::string, std::less<>>;
                  client:(id)sender
       sendingFocusEpoch:(uint64_t)sendingFocusEpoch;
 - (BOOL)updateComposedString:(const mozc::commands::Preedit *)preedit
-          sendingFocusEpoch:(uint64_t)sendingFocusEpoch;
+              liveConversion:(bool)liveConversion
+           sendingFocusEpoch:(uint64_t)sendingFocusEpoch;
+- (void)resetWritingDirection;
+- (void)updateWritingDirectionFromAttributes:(NSDictionary *)attributes;
 @end
 
 namespace {
@@ -119,9 +125,11 @@ uint64_t NewRendererCallbackToken() {
 }
 
 constexpr int kMaxSurroundingLength = 20;
-// In some apllications when the client's text length is large, getting the
-// surrounding text takes too much time. So we set this limitation.
-constexpr int kGetSurroundingTextClientLengthLimit = 1000;
+// Legacy generic surrounding-context acquisition keeps the historical client
+// length cap because some applications make attributedSubstringFromRange:
+// expensive on large documents. Zenz-specific acquisition is independently
+// bounded to a small native range and does not inherit this document-size cap.
+constexpr int kGenericSurroundingTextClientLengthLimit = 1000;
 
 constexpr absl::string_view kRomanModeId = "com.apple.inputmethod.Roman";
 constexpr absl::string_view kKatakanaModeId = "com.apple.inputmethod.Japanese.Katakana";
@@ -210,54 +218,118 @@ bool CanSurroundingText(absl::string_view bundle_id) {
   return bundle_id != "com.evernote.Evernote";
 }
 
-bool ShouldDisplayRendererForOutput(const Output &output) {
+bool HasLiveConversionReading(const Output &output) {
+  return output.has_preedit() &&
+         (output.live_conversion() || output.pre_live_conversion_reading());
+}
+
+bool ShouldDisplayRendererForOutput(const Output &output,
+                                    bool show_conversion_status_indicator) {
+  const bool status_visible = show_conversion_status_indicator &&
+      output.has_preedit() && output.preedit().segment_size() > 0;
   return (output.has_candidate_window() &&
           output.candidate_window().candidate_size() > 0) ||
-         (output.live_conversion() && output.has_preedit());
+         HasLiveConversionReading(output) || status_visible;
 }
 
-bool ShouldSuppressCandidateWindowForLiveConversion(const Output &output,
-                                                   bool use_live_conversion,
-                                                   bool allow_candidate_window) {
-  return use_live_conversion && !allow_candidate_window &&
-         output.has_candidate_window() &&
-         output.candidate_window().candidate_size() > 0 &&
-         !output.live_conversion();
-}
-
-bool ShouldRecalculateRendererPosition(const RendererCommand &command) {
-  return !command.visible() ||
-         (command.has_output() && command.output().live_conversion());
-}
-
-uint32_t GetPreeditCharLength(const Preedit &preedit) {
-  uint32_t length = 0;
-  for (int i = 0; i < preedit.segment_size(); ++i) {
-    const Preedit::Segment &segment = preedit.segment(i);
-    if (segment.has_value_length()) {
-      length += segment.value_length();
-    } else {
-      length += mozc::Util::CharsLen(segment.value());
-    }
+bool ShouldSuppressCandidateWindowForLiveConversion(
+    const Output &output, bool use_live_conversion) {
+  if (!use_live_conversion ||
+      !output.has_candidate_window() ||
+      output.candidate_window().candidate_size() == 0 ||
+      output.live_conversion()) {
+    return false;
   }
-  return length;
+
+  const mozc::commands::CandidateWindow &candidate_window =
+      output.candidate_window();
+
+  // focused_index is the protocol-level distinction between an actual
+  // candidate-selection state and a passive suggestion state.  Do not infer
+  // this state from the physical key or require a particular category.
+  return !candidate_window.has_focused_index();
+}
+
+bool ShouldRecalculateRendererPosition(const RendererCommand &command,
+                                       bool show_conversion_status_indicator) {
+  return !command.visible() || (command.has_output() &&
+      (HasLiveConversionReading(command.output()) ||
+       (show_conversion_status_indicator &&
+        command.output().has_preedit())));
 }
 
 int32_t GetRendererAnchorPosition(const Output &output) {
-  if (output.live_conversion() && output.has_preedit()) {
-    const Preedit &preedit = output.preedit();
-    const uint32_t length = GetPreeditCharLength(preedit);
-    if (length == 0) {
-      return 0;
-    }
-    const uint32_t cursor = std::min(preedit.cursor(), length);
-    return (cursor == 0) ? 0 : static_cast<int32_t>(cursor - 1);
-  }
+  // CandidateWindow::position is the protocol-defined position within the
+  // composition.  Live conversion must not replace it with cursor - 1,
+  // because doing so moves a suggestion toward the end of a multi-character
+  // preedit.
   if (output.has_candidate_window()) {
     return output.candidate_window().position();
   }
+
+  // A live-conversion ruby window can be displayed without a candidate
+  // window.  Such a window is anchored to the start of the composition.
   return 0;
 }
+
+void SetRendererRectangle(
+    const NSRect &line_rect, const NSPoint &baseline,
+    RendererCommand::Rectangle *rectangle) {
+  const int right_offset = line_rect.size.width;
+  const int top_offset = -line_rect.size.height;
+
+  rectangle->set_left(baseline.x);
+  rectangle->set_right(baseline.x + right_offset);
+  rectangle->set_top(baseline.y + top_offset);
+  rectangle->set_bottom(baseline.y);
+}
+
+NSUInteger CodePointOffsetToUtf16Offset(NSString *text, uint32_t code_point_offset) {
+  const NSUInteger length = [text length];
+  NSUInteger utf16_offset = 0;
+  uint32_t current_code_point = 0;
+  while (utf16_offset < length && current_code_point < code_point_offset) {
+    const unichar first = [text characterAtIndex:utf16_offset];
+    ++utf16_offset;
+    if (first >= 0xD800 && first <= 0xDBFF && utf16_offset < length) {
+      const unichar second = [text characterAtIndex:utf16_offset];
+      if (second >= 0xDC00 && second <= 0xDFFF) {
+        ++utf16_offset;
+      }
+    }
+    ++current_code_point;
+  }
+  return utf16_offset;
+}
+bool IsHighSurrogate(unichar value) {
+  return value >= 0xD800 && value <= 0xDBFF;
+}
+
+bool IsLowSurrogate(unichar value) {
+  return value >= 0xDC00 && value <= 0xDFFF;
+}
+
+NSString *TrimIncompleteZenzSurrogateEdges(NSString *text) {
+  if (text == nil) {
+    return nil;
+  }
+
+  NSUInteger begin = 0;
+  NSUInteger end = [text length];
+
+  if (begin < end && IsLowSurrogate([text characterAtIndex:begin])) {
+    ++begin;
+  }
+  if (begin < end && IsHighSurrogate([text characterAtIndex:end - 1])) {
+    --end;
+  }
+
+  if (begin == 0 && end == [text length]) {
+    return text;
+  }
+  return [text substringWithRange:NSMakeRange(begin, end - begin)];
+}
+
 }  // namespace
 
 @implementation MozcImkInputController
@@ -269,9 +341,8 @@ int32_t GetRendererAnchorPosition(const Output &output) {
 @synthesize replacementRange = replacementRange_;
 @synthesize imkClientForTest = imkClientForTest_;
 @synthesize useLiveConversionForTest = useLiveConversion_;
-@synthesize allowCandidateWindowForLiveConversionForTest =
-    allowCandidateWindowForLiveConversion_;
-@synthesize secureInputOverrideForTest = secureInputOverrideForTest_;
+@synthesize useZenzContextAcquisitionForTest = useZenzContextAcquisition_;
+@synthesize secureEventInputStateForTest = secureEventInputStateForTest_;
 - (mozc::client::ClientInterface *)mozcClient {
   return mozcClient_.get();
 }
@@ -309,41 +380,54 @@ int32_t GetRendererAnchorPosition(const Output &output) {
   originalString_ = [[NSMutableString alloc] init];
   composedString_ = [[NSMutableAttributedString alloc] init];
   cursorPosition_ = -1;
+  useUnspecifiedSelectionRange_ = false;
   mode_ = mozc::commands::DIRECT;
   suppressSuggestion_ = false;
   yenSignCharacter_ = mozc::config::Config::YEN_SIGN;
+  hasWritingDirection_ = false;
+  verticalWriting_ = false;
   liveConversionAnchorLeft_ = 0;
   hasLiveConversionAnchorLeft_ = false;
   useLiveConversion_ = false;
-  allowCandidateWindowForLiveConversion_ = false;
+  useConversionStatusIndicator_ = false;
+  useZenzContextAcquisition_ = false;
+  secureEventInputStateForTest_ = (server == nil) ? 0 : -1;
   grimodexFocusEpoch_ = mozc::grimodex::AdvanceFocusEpoch(0);
   grimodexSecureInput_ = false;
   grimodexSecureInputInitialized_ = false;
   // Unit tests directly exercise the controller without IMK activation.
   // Production controllers become active only in activateServer:.
   grimodexActive_ = server == nil;
-  secureInputOverrideForTest_ = server == nil ? 0 : -1;
   delayedSessionCommandFocusEpoch_ = 0;
   rendererCommandFocusEpoch_ = 0;
   rendererCallbackToken_ = 0;
-  mozcRenderer_ = mozc::renderer::RendererClient::Create();
-  mozcClient_ = mozc::client::ClientFactory::NewClient();
+  // Unit tests inject mock renderer/client objects immediately after
+  // construction. Avoid creating production process/IPC dependencies in the
+  // server == nil test environment.
+  if (server != nil) {
+    mozcRenderer_ = mozc::renderer::RendererClient::Create();
+    mozcClient_ = mozc::client::ClientFactory::NewClient();
+  }
   lastKeyDownTime_ = 0;
   lastKeyCode_ = 0;
 
   // We don't check the return value of NSBundle because it fails during tests.
   [[NSBundle mainBundle] loadNibNamed:@"Config" owner:self topLevelObjects:nil];
-  if (!originalString_ || !composedString_ || !mozcRenderer_ || !mozcClient_) {
+  const bool hasRuntimeDependencies =
+      server == nil || (mozcRenderer_ != nullptr && mozcClient_ != nullptr);
+  if (!originalString_ || !composedString_ || !hasRuntimeDependencies) {
     self = nil;
   } else {
     DLOG(INFO) << [[NSString
         stringWithFormat:@"initWithServer: %@ %@ %@", server, delegate, inputClient] UTF8String];
-    if (!mozcRenderer_->Activate()) {
+    if (mozcRenderer_ && !mozcRenderer_->Activate()) {
       LOG(ERROR) << "Cannot activate renderer";
       mozcRenderer_.reset();
     }
     [self setupClientBundle:inputClient];
-    [self setupCapability];
+    if (mozcClient_) {
+      [self setupCapability];
+    }
     RendererCommand::ApplicationInfo *applicationInfo = rendererCommand_.mutable_application_info();
     applicationInfo->set_process_id(::getpid());
     // thread_id and receiver_handle are not used currently in Mac but
@@ -484,6 +568,10 @@ int32_t GetRendererAnchorPosition(const Output &output) {
   [keyCodeMap_ setInputMode:input_mode];
   yenSignCharacter_ = config.yen_sign_character();
   useLiveConversion_ = config.use_live_conversion();
+  useConversionStatusIndicator_ = config.show_conversion_status_indicator();
+  // Avoid an extra TEST_SEND_KEY round trip for ordinary Mozc input.
+  useZenzContextAcquisition_ =
+      useLiveConversion_ && config.use_zenz_live_correction();
 
   if (config.use_japanese_layout()) {
     // Apple does not have "Japanese" layout actually -- here sets
@@ -518,6 +606,8 @@ int32_t GetRendererAnchorPosition(const Output &output) {
                        NSMakeRange(0, [composedString_ length])];
   [originalString_ setString:@""];
   cursorPosition_ = -1;
+  useUnspecifiedSelectionRange_ = false;
+  [self resetWritingDirection];
   [NSObject cancelPreviousPerformRequestsWithTarget:self
                                            selector:@selector(delayedUpdateCandidates)
                                              object:nil];
@@ -528,9 +618,7 @@ int32_t GetRendererAnchorPosition(const Output &output) {
   // This check intentionally happens before every path that may query the
   // client's text.  The test override keeps that security contract directly
   // verifiable without depending on process-global Carbon state.
-  const bool secureInput =
-      secureInputOverrideForTest_ >= 0 ? secureInputOverrideForTest_ != 0
-                                       : ::IsSecureEventInputEnabled();
+  const bool secureInput = [self isSecureEventInputEnabledForContext];
   const bool changed =
       grimodexSecureInputInitialized_ && secureInput != grimodexSecureInput_;
   const bool initiallySecure =
@@ -911,6 +999,7 @@ int32_t GetRendererAnchorPosition(const Output &output) {
     return;
   }
   if (![self updateComposedString:&(output->preedit())
+                   liveConversion:output->live_conversion()
                 sendingFocusEpoch:sendingFocusEpoch]) {
     return;
   }
@@ -1048,43 +1137,73 @@ int32_t GetRendererAnchorPosition(const Output &output) {
 }
 
 - (void)updateComposedString:(const Preedit *)preedit {
+  [self updateComposedString:preedit liveConversion:false];
+}
+
+- (void)updateComposedString:(const Preedit *)preedit
+              liveConversion:(bool)live_conversion {
   [self refreshSecureInputState];
   [self updateComposedString:preedit
-          sendingFocusEpoch:grimodexFocusEpoch_];
+              liveConversion:live_conversion
+           sendingFocusEpoch:grimodexFocusEpoch_];
 }
 
 - (BOOL)updateComposedString:(const Preedit *)preedit
-          sendingFocusEpoch:(uint64_t)sendingFocusEpoch {
+              liveConversion:(bool)live_conversion
+           sendingFocusEpoch:(uint64_t)sendingFocusEpoch {
   if (![self isCurrentGrimodexEpoch:sendingFocusEpoch]) {
     return NO;
   }
   // If the last and the current composed string length is 0,
   // we don't update the composition.
-  if (([composedString_ length] == 0) && ((preedit == nullptr || preedit->segment_size() == 0))) {
+  if (([composedString_ length] == 0) &&
+      ((preedit == nullptr || preedit->segment_size() == 0))) {
+    // No composition owns the cached writing direction at this point.  Clear
+    // it even though there is no marked-text update to send to the client.
+    [self resetWritingDirection];
     return YES;
   }
 
   [composedString_ deleteCharactersInRange:NSMakeRange(0, [composedString_ length])];
   cursorPosition_ = -1;
+  useUnspecifiedSelectionRange_ = false;
   if (preedit != nullptr) {
-    cursorPosition_ = preedit->cursor();
+    NSDictionary *highlightAttributes =
+        [self markForStyle:kTSMHiliteSelectedConvertedText
+                   atRange:NSMakeRange(NSNotFound, 0)];
+    NSDictionary *underlineAttributes =
+        [self markForStyle:kTSMHiliteConvertedText
+                   atRange:NSMakeRange(NSNotFound, 0)];
+
     for (size_t i = 0; i < preedit->segment_size(); ++i) {
-      NSDictionary *highlightAttributes = [self markForStyle:kTSMHiliteSelectedConvertedText
-                                                     atRange:NSMakeRange(NSNotFound, 0)];
-      NSDictionary *underlineAttributes = [self markForStyle:kTSMHiliteConvertedText
-                                                     atRange:NSMakeRange(NSNotFound, 0)];
       const Preedit::Segment &seg = preedit->segment(static_cast<int32_t>(i));
-      NSDictionary *attr = (seg.annotation() == Preedit::Segment::HIGHLIGHT) ? highlightAttributes
-                                                                             : underlineAttributes;
+      NSDictionary *attributes = nil;
+      if (!live_conversion) {
+        attributes = (seg.annotation() == Preedit::Segment::HIGHLIGHT)
+                         ? highlightAttributes
+                         : underlineAttributes;
+      }
       NSString *seg_string = [NSString stringWithUTF8String:seg.value().c_str()];
       NSAttributedString *seg_attributed_string =
-          [[NSAttributedString alloc] initWithString:seg_string attributes:attr];
+          [[NSAttributedString alloc] initWithString:seg_string attributes:attributes];
       [composedString_ appendAttributedString:seg_attributed_string];
+    }
+
+    if (live_conversion && [composedString_ length] > 0) {
+      // Live conversion is a conversion preview, not a focused-clause
+      // selection.  Leaving the selection unspecified lets AppKit keep its
+      // native insertion caret instead of showing Mozc's focused-clause
+      // boundary as the caret.
+      useUnspecifiedSelectionRange_ = true;
+    } else {
+      cursorPosition_ = static_cast<int>(
+          CodePointOffsetToUtf16Offset([composedString_ string], preedit->cursor()));
     }
   }
   if ([composedString_ length] == 0) {
     [originalString_ setString:@""];
     replacementRange_ = NSMakeRange(NSNotFound, 0);
+    [self resetWritingDirection];
   }
 
   // selectionRange may enter the host application and reenter the run loop.
@@ -1124,9 +1243,9 @@ int32_t GetRendererAnchorPosition(const Output &output) {
   return composedString_;
 }
 
+
 - (void)clearCandidates {
   hasLiveConversionAnchorLeft_ = false;
-  allowCandidateWindowForLiveConversion_ = false;
   rendererCommandFocusEpoch_ = 0;
   rendererCallbackToken_ = 0;
   rendererCommand_.set_type(RendererCommand::UPDATE);
@@ -1141,8 +1260,13 @@ int32_t GetRendererAnchorPosition(const Output &output) {
 // |selecrionRange| method is defined at IMKInputController class and
 // means the position of cursor actually.
 - (NSRange)selectionRange {
+  // Refresh first: a Secure Event Input transition clears the composition and
+  // with it the live-conversion selection state checked below.
   const bool secureInput = [self refreshSecureInputState];
   const uint64_t textQueryEpoch = grimodexFocusEpoch_;
+  if (useUnspecifiedSelectionRange_) {
+    return NSMakeRange(NSNotFound, 0);
+  }
   if ((!grimodexActive_ || secureInput) && cursorPosition_ == -1) {
     return NSMakeRange(0, 0);
   }
@@ -1164,6 +1288,38 @@ int32_t GetRendererAnchorPosition(const Output &output) {
   return selectedRange;
 }
 
+- (void)resetWritingDirection {
+  hasWritingDirection_ = false;
+  verticalWriting_ = false;
+
+  if (rendererCommand_.has_application_info() &&
+      rendererCommand_.application_info().has_composition_target()) {
+    rendererCommand_.mutable_application_info()
+        ->mutable_composition_target()
+        ->clear_vertical_writing();
+  }
+}
+
+- (void)updateWritingDirectionFromAttributes:(NSDictionary *)attributes {
+  // IMKTextOrientationName is returned by
+  // attributesForCharacterIndex:lineHeightRectangle:.  Its NSNumber value is
+  // YES for horizontal layout and NO for vertical layout.
+  if (hasWritingDirection_ || attributes == nil) {
+    return;
+  }
+
+  id orientation = attributes[IMKTextOrientationName];
+  if (![orientation isKindOfClass:[NSNumber class]]) {
+    return;
+  }
+
+  hasWritingDirection_ = true;
+  verticalWriting_ = ![orientation boolValue];
+  rendererCommand_.mutable_application_info()
+      ->mutable_composition_target()
+      ->set_vertical_writing(verticalWriting_);
+}
+
 - (void)delayedUpdateCandidates {
   if (!mozcRenderer_) {
     return;
@@ -1178,14 +1334,15 @@ int32_t GetRendererAnchorPosition(const Output &output) {
   }
 
   if (!rendererCommand_.has_output() ||
-      !ShouldDisplayRendererForOutput(rendererCommand_.output())) {
+      !ShouldDisplayRendererForOutput(rendererCommand_.output(),
+                                      useConversionStatusIndicator_)) {
     hasLiveConversionAnchorLeft_ = false;
     rendererCommand_.set_visible(false);
     mozcRenderer_->ExecCommand(rendererCommand_);
     return;
   }
 
-  if (!rendererCommand_.output().live_conversion()) {
+  if (!HasLiveConversionReading(rendererCommand_.output())) {
     hasLiveConversionAnchorLeft_ = false;
   }
 
@@ -1197,7 +1354,8 @@ int32_t GetRendererAnchorPosition(const Output &output) {
   //    cursor position correctly.  The candidate window moves
   //    frequently with those application, which irritates users.
   //  - Kotoeri does this too.
-  if (!ShouldRecalculateRendererPosition(rendererCommand_)) {
+  if (!ShouldRecalculateRendererPosition(rendererCommand_,
+                                         useConversionStatusIndicator_)) {
     // Call ExecCommand anyway to update other information like candidate words.
     mozcRenderer_->ExecCommand(rendererCommand_);
     return;
@@ -1207,40 +1365,68 @@ int32_t GetRendererAnchorPosition(const Output &output) {
 
   NSRect preeditRect = NSZeroRect;
   const uint64_t geometryEpoch = rendererCommandFocusEpoch_;
+  // Snapshot what is needed from the output: a domain transition detected
+  // after a host call clears |rendererCommand_|.
   const int32_t position = GetRendererAnchorPosition(rendererCommand_.output());
-  // Some applications throws error when we call attributesForCharacterIndex.
+  const bool hasLiveConversionReading =
+      HasLiveConversionReading(rendererCommand_.output());
+
+  // Some applications throw an exception from
+  // attributesForCharacterIndex:lineHeightRectangle:.
   DLOG(INFO) << "attributesForCharacterIndex: " << position;
   @try {
-    NSDictionary *clientData = [[self client] attributesForCharacterIndex:position
-                                                      lineHeightRectangle:&preeditRect];
+    NSDictionary *clientData =
+        [[self client] attributesForCharacterIndex:position
+                              lineHeightRectangle:&preeditRect];
     if (![self isCurrentNonSecureTextQueryEpoch:geometryEpoch]) {
       [self clearCandidates];
       return;
     }
+    [self updateWritingDirectionFromAttributes:clientData];
 
-    // IMKBaseline: Left-bottom of the composition.
-    NSPoint baseline = [clientData[@"IMKBaseline"] pointValue];
-    // IMKTextOrientation: 0: vertical writing, 1: horizontal writing.
-    // IMKLineHeight: Height of the composition (in horizontal writing).
-    // NSFont: Font information of the composition.
-    // IMKLineAscent: Not sure. A float number. (e.g. 9.240234)
+    // IMKBaseline is the left-bottom coordinate of the requested character.
+    const NSPoint baseline = [clientData[@"IMKBaseline"] pointValue];
 
-    const int right_offset = preeditRect.size.width;
-    const int top_offset = -preeditRect.size.height;
-    int left = baseline.x;
-    if (rendererCommand_.output().live_conversion()) {
+    int candidate_left = baseline.x;
+    if (hasLiveConversionReading) {
       if (!hasLiveConversionAnchorLeft_) {
         liveConversionAnchorLeft_ = baseline.x;
         hasLiveConversionAnchorLeft_ = true;
       }
-      left = liveConversionAnchorLeft_;
+      candidate_left = liveConversionAnchorLeft_;
     }
 
-    RendererCommand::Rectangle *rect = rendererCommand_.mutable_preedit_rectangle();
-    rect->set_left(left);
-    rect->set_right(left + right_offset);
-    rect->set_top(baseline.y + top_offset);
-    rect->set_bottom(baseline.y);
+    SetRendererRectangle(
+        preeditRect, NSMakePoint(candidate_left, baseline.y),
+        rendererCommand_.mutable_preedit_rectangle());
+
+    rendererCommand_.clear_ruby_preedit_rectangle();
+
+    if (hasLiveConversionReading) {
+      if (position == 0) {
+        rendererCommand_.mutable_ruby_preedit_rectangle()->CopyFrom(
+            rendererCommand_.preedit_rectangle());
+      } else {
+        // A passive suggestion may be anchored partway through the
+        // composition. Ruby represents the reading of the entire preedit and
+        // therefore needs the geometry of character index zero.
+        NSRect rubyPreeditRect = NSZeroRect;
+        NSDictionary *rubyClientData =
+            [[self client] attributesForCharacterIndex:0
+                                  lineHeightRectangle:&rubyPreeditRect];
+        if (![self isCurrentNonSecureTextQueryEpoch:geometryEpoch]) {
+          [self clearCandidates];
+          return;
+        }
+        [self updateWritingDirectionFromAttributes:rubyClientData];
+        const NSPoint rubyBaseline =
+            [rubyClientData[@"IMKBaseline"] pointValue];
+
+        SetRendererRectangle(
+            rubyPreeditRect, rubyBaseline,
+            rendererCommand_.mutable_ruby_preedit_rectangle());
+      }
+    }
 
   } @catch (NSException *exception) {
     LOG(ERROR) << "Exception from [" << clientBundle_ << "] " << [[exception name] UTF8String]
@@ -1260,19 +1446,23 @@ int32_t GetRendererAnchorPosition(const Output &output) {
     return;
   }
 
-  if (ShouldSuppressCandidateWindowForLiveConversion(
-          *output, useLiveConversion_, allowCandidateWindowForLiveConversion_)) {
+  const bool suppress_candidate_window =
+      ShouldSuppressCandidateWindowForLiveConversion(
+          *output, useLiveConversion_);
+  if (suppress_candidate_window &&
+      !output->pre_live_conversion_reading()) {
     [self clearCandidates];
     return;
   }
 
-  if (output->live_conversion() || !output->has_candidate_window() ||
-      output->candidate_window().candidate_size() == 0) {
-    allowCandidateWindowForLiveConversion_ = false;
-  }
-
   rendererCommand_.set_type(RendererCommand::UPDATE);
   *rendererCommand_.mutable_output() = *output;
+  if (suppress_candidate_window) {
+    // Keep the pre-live reading output, but preserve the existing behavior of
+    // suppressing the unfocused ordinary suggestion while live conversion is
+    // enabled.
+    rendererCommand_.mutable_output()->clear_candidate_window();
+  }
   rendererCommandFocusEpoch_ = grimodexFocusEpoch_;
   rendererCallbackToken_ = NewRendererCallbackToken();
   rendererCommand_.mutable_application_info()->set_renderer_callback_token(
@@ -1322,7 +1512,7 @@ int32_t GetRendererAnchorPosition(const Output &output) {
     return false;
   }
   if (totalLength <= 0 || totalLength == NSNotFound ||
-      totalLength > kGetSurroundingTextClientLengthLimit) {
+      totalLength > kGenericSurroundingTextClientLengthLimit) {
     return false;
   }
   NSRange selectedRange = [client selectedRange];
@@ -1396,6 +1586,162 @@ int32_t GetRendererAnchorPosition(const Output &output) {
     return false;
   }
   return true;
+}
+
+- (BOOL)fillZenzSurroundingContext:(mozc::commands::Context *)context
+                            client:(id<IMKTextInput>)client
+                   precedingLength:(uint32_t)precedingLength
+                   followingLength:(uint32_t)followingLength {
+  if (context == nullptr || client == nil) {
+    return false;
+  }
+  if (precedingLength == 0 && followingLength == 0) {
+    return true;
+  }
+
+  // Zenz context is host text.  Apply the same boundary as the generic
+  // collector: never query the client under Secure Event Input or outside the
+  // active input domain, and recheck after every potentially reentrant host
+  // call so text read for a previous domain is never forwarded.
+  const auto abandon = [context]() -> BOOL {
+    context->clear_zenz_preceding_text();
+    context->clear_zenz_following_text();
+    return false;
+  };
+  if ([self refreshSecureInputState] || !grimodexActive_) {
+    return abandon();
+  }
+  const uint64_t textQueryEpoch = grimodexFocusEpoch_;
+
+  const NSUInteger totalLength = [client length];
+  if (![self isCurrentNonSecureTextQueryEpoch:textQueryEpoch]) {
+    return abandon();
+  }
+  if (totalLength == NSNotFound) {
+    return false;
+  }
+
+  const NSRange selectedRange = [client selectedRange];
+  if (![self isCurrentNonSecureTextQueryEpoch:textQueryEpoch]) {
+    return abandon();
+  }
+  if (selectedRange.location == NSNotFound ||
+      selectedRange.length == NSNotFound) {
+    return false;
+  }
+
+  const std::optional<mozc::mac::ZenzContextNativeRanges> ranges =
+      mozc::mac::GetZenzContextNativeRanges(
+          static_cast<size_t>(totalLength),
+          static_cast<size_t>(selectedRange.location),
+          static_cast<size_t>(selectedRange.length), precedingLength,
+          followingLength);
+  if (!ranges.has_value()) {
+    return false;
+  }
+
+  bool succeeded = true;
+
+  if (precedingLength > 0 && ranges->preceding.has_value()) {
+    if (context->has_preceding_text() &&
+        mozc::Util::CharsLen(context->preceding_text()) >= precedingLength) {
+      context->set_zenz_preceding_text(
+          mozc::mac::TakeTrailingZenzContextCharacters(
+              context->preceding_text(), precedingLength));
+    } else {
+      const mozc::mac::ZenzContextNativeRange range = *ranges->preceding;
+      if (range.length == 0) {
+        context->set_zenz_preceding_text("");
+      } else {
+        @try {
+          NSAttributedString *nativeAttributedText =
+              [client attributedSubstringFromRange:NSMakeRange(
+                          static_cast<NSUInteger>(range.location),
+                          static_cast<NSUInteger>(range.length))];
+          if (![self isCurrentNonSecureTextQueryEpoch:textQueryEpoch]) {
+            return abandon();
+          }
+          NSString *nativeText = [nativeAttributedText string];
+          if (![self isCurrentNonSecureTextQueryEpoch:textQueryEpoch]) {
+            return abandon();
+          }
+          nativeText = TrimIncompleteZenzSurrogateEdges(nativeText);
+          const char *utf8 =
+              nativeText == nil ? nullptr : [nativeText UTF8String];
+          if (utf8 == nullptr) {
+            succeeded = false;
+          } else {
+            context->set_zenz_preceding_text(
+                mozc::mac::TakeTrailingZenzContextCharacters(
+                    utf8, precedingLength));
+          }
+        } @catch (NSException *exception) {
+          LOG(ERROR)
+              << "Exception while acquiring Zenz preceding context from ["
+              << clientBundle_ << "]: " << [[exception reason] UTF8String];
+          succeeded = false;
+        }
+      }
+    }
+  }
+
+  if (followingLength > 0 && ranges->following.has_value()) {
+    const mozc::mac::ZenzContextNativeRange range = *ranges->following;
+    if (range.length == 0) {
+      context->set_zenz_following_text("");
+    } else {
+      @try {
+        NSAttributedString *nativeAttributedText =
+            [client attributedSubstringFromRange:NSMakeRange(
+                        static_cast<NSUInteger>(range.location),
+                        static_cast<NSUInteger>(range.length))];
+        if (![self isCurrentNonSecureTextQueryEpoch:textQueryEpoch]) {
+          return abandon();
+        }
+        NSString *nativeText = [nativeAttributedText string];
+        if (![self isCurrentNonSecureTextQueryEpoch:textQueryEpoch]) {
+          return abandon();
+        }
+        nativeText = TrimIncompleteZenzSurrogateEdges(nativeText);
+        const char *utf8 =
+            nativeText == nil ? nullptr : [nativeText UTF8String];
+        if (utf8 == nullptr) {
+          succeeded = false;
+        } else {
+          context->set_zenz_following_text(
+              mozc::mac::TakeLeadingZenzContextCharacters(
+                  utf8, followingLength));
+        }
+      } @catch (NSException *exception) {
+        LOG(ERROR)
+            << "Exception while acquiring Zenz following context from ["
+            << clientBundle_ << "]: " << [[exception reason] UTF8String];
+        succeeded = false;
+      }
+    }
+  }
+
+  if (![self isCurrentNonSecureTextQueryEpoch:textQueryEpoch]) {
+    return abandon();
+  }
+  return succeeded;
+}
+
+- (BOOL)isSecureEventInputEnabledForContext {
+  if (secureEventInputStateForTest_ >= 0) {
+    return secureEventInputStateForTest_ != 0;
+  }
+  return IsSecureEventInputEnabled();
+}
+
+- (void)applyClientHintsToContext:(mozc::commands::Context *)context {
+  if (suppressSuggestion_) {
+    // TODO(komatsu, horo): Support Google Omnibox too.
+    context->add_experimental_features("google_search_box");
+  }
+  if (hasWritingDirection_ && verticalWriting_) {
+    context->set_vertical_writing(true);
+  }
 }
 
 - (BOOL)handleEvent:(NSEvent *)event client:(id)sender {
@@ -1497,21 +1843,54 @@ int32_t GetRendererAnchorPosition(const Output &output) {
     [originalString_ appendFormat:@"%c", keyEvent.key_code()];
   }
 
+  // The Grimodex client context carries the focus epoch and the Secure Event
+  // Input state.  Under Secure Event Input it is marked PASSWORD and no
+  // application text is inspected (matching the Windows password-scope privacy
+  // boundary); otherwise it performs the historical best-effort generic
+  // surrounding-context acquisition.
   mozc::commands::Context context =
       [self buildClientContextForClient:sender includeSurroundingText:YES];
-  if (suppressSuggestion_) {
-    // TODO(komatsu, horo): Support Google Omnibox too.
-    context.add_experimental_features("google_search_box");
-  }
+  [self applyClientHintsToContext:&context];
   keyEvent.set_mode(mode_);
 
-  if (useLiveConversion_) {
-    allowCandidateWindowForLiveConversion_ =
-        keyEvent.has_special_key() &&
-      keyEvent.special_key() == mozc::commands::KeyEvent::SPACE;
+  uint64_t sendingFocusEpoch = context.grimodex().focus_epoch();
+  const bool secureEventInput = context.grimodex().secure_input();
+  const bool canAcquireSurroundingContext =
+      [composedString_ length] == 0 &&
+      CanSelectedRange(clientBundle_) &&
+      CanSurroundingText(clientBundle_);
+
+  // Zenz-specific acquisition is independently bounded, so a legacy generic
+  // context failure (for example, a document longer than 1000 UTF-16 units)
+  // must not suppress the TEST_SEND_KEY preflight.
+  if (!secureEventInput && useZenzContextAcquisition_ &&
+      canAcquireSurroundingContext) {
+    Output testOutput;
+    if (mozcClient_->TestSendKeyWithContext(keyEvent, context, &testOutput) &&
+        [self isCurrentNonSecureTextQueryEpoch:sendingFocusEpoch]) {
+      const uint32_t precedingLength =
+          testOutput.zenz_preceding_text_request_length();
+      const uint32_t followingLength =
+          testOutput.zenz_following_text_request_length();
+      if (precedingLength > 0 || followingLength > 0) {
+        [self fillZenzSurroundingContext:&context
+                                  client:sender
+                         precedingLength:precedingLength
+                         followingLength:followingLength];
+      }
+    }
+    // The preflight round trip and the host text queries can reenter the run
+    // loop.  If Secure Event Input or the input domain changed meanwhile,
+    // discard everything collected for the previous domain and send the key
+    // with a context rebuilt from the current state.
+    if (![self isCurrentNonSecureTextQueryEpoch:sendingFocusEpoch]) {
+      context =
+          [self buildClientContextForClient:sender includeSurroundingText:NO];
+      [self applyClientHintsToContext:&context];
+      sendingFocusEpoch = context.grimodex().focus_epoch();
+    }
   }
 
-  const uint64_t sendingFocusEpoch = context.grimodex().focus_epoch();
   if (!mozcClient_->SendKeyWithContext(keyEvent, context, &output)) {
     return NO;
   }

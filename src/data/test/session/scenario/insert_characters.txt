@@ -255,10 +255,10 @@ EXPECT_RESULT
 RESET_CONTEXT
 SWITCH_COMPOSITION_MODE	HALF_ASCII
 SEND_KEY	SPACE
-# Space will be passed directly
+# Half-width Space is explicitly committed by ReconvertSelectionOrInsertSpace.
 EXPECT_PREEDIT
-EXPECT_RESULT
-EXPECT_CONSUMED	false
+EXPECT_RESULT	" "
+EXPECT_CONSUMED	true
 SEND_KEY	CTRL SHIFT SPACE
 EXPECT_PREEDIT
 # Full width space in result
@@ -271,10 +271,10 @@ EXPECT_RESULT	　
 RESET_CONTEXT
 SWITCH_COMPOSITION_MODE	HALF_KATAKANA
 SEND_KEY	SPACE
-# Space will be passed directly
+# Half-width Space is explicitly committed by ReconvertSelectionOrInsertSpace.
 EXPECT_PREEDIT
-EXPECT_RESULT
-EXPECT_CONSUMED	false
+EXPECT_RESULT	" "
+EXPECT_CONSUMED	true
 SEND_KEY	CTRL SHIFT SPACE
 EXPECT_PREEDIT
 # Full width space in result

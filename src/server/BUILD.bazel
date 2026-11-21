@@ -117,18 +117,6 @@ mozc_cc_library(
 
 mozc_macos_application(
     name = "mozc_server_macos",
-    additional_contents = {
-        "//mac/zenz_runtime:packaged_license_apache_2_0": "Resources/licenses",
-        "//mac/zenz_runtime:packaged_license_cpp_httplib_mit": "Resources/licenses",
-        "//mac/zenz_runtime:packaged_license_llama_cpp_mit": "Resources/licenses",
-        "//mac/zenz_runtime:packaged_license_nlohmann_json_mit": "Resources/licenses",
-        "//mac/zenz_runtime:packaged_license_third_party_notices": "Resources/licenses",
-        "//mac/zenz_runtime:packaged_license_zenz_model": "Resources/licenses",
-        "//mac/zenz_runtime:packaged_llama_server": "Resources",
-        "//mac/zenz_runtime:packaged_mozc_zenz_scorer": "Resources",
-        "//mac/zenz_runtime:packaged_normalized_model": "Resources/models",
-        "//mac/zenz_runtime:packaged_runtime_manifest": "Resources",
-    },
     app_icons = ["//data/images/mac:product_icon.icns"],
     bundle_id = MACOS_BUNDLE_ID_PREFIX + ".Converter",
     bundle_name = mozc_select(

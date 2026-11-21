@@ -55,6 +55,11 @@ struct ExternalConversionSegment {
   std::string key;
   std::string value;
   bool is_reranked = false;
+
+  // True only when this segment sequence represents a boundary change from the
+  // live Mozc conversion that the user saw. Callers must set this consistently
+  // for every segment in the same sequence.
+  bool boundary_resized = false;
 };
 
 class ConverterInterface {
@@ -112,7 +117,19 @@ class ConverterInterface {
     return false;
   }
 
-  // Learns externally committed multi-segment conversion results, such as a
+  // Reversible variant of LearnExternalConversionResult. On success,
+  // |revert_segments| receives the post-FinishConversion Segments carrying the
+  // revert_id and rewriter state required by RevertConversion().
+  [[nodiscard]]
+  virtual bool LearnExternalConversionResultReversibly(
+      const ConversionRequest& request,
+      absl::string_view key,
+      absl::string_view value,
+      Segments* revert_segments) const {
+    return false;
+  }
+
+  // Learns externally committed segmented conversion results, such as a
   // Zenz accepted result safely projected onto Mozc live-conversion segments.
   // This represents one virtual conversion commit with phrase boundaries, not
   // multiple independent feedback-store records.
@@ -120,6 +137,55 @@ class ConverterInterface {
   virtual bool LearnExternalConversionSegments(
       const ConversionRequest& request,
       absl::Span<const ExternalConversionSegment> segments) const {
+    return false;
+  }
+
+  // Reversible variant of LearnExternalConversionSegments. On success,
+  // |revert_segments| receives the post-FinishConversion Segments carrying the
+  // revert_id and rewriter state required by RevertConversion().
+  [[nodiscard]]
+  virtual bool LearnExternalConversionSegmentsReversibly(
+      const ConversionRequest& request,
+      absl::Span<const ExternalConversionSegment> segments,
+      Segments* revert_segments) const {
+    return false;
+  }
+
+  // Confirms a reversible Finish operation by discarding only its rollback
+  // metadata. The learned history remains applied.
+  virtual void DiscardConversionRevertState(Segments* segments) const {
+    if (segments != nullptr) {
+      segments->set_revert_id(0);
+    }
+  }
+
+  // Resolves an accepted external full-sequence key/value pair into Mozc-native
+  // phrase boundaries without mutating user history.  Implementations must
+  // return only boundaries for which both reverse reading and fixed-boundary
+  // forward conversion agree exactly with |key| and |value|.
+  [[nodiscard]]
+  virtual bool ResolveExternalConversionSegments(
+      const ConversionRequest& request, absl::string_view key,
+      absl::string_view value,
+      std::vector<ExternalConversionSegment>* segments) const {
+    if (segments != nullptr) {
+      segments->clear();
+    }
+    return false;
+  }
+
+  // Evaluates a caller-supplied external segment sequence under exactly those
+  // reading boundaries, without mutating history. The output preserves the
+  // supplied keys/values and marks is_reranked when the accepted surface is a
+  // normal Mozc candidate but not candidate(0) with user history disabled.
+  [[nodiscard]]
+  virtual bool EvaluateExternalConversionSegments(
+      const ConversionRequest& request,
+      absl::Span<const ExternalConversionSegment> segments,
+      std::vector<ExternalConversionSegment>* evaluated_segments) const {
+    if (evaluated_segments != nullptr) {
+      evaluated_segments->clear();
+    }
     return false;
   }
 
@@ -151,6 +217,13 @@ class ConverterInterface {
   virtual bool DeleteCandidateFromHistory(const Segments& segments,
                                           size_t segment_index,
                                           int candidate_index) const = 0;
+
+  // Adds an exact suppression entry to the persistent user dictionary.
+  [[nodiscard]]
+  virtual bool AddSuppressionEntry(absl::string_view key,
+                                   absl::string_view value) const {
+    return false;
+  }
 
   // Reconstruct history segments from given preceding text.
   [[nodiscard]]

@@ -97,9 +97,42 @@ struct RendererWindowShadowStyle {
   uint32_t distance = 0;
 };
 
-// Applies whole-window opacity. 100 removes WS_EX_LAYERED again so the default
-// opaque path remains the fast path. The value is clamped to [20, 100].
+// Converts a renderer-window opacity percentage to the Win32 alpha byte used
+// by layered-window APIs. Renderer-window opacity is clamped to [20, 100].
+BYTE RendererWindowOpacityToAlpha(uint32_t opacity_percent);
+
+// Converts a logical corner radius to physical pixels for a concrete window
+// size. The result is clamped so the rounded rectangle always remains valid.
+int GetRendererWindowCornerRadiusInPixels(uint32_t logical_radius, uint32_t dpi,
+                                          int width, int height);
+
+// Creates a top-down 32-bit DIB section suitable for per-pixel-alpha layered
+// windows. The caller owns the returned HBITMAP. |pixels| receives the BGRA
+// backing store and is set to nullptr on failure.
+HBITMAP CreateRendererLayeredWindowBitmap(HDC reference_dc, int width,
+                                          int height, uint32_t** pixels);
+
+// Presents a PBGRA bitmap through UpdateLayeredWindow. The bitmap size is also
+// used as the destination window size. |opacity| is applied as
+// SourceConstantAlpha so per-pixel coverage remains independent from the
+// renderer-window opacity setting.
+bool PresentRendererLayeredWindowBitmap(HWND hwnd, HBITMAP bitmap, int width,
+                                        int height, BYTE opacity);
+
+// Applies whole-window opacity to a conventional (non per-pixel-alpha) window.
+// 100 removes WS_EX_LAYERED again so the opaque path remains the fast path.
+// Per-pixel-alpha renderer windows (Candidate, Ruby, and Infolist) do not use
+// this API: their surfaces remain permanently layered and are presented with
+// UpdateLayeredWindow and SourceConstantAlpha.
 void ApplyRendererWindowOpacity(HWND hwnd, uint32_t opacity_percent);
+
+// Converts an already-rendered opaque BGRA/RGB DIB into a PBGRA surface for
+// UpdateLayeredWindow. The outer rounded-rectangle silhouette and its border
+// are antialiased from the same signed-distance geometry used by the renderer
+// shadow. |border_width| and |corner_radius| are physical pixels.
+void ApplyRoundedRectAlphaAndBorder(uint32_t* pixels, int width, int height,
+                                    int corner_radius, int border_width,
+                                    COLORREF border_color);
 
 class RendererShadowWindow {
  public:
@@ -110,9 +143,16 @@ class RendererShadowWindow {
 
   void Destroy();
   void Hide();
+  // |owner_corner_radius_pixels| is the already-scaled physical radius of the
+  // owner surface. Passing the final radius keeps body, border, and shadow on
+  // exactly the same rounded-rectangle geometry. If |z_order_anchor_window| is
+  // a visible renderer body, the shadow is placed behind that body instead of
+  // merely behind its own owner. This lets WindowManager keep every renderer
+  // body above every candidate-family shadow while preserving WS_EX_TOPMOST.
   bool Update(HWND owner_window, const RECT& owner_rect, uint32_t dpi,
-              uint32_t owner_corner_radius,
-              const RendererWindowShadowStyle& style);
+              int owner_corner_radius_pixels,
+              const RendererWindowShadowStyle& style,
+              HWND z_order_anchor_window = nullptr);
 
  private:
   HWND hwnd_ = nullptr;
@@ -136,6 +176,11 @@ class WindowPositionInterface {
 
   // This method wraps API call of GetWindowRect.
   virtual bool GetWindowRect(HWND window_handle, RECT* rect) = 0;
+
+  // Returns the same window bounds in physical screen coordinates.
+  // The default implementation supports emulators; the native implementation
+  // queries PMv2 bounds without depending on point-conversion boundary checks.
+  virtual bool GetWindowRectInPhysicalCoords(HWND window_handle, RECT* rect);
 
   // This method wraps API call of GetClientRect.
   virtual bool GetClientRect(HWND window_handle, RECT* rect) = 0;
@@ -193,8 +238,8 @@ class LayoutManager {
   // DPI-aware applications.  When the LogicalToPhysicalPoint API is not
   // available in the target platform, this function simply copies |point|
   // into |result|.  If LogicalToPhysicalPoint API fails due to some
-  // limitations, this function tries to emulate the result assuming the
-  // scaling factor is one dimension and scaling center is (0, 0).
+  // limitations, this function maps relative to the root window's logical
+  // and physical bounds, including nonzero and negative monitor origins.
   // See remarks of the following document for details about the limitations.
   // http://msdn.microsoft.com/en-us/library/ms633533.aspx
   // This method is thread-safe.
@@ -204,6 +249,15 @@ class LayoutManager {
   // RECT version of GetPointInPhysicalCoords.  This method is thread-safe.
   void GetRectInPhysicalCoords(HWND window_handle, const RECT& rect,
                                RECT* result) const;
+
+  // Converts |composition_target| from the target application's virtualized
+  // screen coordinates into physical screen coordinates. |top_left| keeps
+  // the same semantic anchor as CharacterPosition::top_left, and
+  // |line_height| is scaled along the writing direction. Uses
+  // |fallback_line_height| when CharacterPosition::line_height is absent.
+  bool GetCompositionTargetInPhysicalCoords(
+      const commands::RendererCommand_ApplicationInfo& app_info,
+      uint32_t fallback_line_height, POINT* top_left, int* line_height) const;
 
   // Converts a local coordinate into a logical screen coordinate assuming
   // |src_point| is the client coorinate in the window specified by

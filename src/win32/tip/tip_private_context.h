@@ -43,6 +43,8 @@
 #include "win32/base/input_state.h"
 #include "win32/base/keyboard.h"
 #include "win32/base/surrogate_pair_observer.h"
+#include "win32/tip/tip_writing_direction.h"
+#include "win32/tip/tip_zenz_context_request.h"
 
 namespace mozc {
 namespace win32 {
@@ -105,6 +107,7 @@ class TipPrivateContext {
   uint64_t composition_generation() const;
   bool IsLatestCompositionGenerationInactive(
       uint64_t composition_generation) const;
+  TipZenzContextRequestState* mutable_zenz_context_request_state();
   const VirtualKey& last_down_key() const;
   VirtualKey* mutable_last_down_key();
 
@@ -116,6 +119,21 @@ class TipPrivateContext {
 
   const InputBehavior& input_behavior() const;
   InputBehavior* mutable_input_behavior();
+
+  WritingDirection composition_writing_direction() const;
+  void SetCompositionWritingDirection(WritingDirection direction);
+  void ClearCompositionWritingDirection();
+
+  void SetPendingRomanDisplayColors(COLORREF text_color,
+                                    COLORREF background_color,
+                                    bool surface_uniform,
+                                    bool retry_allowed);
+  void SetPendingRomanDisplayColorsUnavailable(bool retry_allowed);
+  bool GetPendingRomanDisplayColors(COLORREF* text_color,
+                                    COLORREF* background_color,
+                                    bool* surface_uniform,
+                                    bool* retry_allowed) const;
+  void ClearPendingRomanDisplayColors();
 
  private:
   class InternalState;

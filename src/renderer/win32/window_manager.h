@@ -47,13 +47,21 @@ namespace renderer {
 namespace win32 {
 
 // This class is the controller of the candidate windows.
+class ConversionStatusWindow;
+
 class WindowManager {
  public:
   WindowManager();
   WindowManager(const WindowManager&) = delete;
   WindowManager& operator=(const WindowManager&) = delete;
   ~WindowManager();
-  void Initialize();
+  // |owner_window| is used only at window creation time. Passing an
+  // immersive host HWND lets Windows place renderer popups with the host while
+  // preserving the existing ownerless behavior when nullptr is passed.
+  // |post_quit_message_on_window_destroy| preserves the standalone renderer's
+  // message-loop shutdown behavior. Embedded hosts must pass false.
+  void Initialize(HWND owner_window = nullptr,
+                  bool post_quit_message_on_window_destroy = true);
   void AsyncHideAllWindows();
   void AsyncQuitAllWindows();
   void DestroyAllWindows();
@@ -70,13 +78,13 @@ class WindowManager {
   std::unique_ptr<IndicatorWindow> indicator_window_;
   std::unique_ptr<InfolistWindow> infolist_window_;
   std::unique_ptr<RubyWindow> ruby_window_;
+  std::unique_ptr<ConversionStatusWindow> conversion_status_window_;
   std::unique_ptr<LayoutManager> layout_manager_;
   client::SendCommandInterface* send_command_interface_;
   POINT last_position_;
-  // True while the last visible candidate window was a passive suggestion
-  // attached to live conversion.  Zenz callbacks may redraw live conversion
-  // without candidate_window; in that case the renderer can keep the existing
-  // passive suggestion window visible instead of hiding it.
+  // Tracks the last passive-suggestion geometry only for candidate/ruby
+  // transition handling. Candidate visibility itself is always derived from
+  // the current RendererCommand output.
   bool last_live_conversion_passive_suggestion_visible_;
   RECT last_live_conversion_passive_suggestion_rect_;
   bool has_last_live_conversion_passive_suggestion_rect_;

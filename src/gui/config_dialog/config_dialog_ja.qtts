@@ -4,54 +4,83 @@
 <context>
     <name>ConfigDialog</name>
     <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz による絵文字変換を抑制する</source>
+        <translation>Zenz による絵文字変換を抑制する</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz は入力した読みや文脈に応じて絵文字を生成することがあります。有効にすると、絵文字の追加・変更・削除を伴う Zenz の変換結果を採用せず、通常の Mozc 変換結果を使用します。通常の Mozc の絵文字候補の表示や手動選択には影響しません。初期値はオンです。</source>
+        <translation>Zenz は入力した読みや文脈に応じて絵文字を生成することがあります。有効にすると、絵文字の追加・変更・削除を伴う Zenz の変換結果を採用せず、通常の Mozc 変換結果を使用します。通常の Mozc の絵文字候補の表示や手動選択には影響しません。初期値はオンです。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Input Appearance</source>
+        <translation>入力外観</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>未確定文字の表示色</source>
+        <translation>未確定文字の表示色</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>入力中の文字</source>
+        <translation>入力中の文字</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>変換中の文節</source>
+        <translation>変換中の文節</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>文字色</source>
+        <translation>文字色</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>背景色</source>
+        <translation>背景色</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>下線色</source>
+        <translation>下線色</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>対応アプリのみ有効。Chrome/Edge等は非対応の場合あり。</source>
+        <translation>対応アプリのみ有効。Chrome/Edge等は非対応の場合あり。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>この設定は Windows TSF の表示属性を利用します。対応アプリでのみ有効です。Chrome や Edge など、一部のアプリでは反映されない場合があります。</source>
+        <translation>この設定は Windows TSF の表示属性を利用します。対応アプリでのみ有効です。Chrome や Edge など、一部のアプリでは反映されない場合があります。</translation>
+    </message>    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>未確定のローマ字を薄く表示する</source>
+        <translation>未確定のローマ字を薄く表示する</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>ローマ字入力で変換規則の途中にある末尾の文字だけを薄く表示します。入力文字列や確定結果は変更しません。薄さは下の設定で調整できます。</source>
+        <translation>ローマ字入力で変換規則の途中にある末尾の文字だけを薄く表示します。入力文字列や確定結果は変更しません。薄さは下の設定で調整できます。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>薄さ</source>
+        <translation>薄さ</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>値を大きくすると未確定のローマ字が背景色に近づき、より薄く見えます。0% は高いコントラスト、100% は背景色と同じになり見えなくなります。背景色を安全に取得できないアプリではシステム標準の薄い表示を使います。</source>
+        <translation>値を大きくすると未確定のローマ字が背景色に近づき、より薄く見えます。0% は高いコントラスト、100% は背景色と同じになり見えなくなります。背景色を安全に取得できないアプリではシステム標準の薄い表示を使います。</translation>
+    </message>
+    <message>
         <location filename="config_dialog.ui" line="32"/>
         <source>[ProductName] Settings</source>
         <translation>[ProductName] プロパティ</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="303"/>
-        <source>Mozkey IbG</source>
-        <translation>Mozkey IbG</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="324"/>
-        <source>Typing correction</source>
-        <translation>ミスタイプ補正</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="330"/>
-        <source>Corrects bounded one-edit mistakes in Romaji and JIS-kana input. High-confidence corrections may be applied during live conversion.</source>
-        <translation>ローマ字入力とJISかな入力の1か所の打ち間違いを補正します。信頼度の高い補正はライブ変換中に自動適用される場合があります。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="333"/>
-        <source>Correct mistyped Romaji and kana input</source>
-        <translation>ローマ字・かな入力のミスタイプを補正する</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="340"/>
-        <source>Adds safe correction candidates while preserving the original input.</source>
-        <translation>元の入力を保持したまま、安全な補正候補を追加します。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="353"/>
-        <source>Segment cycling</source>
-        <translation>文節サイクル</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="359"/>
-        <source>Uses Ctrl+Shift+Space to cycle alternative segment boundaries while converting.</source>
-        <translation>変換中にCtrl+Shift+Spaceで文節の区切り候補を順番に切り替えます。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="362"/>
-        <source>Use Ctrl+Shift+Space to cycle segment boundaries</source>
-        <translation>Ctrl+Shift+Spaceで文節区切りを順番に切り替える</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="369"/>
-        <source>The fullwidth-space shortcut is preserved outside Conversion mode.</source>
-        <translation>変換中以外では、従来どおり全角スペースのショートカットとして動作します。</translation>
     </message>
     <message>
         <location filename="config_dialog.ui" line="57"/>
@@ -304,6 +333,7 @@
         <source>Show input mode indicator near the cursor</source>
         <translation>カーソル周辺に入力モードを表示する</translation>
     </message>
+
     <message>
         <location filename="config_dialog.ui" line="817"/>
         <source>Use dark mode for candidate and ruby windows</source>
@@ -341,13 +371,13 @@
     </message>
     <message>
         <location filename="config_dialog.ui" line="0"/>
-        <source>Show ruby window during live conversion</source>
-        <translation>ライブ変換中にルビ表示を出す</translation>
+        <source>Show reading during live conversion</source>
+        <translation>ライブ変換中に読みを表示する</translation>
     </message>
     <message>
         <location filename="config_dialog.ui" line="0"/>
-        <source>Shows the typed reading near the candidate window during live conversion.</source>
-        <translation>ライブ変換中に、入力した読みを候補付近のルビ表示で示します。</translation>
+        <source>Shows the typed reading during live conversion. Windows and macOS use a separate ruby window; Fcitx displays it above the candidate list.</source>
+        <translation>ライブ変換中に、入力した読みを表示します。Windows と macOS では専用のルビウィンドウに、Fcitx では候補リストの上に表示します。</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="0"/>
@@ -375,6 +405,16 @@
         <translation>未使用の履歴を削除</translation>
     </message>
     <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Configure and manage Zenz learning under [Advanced] -&gt; [Zenz Learning].</source>
+        <translation>※Zenz学習は、〔入力補助〕→〔Zenz 学習〕で設定・管理できます。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Candidates hidden from the candidate or suggestion window are registered as suppression words in the &quot;非表示候補&quot; user dictionary. Delete the corresponding entry from the user dictionary to show it again.</source>
+        <translation>※候補ウィンドウまたはサジェストウィンドウで非表示にした候補は、ユーザー辞書の「非表示候補」に抑制単語として登録されます。再表示するには、ユーザー辞書から該当する単語を削除してください。</translation>
+    </message>
+    <message>
         <location filename="config_dialog.ui" line="989"/>
         <source>Use realtime conversion</source>
         <translation>リアルタイム変換を有効にする</translation>
@@ -386,8 +426,8 @@
     </message>
     <message>
         <location filename="config_dialog.ui" line="1134"/>
-        <source>Temporarily disable conversion personalization, history-based suggestions and user dictionary</source>
-        <translation>一時的に学習機能、入力履歴からのサジェスト機能、ユーザ辞書機能を無効にする</translation>
+        <source>Temporarily disable conversion personalization (including Zenz learning), history-based suggestions and user dictionary</source>
+        <translation>一時的に学習機能(Zenz学習含む)、入力履歴からのサジェスト機能、ユーザ辞書機能を無効にする</translation>
     </message>
     <message>
         <location filename="config_dialog.ui" line="1175"/>
@@ -482,6 +522,11 @@
     </message>
     <message>
         <location filename="config_dialog.cc" line="0"/>
+        <source>Monochrome (Light/Dark)</source>
+        <translation>モノクロ（ライト・ダーク対応）</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
         <source>Monochrome (Black)</source>
         <translation>モノクロ（黒）</translation>
     </message>
@@ -504,6 +549,316 @@
         <location filename="config_dialog.cc" line="0"/>
         <source>IME icon setting has been saved, but it could not be applied to Windows. If you canceled administrator approval, click Apply again.</source>
         <translation>IME アイコン設定は保存されましたが、Windows への反映を開始できませんでした。管理者権限の確認をキャンセルした場合は、もう一度［適用］をクリックしてください。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>ライブ変換</source>
+        <translation>ライブ変換</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz ライブ補正</source>
+        <translation>Zenz ライブ補正</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正中の文字</source>
+        <translation>Zenz 補正中の文字</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正結果が返るまでライブ変換結果（Mozc）を表示しない</source>
+        <translation>Zenz 補正結果が返るまでライブ変換結果（Mozc）を表示しない</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正が実行される場合、補正結果が確定するまで通常の Mozkey IbG ライブ変換結果を表示しません。Zenz が採用されなかった場合は Mozkey IbG 結果を表示します。</source>
+        <translation>Zenz 補正が実行される場合、補正結果が確定するまで通常の Mozkey IbG ライブ変換結果を表示しません。Zenz が採用されなかった場合は Mozkey IbG 結果を表示します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正開始後の最大待機時間</source>
+        <translation>Zenz 補正開始後の最大待機時間</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>「通常のライブ変換結果を表示しない」が有効な場合、Zenz 補正要求の送信後、この時間以内に結果が返らなければ、その回の Zenz 補正を中止して通常の Mozkey IbG ライブ変換結果を表示します。</source>
+        <translation>「通常のライブ変換結果を表示しない」が有効な場合、Zenz 補正要求の送信後、この時間以内に結果が返らなければ、その回の Zenz 補正を中止して通常の Mozkey IbG ライブ変換結果を表示します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正結果の採用条件</source>
+        <translation>Zenz 補正結果の採用条件</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 条件フィールド</source>
+        <translation>Zenz 条件フィールド</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 学習</source>
+        <translation>Zenz 学習</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>U+EE03 profile として Zenzai v3/v3.2 のプロンプトに渡します。</source>
+        <translation>U+EE03 profile として Zenzai v3/v3.2 のプロンプトに渡します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz profile</source>
+        <translation>Zenz プロファイル</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: 技術文書を書く日本語ユーザー。空欄なら送信しません。</source>
+        <translation>例: 技術文書を書く日本語ユーザー。空欄なら送信しません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: 技術文書を書く日本語ユーザー</source>
+        <translation>例: 技術文書を書く日本語ユーザー</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>U+EE04 topic として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</source>
+        <translation>U+EE04 topic として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz topic</source>
+        <translation>Zenz トピック</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: Mozkey IbG、Rust、会計、法律。空欄なら送信しません。</source>
+        <translation>例: Mozkey IbG、Rust、会計、法律。空欄なら送信しません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: Mozkey IbG</source>
+        <translation>例: Mozkey IbG</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>U+EE05 style として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</source>
+        <translation>U+EE05 style として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz style</source>
+        <translation>Zenz スタイル</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: 技術文書、ビジネス、口語、常体。空欄なら送信しません。</source>
+        <translation>例: 技術文書、ビジネス、口語、常体。空欄なら送信しません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: 技術文書</source>
+        <translation>例: 技術文書</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>U+EE06 settings として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</source>
+        <translation>U+EE06 settings として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz settings</source>
+        <translation>Zenz 設定</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: 専門用語を優先。空欄なら送信しません。</source>
+        <translation>例: 専門用語を優先。空欄なら送信しません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>例: 専門用語を優先</source>
+        <translation>例: 専門用語を優先</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>クライアントからカーソル右側テキストが渡された場合、U+EE07 right context として Zenzai v3.2 のプロンプトに含めます。</source>
+        <translation>クライアントからカーソル右側テキストが渡された場合、U+EE07 right context として Zenzai v3.2 のプロンプトに含めます。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 右文脈を使用する</source>
+        <translation>Zenz 右文脈を使用する</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 右文脈として使う最大文字数です。</source>
+        <translation>Zenz 右文脈として使う最大文字数です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 右文脈長</source>
+        <translation>Zenz 右文脈長</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>カーソル右側テキストが取得できる場合だけ使われます。0 文字なら送信しません。</source>
+        <translation>カーソル右側テキストが取得できる場合だけ使われます。0 文字なら送信しません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>使わない</source>
+        <translation>使わない</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正結果の採用/却下をローカルに保存し、次回以降の補正や候補順位に反映します。確定した内容は、通常の変換履歴にも反映される場合があります。</source>
+        <translation>Zenz 補正結果の採用/却下をローカルに保存し、次回以降の補正や候補順位に反映します。確定した内容は、通常の変換履歴にも反映される場合があります。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正結果をローカル学習する</source>
+        <translation>Zenz 補正結果をローカル学習する</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>同じ読み・同じ文脈クラス・同じ Zenz 補正について、拒否回数と拒否割合の両方が設定値以上になった場合に表示を抑制します。自動ブロック中も Zenz の内部生成と最終確定との比較を続け、一致が増えて拒否割合が下がれば自動解除します。通常の Mozkey IbG 候補から削除する機能ではありません。</source>
+        <translation>同じ読み・同じ文脈クラス・同じ Zenz 補正について、拒否回数と拒否割合の両方が設定値以上になった場合に表示を抑制します。自動ブロック中も Zenz の内部生成と最終確定との比較を続け、一致が増えて拒否割合が下がれば自動解除します。通常の Mozkey IbG 候補から削除する機能ではありません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 補正と異なる結果で確定した場合、その補正を自動ブロックする</source>
+        <translation>Zenz 補正と異なる結果で確定した場合、その補正を自動ブロックする</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>自動ブロック判定に必要な最低拒否回数です。拒否割合の条件も同時に満たした場合だけ自動ブロックします。設定変更は既存の Zenz 学習データにも動的に反映されます。</source>
+        <translation>自動ブロック判定に必要な最低拒否回数です。拒否割合の条件も同時に満たした場合だけ自動ブロックします。設定変更は既存の Zenz 学習データにも動的に反映されます。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>自動ブロックの最低拒否回数</source>
+        <translation>自動ブロックの最低拒否回数</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>自動ブロック判定に必要な最低拒否回数です。</source>
+        <translation>自動ブロック判定に必要な最低拒否回数です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source> 回</source>
+        <translation> 回</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>採用回数と通常拒否回数の合計に占める拒否の最低割合です。最低拒否回数の条件も同時に満たした場合だけ自動ブロックします。</source>
+        <translation>採用回数と通常拒否回数の合計に占める拒否の最低割合です。最低拒否回数の条件も同時に満たした場合だけ自動ブロックします。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>自動ブロックの最低拒否割合</source>
+        <translation>自動ブロックの最低拒否割合</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>自動ブロック判定に必要な最低拒否割合です。拒否割合は「通常拒否 ÷ (採用 + 通常拒否)」で計算します。</source>
+        <translation>自動ブロック判定に必要な最低拒否割合です。拒否割合は「通常拒否 ÷ (採用 + 通常拒否)」で計算します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source> % 以上</source>
+        <translation> % 以上</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 学習データ</source>
+        <translation>Zenz 学習データ</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>保存された Zenz 学習データを確認、検索、インポート、エクスポート、削除します。通常の変換履歴に反映済みの学習は、この画面の削除対象には含まれません。</source>
+        <translation>保存された Zenz 学習データを確認、検索、インポート、エクスポート、削除します。通常の変換履歴に反映済みの学習は、この画面の削除対象には含まれません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>管理...</source>
+        <translation>管理...</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Mozkey IbG</source>
+        <translation>Mozkey IbG</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Typing correction</source>
+        <translation>ミスタイプ補正</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Corrects bounded one-edit mistakes in Romaji and JIS-kana input. High-confidence corrections may be applied during live conversion.</source>
+        <translation>ローマ字入力とJISかな入力の1か所の打ち間違いを補正します。信頼度の高い補正はライブ変換中に自動適用される場合があります。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Correct mistyped Romaji and kana input</source>
+        <translation>ローマ字・かな入力のミスタイプを補正する</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Adds safe correction candidates while preserving the original input.</source>
+        <translation>元の入力を保持したまま、安全な補正候補を追加します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Segment cycling</source>
+        <translation>文節サイクル</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Uses Ctrl+Shift+Space to cycle alternative segment boundaries while converting.</source>
+        <translation>変換中にCtrl+Shift+Spaceで文節の区切り候補を順番に切り替えます。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Use Ctrl+Shift+Space to cycle segment boundaries</source>
+        <translation>Ctrl+Shift+Spaceで文節区切りを順番に切り替える</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>The fullwidth-space shortcut is preserved outside Conversion mode.</source>
+        <translation>変換中以外では、従来どおり全角スペースのショートカットとして動作します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>ローカル Zenz 推論に使うデバイスです。自動では GPU を優先し、利用できない場合は CPU を使います。</source>
+        <translation>ローカル Zenz 推論に使うデバイスです。自動では GPU を優先し、利用できない場合は CPU を使います。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>Zenz 推論デバイス</source>
+        <translation>Zenz 推論デバイス</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.ui" line="0"/>
+        <source>llama-server が検出した GPU、CPU のみ、または GPU 優先の自動選択を指定します。</source>
+        <translation>llama-server が検出した GPU、CPU のみ、または GPU 優先の自動選択を指定します。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Automatic (GPU preferred)</source>
+        <translation>自動（GPU 優先）</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>CPU only</source>
+        <translation>CPU のみ</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>%1 (unavailable; CPU fallback)</source>
+        <translation>%1（利用不可、CPU にフォールバック）</translation>
     </message>
 </context>
 <context>
@@ -530,6 +885,18 @@
         <location filename="keybinding_editor.ui" line="92"/>
         <source>Input key assignments:</source>
         <translation>割り当てるキーの入力:</translation>
+    </message>
+    <message>
+        <source>Either side</source>
+        <translation>左右どちらでも</translation>
+    </message>
+    <message>
+        <source>Left only</source>
+        <translation>左のみ</translation>
+    </message>
+    <message>
+        <source>Right only</source>
+        <translation>右のみ</translation>
     </message>
 </context>
 <context>
@@ -840,8 +1207,8 @@
     </message>
     <message>
         <location filename="config_dialog.cc" line="718"/>
-        <source>Do you want to clear personalization data? Input history is not reset with this operation. Please open &quot;suggestion&quot; tab to remove input history data.</source>
-        <translation>学習結果がリセットされます。実行しますか？ 入力履歴データはリセットされません。入力履歴データのリセットは「サジェスト→全入力履歴の削除」で行えます。</translation>
+        <source>This operation clears Mozkey IbG conversion learning, including learning reflected from accepted Zenz results. Input history data and Zenz learning data itself are not cleared. To remove input history data, use &quot;Suggestion&quot; -&gt; &quot;Clear all history&quot;. To manage Zenz learning data, use &quot;Advanced&quot; -&gt; &quot;Zenz Learning&quot;. Do you want to continue?</source>
+        <translation>Mozkey IbGの変換学習がリセットされます。Zenzの結果からMozkey IbGに反映された変換学習も対象です。入力履歴データとZenz学習データそのものはリセットされません。入力履歴データの削除は「サジェスト→全入力履歴を削除」、Zenz学習データの管理は「入力補助→Zenz 学習」から行えます。実行しますか？</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="776"/>
@@ -872,6 +1239,19 @@
         <location filename="config_dialog.cc" line="201"/>
         <source>Apply</source>
         <translation>適用</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>When you reset %1 settings, any changes you've made will be reverted to the default settings. Do you want to reset settings? The following items are not reset with this operation.
+ - Personalization data
+ - Input history
+ - Administrator settings</source>
+        <translation>%1 の設定を初期値に戻しますか？
+変更した設定は初期値に戻ります。
+なお、以下の項目はこの操作ではリセットされません。
+・学習履歴
+・入力履歴
+・管理者設定</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="0"/>
@@ -919,164 +1299,69 @@ The current Windows default IME override will be saved so it can be restored lat
     </message>
 
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>ライブ変換</source>
-        <translation>ライブ変換</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz ライブ補正</source>
-        <translation>Zenz ライブ補正</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>ローカル Zenz 推論に使うデバイスです。自動では GPU を優先し、利用できない場合は CPU を使います。</source>
-        <translation>ローカル Zenz 推論に使うデバイスです。自動では GPU を優先し、利用できない場合は CPU を使います。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz 推論デバイス</source>
-        <translation>Zenz 推論デバイス</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>llama-server が検出した GPU、CPU のみ、または GPU 優先の自動選択を指定します。</source>
-        <translation>llama-server が検出した GPU、CPU のみ、または GPU 優先の自動選択を指定します。</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Input mode indicator</source>
+        <translation>入力モードインジケーター</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="0"/>
-        <source>Automatic (GPU preferred)</source>
-        <translation>自動（GPU 優先）</translation>
+        <source>Theme</source>
+        <translation>テーマ</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="0"/>
-        <source>CPU only</source>
-        <translation>CPU のみ</translation>
+        <source>System theme</source>
+        <translation>システムテーマに合わせる</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="0"/>
-        <source>%1 (unavailable; CPU fallback)</source>
-        <translation>%1（利用不可、CPU にフォールバック）</translation>
+        <source>Custom design</source>
+        <translation>カスタムデザイン</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz 条件フィールド</source>
-        <translation>Zenz 条件フィールド</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Hiragana</source>
+        <translation>ひらがな</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz 学習</source>
-        <translation>Zenz 学習</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Width</source>
+        <translation>幅</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>U+EE03 profile として Zenzai v3/v3.2 のプロンプトに渡します。</source>
-        <translation>U+EE03 profile として Zenzai v3/v3.2 のプロンプトに渡します。</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Height</source>
+        <translation>高さ</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz profile</source>
-        <translation>Zenz プロファイル</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Text size</source>
+        <translation>文字サイズ</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: 技術文書を書く日本語ユーザー。空欄なら送信しません。</source>
-        <translation>例: 技術文書を書く日本語ユーザー。空欄なら送信しません。</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Border thickness</source>
+        <translation>枠線の太さ</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: 技術文書を書く日本語ユーザー</source>
-        <translation>例: 技術文書を書く日本語ユーザー</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Shadow</source>
+        <translation>影</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>U+EE04 topic として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</source>
-        <translation>U+EE04 topic として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Shadow blur</source>
+        <translation>影のぼかし</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz topic</source>
-        <translation>Zenz トピック</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Shadow X offset</source>
+        <translation>影の横方向オフセット</translation>
     </message>
     <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: Mozkey IbG、Rust、会計、法律。空欄なら送信しません。</source>
-        <translation>例: Mozkey IbG、Rust、会計、法律。空欄なら送信しません。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: Mozkey IbG</source>
-        <translation>例: Mozkey IbG</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>U+EE05 style として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</source>
-        <translation>U+EE05 style として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz style</source>
-        <translation>Zenz スタイル</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: 技術文書、ビジネス、口語、常体。空欄なら送信しません。</source>
-        <translation>例: 技術文書、ビジネス、口語、常体。空欄なら送信しません。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: 技術文書</source>
-        <translation>例: 技術文書</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>U+EE06 settings として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</source>
-        <translation>U+EE06 settings として Zenzai v3/v3.2 のプロンプトに渡します。experimental です。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz settings</source>
-        <translation>Zenz 設定</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: 専門用語を優先。空欄なら送信しません。</source>
-        <translation>例: 専門用語を優先。空欄なら送信しません。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>例: 専門用語を優先</source>
-        <translation>例: 専門用語を優先</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>クライアントからカーソル右側テキストが渡された場合、U+EE07 right context として Zenzai v3.2 のプロンプトに含めます。</source>
-        <translation>クライアントからカーソル右側テキストが渡された場合、U+EE07 right context として Zenzai v3.2 のプロンプトに含めます。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz 右文脈を使用する</source>
-        <translation>Zenz 右文脈を使用する</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz 右文脈として使う最大文字数です。</source>
-        <translation>Zenz 右文脈として使う最大文字数です。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>Zenz 右文脈長</source>
-        <translation>Zenz 右文脈長</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>カーソル右側テキストが取得できる場合だけ使われます。0 文字なら送信しません。</source>
-        <translation>カーソル右側テキストが取得できる場合だけ使われます。0 文字なら送信しません。</translation>
-    </message>
-    <message>
-        <location filename="config_dialog.ui" line="0"/>
-        <source>使わない</source>
-        <translation>使わない</translation>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Shadow Y offset</source>
+        <translation>影の縦方向オフセット</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="1650"/>
@@ -1100,8 +1385,13 @@ The current Windows default IME override will be saved so it can be restored lat
     </message>
     <message>
         <location filename="config_dialog.cc" line="1654"/>
-        <source>Default (Light)</source>
-        <translation>標準（ライト）</translation>
+        <source>Auto (follow system theme)</source>
+        <translation>自動（システムテーマに合わせる）</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="1654"/>
+        <source>Light</source>
+        <translation>ライト</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="1655"/>
@@ -1152,6 +1442,56 @@ The current Windows default IME override will be saved so it can be restored lat
         <location filename="config_dialog.cc" line="1669"/>
         <source>Candidate, suggestion, and ruby font</source>
         <translation>候補・サジェスト・ルビのフォント</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Font weight</source>
+        <translation>フォントの太さ</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Thin (100)</source>
+        <translation>極細 (100)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Extra Light (200)</source>
+        <translation>特細 (200)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Light (300)</source>
+        <translation>細字 (300)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Regular (400)</source>
+        <translation>標準 (400)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Medium (500)</source>
+        <translation>中字 (500)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>SemiBold (600)</source>
+        <translation>中太 (600)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Bold (700)</source>
+        <translation>太字 (700)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Extra Bold (800)</source>
+        <translation>特太 (800)</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2430"/>
+        <source>Black (900)</source>
+        <translation>極太 (900)</translation>
     </message>
     <message>
         <location filename="config_dialog.cc" line="1670"/>
@@ -1292,6 +1632,89 @@ The current Windows default IME override will be saved so it can be restored lat
         <location filename="config_dialog.cc" line="1740"/>
         <source>Set shadow direction</source>
         <translation>影の方向を設定します</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2526"/>
+        <source>Ruby window spacing and gap</source>
+        <translation>ルビウィンドウの余白と間隔</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2555"/>
+        <source>Horizontal padding</source>
+        <translation>左右の余白</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2556"/>
+        <source>Space between the ruby text and the left and right window edges.</source>
+        <translation>ルビ文字とウィンドウ左右端の間隔です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2559"/>
+        <source>Vertical padding</source>
+        <translation>上下の余白</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2560"/>
+        <source>Space between the ruby text and the top and bottom window edges.</source>
+        <translation>ルビ文字とウィンドウ上下端の間隔です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2563"/>
+        <source>Distance from input text</source>
+        <translation>入力文字との距離</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="2564"/>
+        <source>Distance between the ruby window and the text being composed.</source>
+        <translation>ルビウィンドウと入力中の文字列との距離です。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source> 回</source>
+        <translation> 回</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source> % 以上</source>
+        <translation> % 以上</translation>
+    </message>
+
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Zenz correction maximum wait must be at least 50 ms.</source>
+        <translation>Zenz 補正開始後の最大待機時間は 50 ms 以上にしてください。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Failed to activate %1 in the current session. No Windows default-input settings were changed.</source>
+        <translation>現在のセッションで%1を有効化できませんでした。Windowsの既定の入力方式の設定は変更されていません。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Failed to set %1 as the Windows default IME. Persistent changes were rolled back where possible. A restore point may remain; inspect your input settings before trying again.</source>
+        <translation>%1をWindowsの既定IMEに設定できませんでした。可能な範囲で設定を元に戻しましたが、復元用の設定情報が残っている場合があります。再試行する前に、Windowsの入力設定を確認してください。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>%1 was saved as the Windows default IME, but the current session could not be activated. Sign out or restart Windows for the change to take effect.</source>
+        <translation>%1をWindowsの既定IMEに設定しましたが、現在のセッションでは有効化できませんでした。変更を反映するには、Windowsからサインアウトするか、再起動してください。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>The previous Windows default IME setting has been restored.
+The active input method may require a sign-out or restart to update.</source>
+        <translation>以前のWindowsの既定IME設定を復元しました。
+現在使用中の入力方式に反映されるまで、サインアウトまたは再起動が必要な場合があります。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>The previous Windows default IME settings were restored and verified, but the saved restore point could not be cleared.</source>
+        <translation>以前のWindowsの既定IME設定を復元し、結果を確認しました。ただし、保存されていた復元用の設定情報を削除できませんでした。</translation>
+    </message>
+    <message>
+        <location filename="config_dialog.cc" line="0"/>
+        <source>Failed to restore the previous Windows default IME setting. The saved restore point has not been intentionally consumed. Some settings may have changed.</source>
+        <translation>以前のWindowsの既定IME設定を復元できませんでした。復元用の設定情報は意図的に削除していませんが、一部の設定が変更された可能性があります。</translation>
     </message>
 </context>
 <context>
@@ -1441,6 +1864,18 @@ The current Windows default IME override will be saved so it can be restored lat
         <location filename="keymap_editor.cc" line="473"/>
         <source>Do you want to overwrite the current keymaps?</source>
         <translation>現在のキー設定が上書きされます。実行しますか？</translation>
+    </message>
+    <message>
+        <source>Conflicting key assignments:
+%1 -&gt; %2
+%3 -&gt; %4
+
+These assignments can match the same physical key input. Choose non-overlapping left/right conditions.</source>
+        <translation>キー割り当てが競合しています:
+%1 → %2
+%3 → %4
+
+同じ物理キー入力が両方の設定に一致する可能性があります。左右条件が重ならないように設定してください。</translation>
     </message>
 </context>
 <context>

@@ -484,10 +484,26 @@ absl::Status FileUtil::AtomicRename(absl::string_view from,
         absl::StrFormat("StripWritePreventingAttributesIfExists failed: %s",
                         s.message()));
   }
-  if (!::MoveFileExW(pf_from.c_str(), pf_to.c_str(),
-                     MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
+  // MoveFileExW fails with ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION while
+  // |to| is open by someone else, e.g. the user dictionary reloader running in
+  // another thread or an antivirus software scanning the file. As such handles
+  // are usually short-lived, retry several times before giving up.
+  // Retry counts and intervals are based on Chromium's ImportantFileWriter.
+  // https://github.com/chromium/chromium/blob/db776c333e0157636be44892c14e6e45bbe9b96e/base/files/important_file_writer.cc#L50-L61
+  constexpr int kMaxRetries = 5;
+  constexpr DWORD kRetryIntervalMsec = 100;
+  for (int retry = 0;; ++retry) {
+    if (::MoveFileExW(pf_from.c_str(), pf_to.c_str(),
+                      MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
+      break;
+    }
     const DWORD move_file_ex_error = ::GetLastError();
-    return Win32ErrorToStatus(move_file_ex_error, "MoveFileExW failed");
+    const bool retriable = move_file_ex_error == ERROR_ACCESS_DENIED ||
+                           move_file_ex_error == ERROR_SHARING_VIOLATION;
+    if (!retriable || retry >= kMaxRetries) {
+      return Win32ErrorToStatus(move_file_ex_error, "MoveFileExW failed");
+    }
+    ::Sleep(kRetryIntervalMsec);
   }
   if (absl::Status s = SetFileAttributes(pf_to, *original_attributes);
       !s.ok()) {
@@ -572,30 +588,16 @@ absl::StatusOr<FileTimeStamp> FileUtil::GetModificationTime(
     absl::string_view filename) {
   MAYBE_INVOKE_MOCK(GetModificationTime, filename);
 
-  const pfstring pf_filename = to_pfstring(filename);
-
-#if defined(_WIN32)
-  if (pf_filename.empty()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("Utf8ToWide failed: ", filename));
+  const std::filesystem::path path = to_pfstring(filename);
+  std::error_code error_code;
+  const std::filesystem::file_time_type last_write_time =
+      std::filesystem::last_write_time(path, error_code);
+  if (error_code) {
+    return absl::ErrnoToStatus(
+        error_code.value(), absl::StrCat("last_write_time failed: ", filename,
+                                         ": ", error_code.message()));
   }
-  WIN32_FILE_ATTRIBUTE_DATA info = {};
-  if (!::GetFileAttributesEx(pf_filename.c_str(), GetFileExInfoStandard,
-                             &info)) {
-    const auto last_error = ::GetLastError();
-    return Win32ErrorToStatus(
-        last_error, absl::StrCat("GetFileAttributesEx(", filename, ") failed"));
-  }
-  return (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) +
-         info.ftLastWriteTime.dwLowDateTime;
-#else   // !_WIN32
-  struct stat stat_info;
-  if (::stat(pf_filename.c_str(), &stat_info)) {
-    const int err = errno;
-    return absl::ErrnoToStatus(err, absl::StrCat("stat failed: ", filename));
-  }
-  return stat_info.st_mtime;
-#endif  // _WIN32
+  return last_write_time.time_since_epoch().count();
 }
 
 absl::StatusOr<std::string> FileUtil::ReadSymlink(absl::string_view filename) {

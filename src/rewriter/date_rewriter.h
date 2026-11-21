@@ -159,12 +159,13 @@ class DateRewriter : public RewriterInterface {
   // If the rewrite is done, returns `true` and sets the `num_done_out` to the
   // number of segments processed. The `num_done_out` is not modified if the
   // rewrite is not done.
-  static bool RewriteDate(
-      Segment* segment, absl::Span<const std::string> extra_date_formats,
-      absl::Span<const std::string>  extra_datetime_formats,
-      size_t& num_done_out);
+  static bool RewriteDate(Segment* segment,
+                          absl::Span<const std::string> extra_date_formats,
+                          absl::Span<const std::string> extra_datetime_formats,
+                          size_t& num_done_out);
   static bool RewriteEra(Segments::range segments_range, size_t& num_done_out);
-  static bool RewriteAd(Segments::range segments_range, size_t& num_done_out);
+  static bool RewriteAd(const ConversionRequest& request,
+                        Segments::range segments_range, size_t& num_done_out);
 
   // Returns the value if rewrite for AD wants to resize the segments.
   std::optional<ResizeSegmentsRequest> CheckResizeSegmentsForAd(
@@ -179,9 +180,13 @@ class DateRewriter : public RewriterInterface {
   //   0101 -> "1月1日、01/01、1時1分,午前1時1分、1:01"
   //   2020 -> "20時20分、午後8時20分、20:20"
   //   2930 -> "29時30分、29時半、午前5時30分、午前5時半"
-  //   123  -> "1月23日、01/23、1:23"
-  static bool RewriteConsecutiveDigits(const composer::ComposerData& composer,
-                                       int insert_position, Segments* segments);
+  //   123      -> "1月23日、01/23、1:23"
+  //   20260908 -> "2026/09/08、2026-09-08、2026年9月8日"
+  //   9/8      -> "9月8日、09/08、2026/09/08" (current year)
+  static bool RewriteConsecutiveDigits(
+      const composer::ComposerData& composer,
+      absl::Span<const std::string> extra_date_formats, int insert_position,
+      Segments* segments);
 
   // Helper functions for RewriteConsecutiveDigits().
   static bool RewriteConsecutiveTwoDigits(

@@ -284,6 +284,9 @@ class AsyncSetFocusEditSessionImpl final
   // This function is called back by the TSF thread manager when an edit
   // request is granted.
   STDMETHODIMP DoEditSession(TfEditCookie read_cookie) override {
+    // RequestEditSession(TF_ES_ASYNCDONTCARE) may be granted after focus has
+    // already moved elsewhere. Never let a stale callback update display
+    // sampling or input-mode state for a newer focus generation.
     const TsfFocusSnapshot scheduled_domain = {
         .focus_epoch = scheduled_focus_epoch_,
         .focus_revision = scheduled_focus_revision_,
@@ -301,6 +304,19 @@ class AsyncSetFocusEditSessionImpl final
             context_.get(), read_cookie, &selection_range, &active_sel_end))) {
       input_scopes_resolved = SUCCEEDED(TipRangeUtil::GetInputScopes(
           selection_range.get(), read_cookie, &input_scopes));
+      // Fork hardening: the prewarm samples screen pixels around the caret.
+      // Never do that for a field whose scope is unknown or IS_PASSWORD; a
+      // later composition in a non-secure field still performs its own
+      // recovery sample.
+      if (input_scopes_resolved &&
+          !TipSurroundingTextUtil::ContainsPasswordInputScope(input_scopes) &&
+          IsContextFocusedForSnapshot(text_service_.get(), context_.get(),
+                                      scheduled_domain,
+                                      /*require_nonsecure=*/false)) {
+        TipEditSessionImpl::PrewarmGeckoDisplayCompatibility(
+            text_service_.get(), context_.get(), selection_range.get(),
+            read_cookie);
+      }
     }
     if (!input_scopes_resolved) {
       // If TSF withholds the input scope, do not risk selecting project data
@@ -954,6 +970,12 @@ bool TurnOnImeAndTryToReconvertFromIme(TipTextService* text_service,
         output_application_generation);
   }
 
+  // Match the normal TSF reconversion path: embedded objects cannot be
+  // restored safely after reverse conversion.
+  if (TipSurroundingTextUtil::ContainsEmbeddedObject(info.selected_text)) {
+    return false;
+  }
+
   if (!private_context) {
     // This is an unmanaged context. It's OK. Nothing to do.
     return true;
@@ -988,13 +1010,18 @@ bool TurnOnImeAndTryToReconvertFromIme(TipTextService* text_service,
   }
 }
 
-bool ReconvertSelectionOrKeepFallbackOutput(TipTextService* text_service,
-                                            ITfContext* context,
-                                            Output* fallback_output,
-                                            TsfFocusSnapshot reconversion_domain,
-                                            uint64_t output_application_generation) {
+enum class ReconvertSelectionResult {
+  kUseFallback,
+  kHandledSuccessfully,
+  kHandledWithError,
+};
+
+ReconvertSelectionResult ReconvertSelectionOrKeepFallbackOutput(
+    TipTextService* text_service, ITfContext* context,
+    Output* fallback_output, TsfFocusSnapshot reconversion_domain,
+    uint64_t output_application_generation) {
   if (context == nullptr || fallback_output == nullptr) {
-    return false;
+    return ReconvertSelectionResult::kHandledWithError;
   }
   const std::shared_ptr<TipPrivateContext> private_context =
       text_service->GetPrivateContext(context);
@@ -1008,47 +1035,56 @@ bool ReconvertSelectionOrKeepFallbackOutput(TipTextService* text_service,
   if (!IsContextFocusedForSnapshot(text_service, context, reconversion_domain,
                                    /*require_nonsecure=*/true) ||
       !is_output_application_current()) {
-    return true;
+    // Consume the old-domain callback without applying either reconversion or
+    // its fallback output to the newly focused field.
+    return ReconvertSelectionResult::kHandledWithError;
   }
 
   TipSurroundingTextInfo info;
-  bool need_async_edit_session = false;
-  const bool prepared = TipSurroundingText::PrepareForReconversionFromIme(
-      text_service, context, &info, &need_async_edit_session,
-      reconversion_domain.focus_epoch, reconversion_domain.focus_revision);
+  const bool prepared =
+      TipSurroundingText::PrepareForExplicitSelectionReconversionFromIme(
+          text_service, context, &info, reconversion_domain.focus_epoch,
+          reconversion_domain.focus_revision);
   if (!IsContextFocusedForSnapshot(text_service, context, reconversion_domain,
                                    /*require_nonsecure=*/true) ||
       !is_output_application_current()) {
     // Consume the old-domain callback without applying either reconversion or
     // its fallback output to the newly focused field.
-    return true;
+    return ReconvertSelectionResult::kHandledWithError;
   }
   if (!prepared) {
-    // Some TSF clients do not expose enough surrounding text for reconversion.
+    // Space must not confuse a legacy IMM32 reconversion target with a
+    // verified selection. Full TSF is unavailable: insert Space instead.
     // In that case, reconversion is unavailable, so keep the server-generated
     // fallback InsertSpace output instead of consuming Space and doing nothing.
     fallback_output->clear_callback();
-    return false;
+    return ReconvertSelectionResult::kUseFallback;
   }
 
   if (info.in_composition) {
     // This command is only intended for the precomposition state.  Be
     // conservative if a composition is unexpectedly found.
-    return true;
+    return ReconvertSelectionResult::kHandledSuccessfully;
   }
 
   const std::string text_utf8 = WideToUtf8(info.selected_text);
-  if (text_utf8.empty()) {
-    // No selected application text.  Keep and apply the fallback InsertSpace
+  if (!TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(info)) {
+    // No verified selected application text. Keep the fallback InsertSpace
     // output that the server already generated.
     fallback_output->clear_callback();
-    return false;
+    return ReconvertSelectionResult::kUseFallback;
+  }
+
+  if (TipSurroundingTextUtil::ContainsEmbeddedObject(info.selected_text)) {
+    // A selection exists, so do not fall back to Space.  Embedded objects are
+    // intentionally not reconverted because they cannot be restored safely.
+    return ReconvertSelectionResult::kHandledSuccessfully;
   }
 
   if (!private_context) {
     // This is an unmanaged context.  Consume the key rather than applying the
     // fallback and potentially replacing selected application text.
-    return true;
+    return ReconvertSelectionResult::kHandledSuccessfully;
   }
 
   Output output;
@@ -1056,27 +1092,24 @@ bool ReconvertSelectionOrKeepFallbackOutput(TipTextService* text_service,
           text_service, context, private_context->GetClient(), text_utf8,
           reconversion_domain, &output,
           &output_application_generation)) {
-    return true;
+    return ReconvertSelectionResult::kHandledWithError;
   }
 
   if (output.has_callback() && output.callback().has_session_command() &&
       output.callback().session_command().has_type()) {
     // Do not allow recursive callbacks.
-    return true;
+    return ReconvertSelectionResult::kHandledWithError;
   }
 
-  if (need_async_edit_session) {
-    return TipEditSession::OnOutputReceivedAsync(text_service, context,
-                                                 std::move(output),
-                                                 reconversion_domain.focus_epoch,
-                                                 reconversion_domain.focus_revision,
-                                                 output_application_generation);
-  }
-  return TipEditSession::OnOutputReceivedSync(text_service, context,
-                                              std::move(output),
-                                              reconversion_domain.focus_epoch,
-                                              reconversion_domain.focus_revision,
-                                              output_application_generation);
+  // The Output carries a continuation token only when the server has a
+  // suspended keymap macro. SyncEditSessionImpl posts its acknowledgement
+  // after applying that Output. The explicit-selection path is TSF-only.
+  const bool applied = TipEditSession::OnOutputReceivedSync(
+      text_service, context, std::move(output),
+      reconversion_domain.focus_epoch, reconversion_domain.focus_revision,
+      output_application_generation);
+  return applied ? ReconvertSelectionResult::kHandledSuccessfully
+                 : ReconvertSelectionResult::kHandledWithError;
 }
 
 bool UndoCommint(TipTextService* text_service, ITfContext* context,
@@ -1208,10 +1241,31 @@ class SyncEditSessionImpl final : public TipComImplements<ITfEditSession> {
             output_application_generation_)) {
       return S_OK;
     }
-    return TipEditSessionImpl::UpdateContext(
+    const HRESULT result = TipEditSessionImpl::UpdateContext(
         text_service_.get(), context_.get(), write_cookie, output_,
         output_domain_.focus_epoch, output_domain_.focus_revision,
         output_application_generation_);
+    if (SUCCEEDED(result) &&
+        output_.has_command_sequence_resume_generation() &&
+        IsContextFocusedForSnapshot(text_service_.get(), context_.get(),
+                                    output_domain_,
+                                    /*require_nonsecure=*/false) &&
+        private_context->IsOutputApplicationForFocusDomain(
+            output_domain_.focus_epoch, output_domain_.focus_revision,
+            output_application_generation_)) {
+      // TSF has actually applied the reconverted preedit. Queue the resume
+      // for the next message-loop turn, outside this edit session lock.  The
+      // delayed-command queue binds it to the current focus domain and
+      // composition, so a stale resume is dropped instead of being replayed
+      // into another field.
+      SessionCommand resume;
+      resume.set_type(SessionCommand::RESUME_COMMAND_SEQUENCE);
+      resume.set_command_sequence_generation(
+          output_.command_sequence_resume_generation());
+      text_service_->PostDelayedSessionCommand(
+          context_.get(), resume, 1, output_application_generation_);
+    }
+    return result;
   }
 
  private:
@@ -1233,7 +1287,11 @@ bool OnOutputReceivedImpl(TipTextService* text_service,
                           Output new_output,
                           TsfFocusSnapshot output_domain,
                           EditSessionMode mode,
-                          uint64_t output_application_generation) {
+                          uint64_t output_application_generation,
+                          bool* should_consume_key_event) {
+  if (should_consume_key_event != nullptr) {
+    *should_consume_key_event = false;
+  }
   if (text_service == nullptr || context == nullptr) {
     return false;
   }
@@ -1292,16 +1350,22 @@ bool OnOutputReceivedImpl(TipTextService* text_service,
           return TurnOnImeAndTryToReconvertFromIme(
               text_service, context, output_domain,
               output_application_generation);
-        case SessionCommand::RECONVERT_SELECTION_OR_INSERT_SPACE:
-          if (ReconvertSelectionOrKeepFallbackOutput(text_service, context,
-                                                     &new_output, output_domain,
-                                                     output_application_generation)) {
-            return true;
+        case SessionCommand::RECONVERT_SELECTION_OR_INSERT_SPACE: {
+          const ReconvertSelectionResult result =
+              ReconvertSelectionOrKeepFallbackOutput(
+                  text_service, context, &new_output, output_domain,
+                  output_application_generation);
+          if (result == ReconvertSelectionResult::kUseFallback) {
+            if (!is_output_application_current()) {
+              return false;
+            }
+            break;
           }
-          if (!is_output_application_current()) {
-            return false;
+          if (should_consume_key_event != nullptr) {
+            *should_consume_key_event = true;
           }
-          break;
+          return result == ReconvertSelectionResult::kHandledSuccessfully;
+        }
         case SessionCommand::UNDO:
           return UndoCommint(text_service, context, output_domain,
                              output_application_generation);
@@ -1490,11 +1554,13 @@ bool TipEditSession::OnOutputReceivedSync(TipTextService* text_service,
                                           Output new_output,
                                           uint64_t output_focus_epoch,
                                           int32_t output_focus_revision,
-                                          uint64_t output_application_generation) {
+                                          uint64_t output_application_generation,
+                                          bool* should_consume_key_event) {
   return OnOutputReceivedImpl(text_service, context, std::move(new_output),
                               {.focus_epoch = output_focus_epoch,
                                .focus_revision = output_focus_revision},
-                              kSync, output_application_generation);
+                              kSync, output_application_generation,
+                              should_consume_key_event);
 }
 
 bool TipEditSession::OnOutputReceivedAsync(TipTextService* text_service,
@@ -1506,7 +1572,8 @@ bool TipEditSession::OnOutputReceivedAsync(TipTextService* text_service,
   return OnOutputReceivedImpl(text_service, context, std::move(new_output),
                               {.focus_epoch = output_focus_epoch,
                                .focus_revision = output_focus_revision},
-                              kAsync, output_application_generation);
+                              kAsync, output_application_generation,
+                              /*should_consume_key_event=*/nullptr);
 }
 
 bool TipEditSession::OnLayoutChangedAsync(TipTextService* text_service,
@@ -1518,6 +1585,14 @@ bool TipEditSession::OnSetFocusAsync(TipTextService* text_service,
                                      ITfDocumentMgr* document_manager,
                                      uint64_t focus_epoch,
                                      int32_t focus_revision) {
+  // This does not touch TSF text and can run before the asynchronous read edit
+  // session. It prevents a previous context's dynamic display background from
+  // remaining active during the focus handoff.
+  TipEditSessionImpl::ResetGeckoDisplayCompatibility();
+
+  if (text_service == nullptr) {
+    return false;
+  }
   const TsfFocusSnapshot scheduled_domain = {
       .focus_epoch = focus_epoch,
       .focus_revision = focus_revision,
@@ -1534,6 +1609,16 @@ bool TipEditSession::OnSetFocusAsync(TipTextService* text_service,
                                    scheduled_domain,
                                    /*require_nonsecure=*/false)) {
     return false;
+  }
+
+  // The per-context sample belongs to a focus generation. Clear it
+  // synchronously, before the asynchronous edit session can race with the
+  // first real composition. The later prewarm callback may only populate an
+  // empty/retryable cache; it must never clear a sample created by typing.
+  if (const std::shared_ptr<TipPrivateContext> private_context =
+          text_service->GetPrivateContext(context.get());
+      private_context != nullptr) {
+    private_context->ClearPendingRomanDisplayColors();
   }
 
   // When RequestEditSession fails, it does not maintain the reference count.

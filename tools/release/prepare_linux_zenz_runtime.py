@@ -187,6 +187,9 @@ def verify_server(path: Path) -> None:
         "--model",
         "--ctx-size",
         "--threads",
+        # src/zenz_scorer always launches with `--parallel 1 --cache-ram 0`.
+        "--parallel",
+        "--cache-ram",
     ):
         if required_flag not in (help_output.stdout or ""):
             raise PreparationError("llama_server_cli_incompatible")

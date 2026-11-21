@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,10 +51,12 @@
 #include "session/ime_context.h"
 #include "session/keymap.h"
 #include "session/zenz_adoption_policy.h"
+#include "session/zenz_context_assembler.h"
 #include "session/zenz_context_sanitizer.h"
 #include "session/zenz_feedback_store.h"
 #include "session/zenz_live_corrector.h"
 #include "session/zenz_output_validator.h"
+#include "session/zenz_segment_projection.h"
 #include "transliteration/transliteration.h"
 
 namespace mozc {
@@ -63,6 +66,20 @@ struct ZenzProjectedLearningSegment {
   std::string key;
   std::string value;
   bool is_reranked = false;
+
+  // Sequence-level signal consumed by LearnExternalConversionSegments.
+  bool boundary_resized = false;
+
+  // True only for an aggregate projection whose internal live-Mozc boundary
+  // was intentionally left unresolved. SetPendingZenzFeedbackAccepted tries
+  // Mozc-native resegmentation for this unit without affecting neighboring
+  // safe units.
+  bool needs_native_resolution = false;
+
+  // Original live-Mozc segment keys inside an unresolved aggregate. Used only
+  // to decide whether a successfully resolved native sequence really changed
+  // a boundary; never used to guess a boundary.
+  std::vector<std::string> baseline_keys;
 };
 
 class Session {
@@ -107,6 +124,9 @@ class Session {
   // composition.
   bool DeleteCandidateFromHistory(mozc::commands::Command* command);
 
+  // Handles the keymap-level DeleteSelectedCandidate action.
+  bool DeleteSelectedCandidate(mozc::commands::Command* command);
+
   // Resets the composer and clear conversion segments.
   // History segments will not be cleared.
   // Therefore if a user commits "風"(かぜ) and Revert method is called,
@@ -147,7 +167,8 @@ class Session {
 
   bool InsertSpace(mozc::commands::Command* command);
   bool InsertSpaceToggled(mozc::commands::Command* command);
-  bool InsertSpaceHalfWidth(mozc::commands::Command* command);
+  bool InsertSpaceHalfWidth(mozc::commands::Command* command,
+                            bool allow_pass_through = true);
   bool InsertSpaceFullWidth(mozc::commands::Command* command);
   bool InsertCharacter(mozc::commands::Command* command);
   bool UpdateComposition(mozc::commands::Command* command);
@@ -295,6 +316,18 @@ class Session {
  private:
   friend class SessionTestPeer;
 
+  struct PassiveSuggestionSnapshot {
+    commands::CandidateWindow candidate_window;
+    std::unique_ptr<ImeContext> context;
+  };
+
+  // One continuation per IME session. Invalidated on every physical key.
+  // Never retain a pointer to a stack-allocated commands::Command.
+  keymap::CommandSequence pending_command_sequence_;
+  uint32_t command_sequence_generation_ = 0;
+  bool command_sequence_waits_for_reconversion_ = false;
+  std::string pending_command_sequence_key_;
+
   std::unique_ptr<ImeContext> context_;
 
   // Security-domain identity supplied by the Grimodex-aware client.  This is
@@ -310,10 +343,21 @@ class Session {
 
   GrimodexDomainState grimodex_domain_;
 
+  // True only while ordinary composition is displaying a passive suggestion
+  // that was intentionally held across unresolved trailing Roman input.
+  bool composition_holds_passive_suggestion_ = false;
+
   // True while the current CONVERSION state was started by live conversion.
   // In this mode, ordinary character input should keep editing the underlying
   // composition instead of committing the conversion.
   bool live_conversion_active_ = false;
+
+  // Provenance of the active live conversion. A forced Zenz request sets
+  // live_conversion_active_ even for ordinary conversion with live mode OFF
+  // or ON.  That temporary state must not acquire LiveConversion bindings or
+  // live-edit continuation unless conversion actually started from streaming
+  // composition (including a pending live-conversion request).
+  bool live_conversion_from_composition_ = false;
 
   // True while a live conversion request has been scheduled but not applied yet.
   bool live_conversion_pending_ = false;
@@ -335,10 +379,31 @@ class Session {
   // prevents the visible suggestion window from disappearing at materialization.
   commands::CandidateWindow pending_live_conversion_suggestion_candidate_window_;
 
+  // Exact cloned context that owns candidate IDs in the pending window above.
+  // Pending and active live-conversion suggestions are separate semantic
+  // snapshots and must never share ownership implicitly.
+  std::unique_ptr<ImeContext> pending_live_conversion_suggestion_context_;
+
+  // True when the delayed live-conversion request was scheduled from a
+  // physical lower-case Roman key whose unresolved suffix must keep the
+  // previously visible passive suggestion instead of refreshing prediction.
+  // Keep this explicit: Composer state alone cannot distinguish Roman keyboard
+  // input from key_string/mobile input that may use pending_ internally.
+  bool pending_live_conversion_holds_passive_suggestion_ = false;
+
   // Passive suggestion window currently associated with live conversion output.
   // Some delayed callbacks re-render live conversion without regenerating
   // suggestions; this cache keeps the passive suggestion window stable there.
   commands::CandidateWindow live_conversion_suggestion_candidate_window_;
+
+  // Exact cloned context that produced the passive suggestion window above.
+  // Candidate IDs in that window belong to this converter state, not to the
+  // real live-conversion converter which intentionally remains in CONVERSION.
+  std::unique_ptr<ImeContext> live_conversion_suggestion_context_;
+
+  // True only when the active live-conversion passive suggestion is an exact
+  // held snapshot from before the current unresolved Roman suffix.
+  bool live_conversion_holds_passive_suggestion_ = false;
 
   // The reading used for the latest successful live conversion.
   std::string live_conversion_key_;
@@ -366,10 +431,74 @@ class Session {
   // to avoid display-attribute flicker.
   commands::Preedit live_conversion_preedit_output_;
 
+  // A presentation-only basis used while ordinary character input continues
+  // from a visible Zenz/deferred result.  The live_conversion_* fields remain
+  // the Mozc baseline for Zenz validation/fallback; this state exists only so
+  // pending preedit output and pending direct commit extend what the user
+  // actually saw rather than leaking the hidden Mozc surface.
+  struct StablePresentationSpan {
+    std::string key;
+    std::string raw_preedit;
+    std::string value;
+    commands::Preedit::Segment preedit_segment;
+  };
+
+  struct PendingLiveConversionPresentation {
+    std::string key;
+    std::string raw_preedit;
+    std::string value;
+    commands::Preedit preedit_output;
+
+    // Leading reading/value spans whose correspondence was already proven by
+    // the Mozc result that existed when this presentation was visible.  These
+    // spans may survive a later converter re-segmentation as long as their
+    // reading still matches the current composition at the same position.
+    std::vector<StablePresentationSpan> stable_spans;
+  };
+  std::optional<PendingLiveConversionPresentation>
+      pending_live_conversion_presentation_;
+
   // User-dictionary surfaces selected by the latest normal live conversion.
   // Zenz live correction may improve the surrounding sentence, but these
   // surfaces must be preserved or safely repaired before adoption.
   std::vector<ProtectedConversionSpan> live_conversion_protected_spans_;
+
+  // Presentation snapshot used when normal live conversion is computed as the
+  // first stage for Zenz, but its result is intentionally kept hidden until
+  // Zenz finishes. The previous visible basis is captured before Convert(), and
+  // any previously proven reading/value spans are kept independent of the next
+  // Mozc segmentation. The converter and live_conversion_* fields continue to
+  // represent the newly computed Mozc result.
+  struct DeferredZenzLivePresentation {
+    std::string visible_key;
+    std::string visible_value;
+    std::string visible_raw_preedit;
+    commands::Preedit visible_preedit;
+
+    // Stable live-conversion state from before the hidden Mozc conversion.
+    // Restore this state when the user edits the still-visible preedit so the
+    // hidden Mozc result never leaks into the next pending display.
+    std::string previous_live_key;
+    std::string previous_live_preedit;
+    std::string previous_live_value;
+    commands::Preedit previous_live_preedit_output;
+    commands::CandidateWindow previous_live_suggestion_candidate_window;
+
+    // Exact cloned context that produced the previous passive suggestion
+    // window. Candidate IDs are meaningful only together with this converter
+    // state, so deferred presentation must preserve both as one snapshot.
+    std::unique_ptr<ImeContext> previous_live_suggestion_context;
+
+    // Stable presentation basis from before any transient unresolved-romaji
+    // suffix.  Keep this basis across hidden Mozc/Zenz rounds so a sequence
+    // such as "s" -> "su" can rewrite the suffix to "す" without exposing
+    // the hidden Mozc surface.
+    std::optional<PendingLiveConversionPresentation>
+        continued_input_presentation;
+  };
+
+  std::optional<DeferredZenzLivePresentation>
+      deferred_zenz_live_presentation_;
 
   // Set only after an explicit conversion Cancel command, such as Esc or Ctrl+Z
   // in the default keymap.  If the user commits the unchanged hiragana preedit
@@ -395,10 +524,17 @@ class Session {
     std::string style;
     std::string settings;
     std::string prompt;
+    // Input actually sent to the model; original key remains unchanged.
+    std::string prompt_reading;
+    bool proper_name_proxy_active = false;
     std::vector<ProtectedConversionSpan> protected_spans;
+    std::vector<ZenzBaselineSegment> baseline_segments;
     absl::Time issued_at;
     bool pending = false;
     bool submitted = false;
+    // Snapshot manual invocation policy for asynchronous responses.
+    bool forced = false;
+    bool bypass_automatic_feedback = false;
     uint32_t poll_count = 0;
   };
 
@@ -409,7 +545,7 @@ class Session {
     enum class Action {
       kNone,
       kAccepted,
-      kRejected,
+      kCompareFinalCommit,
     };
 
     bool pending = false;
@@ -419,11 +555,17 @@ class Session {
     std::string value;
     std::string reason;
 
-    // Set when a rejected Zenz candidate is followed by a real commit.
-    // This lets ambiguous operations such as Space revert become neutral when
-    // the final committed text is identical to the Zenz value.
+    // Set when a Zenz candidate is compared with a later real commit. Visible
+    // overrides and auto-blocked shadow candidates share this final-observation
+    // path so one user decision contributes at most one accepted/rejected event.
     bool has_final_committed_value = false;
     std::string final_committed_value;
+
+    // Auto-block shadow observations are speculative prefixes until the same
+    // full reading is actually committed. Require an exact committed key match
+    // for those observations so continued typing is never miscounted as a reject.
+    bool require_final_committed_key_match = false;
+    std::string final_committed_key;
 
     // Snapshot of reverse-projected segment-local learning pairs derived from
     // the Mozc live-conversion segments that were visible when the Zenz result
@@ -436,6 +578,18 @@ class Session {
     // conversion commit so Mozc history can observe phrase-boundary context.
     std::vector<ZenzProjectedLearningSegment>
         reverse_projected_learning_segments;
+
+    // Only a successfully flushed accepted record requires Undo compensation.
+    // Do not compensate earlier accepted records if this append failed.
+    bool feedback_acceptance_write_succeeded = false;
+    bool mozc_history_learning_requested = false;
+
+    // Phase 2: generalized Mozc history may be applied at the same explicit
+    // commit point as the Zenz acceptance. Each handle corresponds to one
+    // reversible external FinishConversion operation and must be reverted in
+    // reverse order if the commit is immediately undone.
+    bool mozc_history_learning_applied = false;
+    std::vector<uint64_t> mozc_history_revert_ids;
   };
 
   PendingZenzFeedback pending_zenz_feedback_;
@@ -464,20 +618,50 @@ class Session {
   std::string zenz_live_left_context_;
   commands::Preedit zenz_live_preedit_output_;
 
+  // Reading/value spans that were proven by an earlier Mozc presentation and
+  // are still valid for the currently visible Zenz result.  Unlike the latest
+  // Mozc segmentation, these spans are intentionally persistent: a later
+  // conversion may merge or split segments without invalidating an unchanged
+  // leading reading/value correspondence.
+  std::vector<StablePresentationSpan> zenz_live_stable_spans_;
+
+  ZenzContextAssembler zenz_context_assembler_;
   ZenzContextSanitizer zenz_context_sanitizer_;
   ZenzOutputValidator zenz_output_validator_;
   ZenzAdoptionPolicy zenz_adoption_policy_;
   ZenzFeedbackStore zenz_feedback_store_;
   std::unique_ptr<ZenzLiveCorrector> zenz_live_corrector_;
 
+  struct PendingLiveConversionUndoState {
+    std::string pending_key;
+    commands::Input pending_input;
+    std::optional<PendingLiveConversionPresentation> pending_presentation;
+    commands::CandidateWindow pending_suggestion_candidate_window;
+    std::unique_ptr<ImeContext> pending_suggestion_context;
+    commands::CandidateWindow live_suggestion_candidate_window;
+    std::unique_ptr<ImeContext> live_suggestion_context;
+    std::string live_key;
+    std::string live_preedit;
+    std::string live_value;
+    commands::Preedit live_preedit_output;
+  };
+
+  struct UndoEntry {
+    std::unique_ptr<ImeContext> context;
+    std::optional<PendingLiveConversionUndoState> pending_live_conversion;
+    bool revert_converter_on_undo = true;
+  };
+
   // Undo stack. *begin is the oldest, and *back is the newest.
-  std::deque<std::unique_ptr<ImeContext>> undo_contexts_;
+  std::deque<UndoEntry> undo_contexts_;
 
   std::unique_ptr<ImeContext> CreateContext(
       const EngineInterface& engine) const;
 
   void PushUndoContext();
+  void PushDirectCommitUndoContext();
   void PopUndoContext();
+  bool ShouldRevertConverterOnUndo() const;
   // Clear the undo context.
   // This should be called when the composer's preedit or cursor position
   // is updated by non-undo related operations. This achieves intuitive
@@ -579,7 +763,14 @@ class Session {
 
   // Live conversion.
   bool MaybeStartLiveConversion(mozc::commands::Command* command);
-  bool MaybeScheduleLiveConversion(mozc::commands::Command* command);
+  bool MaybeStartLiveConversionInternal(
+      mozc::commands::Command* command, bool allow_zenz_live_correction,
+      PassiveSuggestionSnapshot* held_suggestion);
+  bool MaybeStartLiveConversionAfterEditing(
+      mozc::commands::Command* command);
+  bool MaybeScheduleLiveConversion(
+      mozc::commands::Command* command,
+      PassiveSuggestionSnapshot* held_suggestion = nullptr);
   bool ApplyDelayedLiveConversion(mozc::commands::Command* command);
   bool IgnoreStaleDelayedLiveConversion(mozc::commands::Command* command);
   void CancelPendingLiveConversion();
@@ -594,6 +785,14 @@ class Session {
   // without mutating the real converter state.  This keeps live conversion as a
   // CONVERSION state for normal conversion keys while still showing passive
   // suggestions.
+  bool CaptureVisiblePassiveSuggestionSnapshot(
+      PassiveSuggestionSnapshot* snapshot) const;
+  bool AttachPassiveSuggestionSnapshot(
+      const mozc::commands::Input& input,
+      PassiveSuggestionSnapshot* snapshot,
+      mozc::commands::Output* output);
+  // Focus the actual displayed passive-suggestion list, held or freshly made.
+  bool FocusDisplayedPassiveSuggestion(mozc::commands::Command* command);
   bool AttachLiveConversionSuggestionCandidateWindow(
       const mozc::commands::Input& input,
       mozc::commands::Output* output);
@@ -602,17 +801,51 @@ class Session {
   bool CommitLiveConversionResult(
       mozc::commands::Command* command,
       absl::string_view corrected_key_for_commit = {});
+  std::pair<std::string, std::string>
+  GetPendingLiveConversionDisplayCommitStrings() const;
   bool CommitPendingLiveConversionDisplayDirectly(
+      mozc::commands::Command* command);
+  bool CommitPendingLiveConversionDisplayForSubmit(
       mozc::commands::Command* command);
   bool OutputPendingLiveConversion(mozc::commands::Command* command) const;
   absl::string_view LiveConversionKeyForZenz() const;
+  bool OutputPendingLiveConversionWithPresentation(
+      mozc::commands::Command* command,
+      const PendingLiveConversionPresentation* presentation,
+      PendingLiveConversionPresentation* stable_presentation) const;
+  std::vector<StablePresentationSpan> BuildStablePresentationSpans(
+      absl::string_view visible_value) const;
+  std::vector<StablePresentationSpan> MergeStablePresentationSpans(
+      absl::string_view visible_value,
+      const std::vector<StablePresentationSpan>& previous_spans) const;
+  std::optional<PendingLiveConversionPresentation>
+  CapturePendingLiveConversionPresentationForContinuedInput() const;
   void AttachDelayedLiveConversionCallback(
       mozc::commands::Command* command) const;
+
+  // Deferred Zenz presentation keeps the pre-Zenz display visible while the
+  // normal Mozc result remains available internally as the Zenz baseline and
+  // fallback.
+  bool HasDeferredZenzLivePresentation() const;
+  void ClearDeferredZenzLivePresentation();
+  void OverrideOutputWithDeferredZenzLivePresentation(
+      mozc::commands::Command* command) const;
+  void RestoreDeferredZenzLivePresentationForEditing();
+  bool CommitDeferredZenzLivePresentationForSubmit(
+      mozc::commands::Command* command);
+  bool RevealDeferredZenzLiveConversion(
+      mozc::commands::Command* command);
 
   // zenz live correction.
   bool MaybeApplyZenzFeedbackLiveCorrection(
       mozc::commands::Command* command);
-  bool MaybeScheduleZenzLiveCorrection(mozc::commands::Command* command);
+  bool MaybeScheduleZenzLiveCorrection(
+      mozc::commands::Command* command, bool forced = false,
+      bool bypass_automatic_feedback = false);
+  bool ForceZenzLiveCorrection(
+      mozc::commands::Command* command,
+      bool bypass_automatic_feedback = false);
+  bool ResumeCommandSequence(mozc::commands::Command* command);
   void AttachZenzLiveCorrectionStartCallback(
       mozc::commands::Command* command) const;
   void AttachZenzLiveCorrectionPollCallback(
@@ -636,7 +869,8 @@ class Session {
       absl::string_view value,
       mozc::commands::Command* command);
   bool RevertZenzLiveCorrectionToNormalConversion(
-      mozc::commands::Command* command);
+      mozc::commands::Command* command, bool record_rejection = true);
+  bool BlockVisibleZenzCorrection(mozc::commands::Command* command);
   bool CommitZenzLiveCorrectionResult(mozc::commands::Command* command);
 
   std::string BuildZenzFeedbackContextClass(
@@ -648,11 +882,14 @@ class Session {
 
   bool MaybeLearnZenzCandidateToMozcHistory(
       absl::string_view key,
-      absl::string_view value);
+      absl::string_view value,
+      std::vector<uint64_t>* revert_ids = nullptr);
   int MaybeLearnZenzReverseSegmentsToMozcHistory(
-      const std::vector<std::pair<std::string, std::string>>& segments);
+      const std::vector<std::pair<std::string, std::string>>& segments,
+      std::vector<uint64_t>* revert_ids = nullptr);
   int MaybeLearnZenzProjectedSegmentsToMozcHistory(
-      const std::vector<ZenzProjectedLearningSegment>& segments);
+      const std::vector<ZenzProjectedLearningSegment>& segments,
+      std::vector<uint64_t>* revert_ids = nullptr);
 
   bool SetPendingDirectCommitLearning(
       absl::string_view key,
@@ -673,6 +910,13 @@ class Session {
       absl::string_view key,
       absl::string_view context_class,
       absl::string_view value);
+  void ApplyPendingZenzAcceptedMozcHistoryLearning();
+  void SetPendingZenzFeedbackComparison(
+      absl::string_view key,
+      absl::string_view context_class,
+      absl::string_view value,
+      absl::string_view reason,
+      bool require_final_committed_key_match);
   void SetPendingZenzFeedbackRejected(absl::string_view reason);
   void ObservePendingZenzFeedbackCommittedResult(
       const mozc::commands::Command& command,
@@ -686,12 +930,14 @@ class Session {
 
   void CancelPendingZenzLiveCorrection();
   void ClearZenzLiveCorrectionState();
+  // Returns the client text before the cursor on the current line, limited to
+  // |max_chars| characters.  Preceding lines are never included.
   std::string ExtractZenzLeftContext(uint32_t max_chars) const;
-  std::string ExtractZenzRightContext(uint32_t max_chars) const;
 
   // Fill command's output according to the current state.
   void OutputFromState(mozc::commands::Command* command);
   void Output(mozc::commands::Command* command);
+  void MaybeUpdateCandidateActionFooter(mozc::commands::Output* output) const;
   void OutputMode(mozc::commands::Command* command) const;
   void OutputComposition(mozc::commands::Command* command) const;
   void OutputKey(mozc::commands::Command* command) const;
@@ -708,6 +954,10 @@ class Session {
   bool ExecuteDirectInputCommand(
       mozc::keymap::DirectInputState::Commands key_command,
       mozc::commands::Command* command);
+
+  // An IME ON key can restore hiragana from temporary Shift ASCII without
+  // committing composition. Keep other already-on input modes unchanged.
+  bool IMEOnWhenAlreadyOn(mozc::commands::Command* command);
 
   bool ExecutePrecompositionCommand(
       mozc::keymap::PrecompositionState::Commands key_command,

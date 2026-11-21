@@ -72,6 +72,9 @@ void SetLegacyInputDefaultsForScenarioTest() {
   config.set_direct_commit_key(0);
   config.set_use_typing_correction(false);
   config.set_use_cycle_segmentation_shortcut(false);
+  config.set_use_zenz_live_correction(false);
+  config.set_use_zenz_feedback_learning(false);
+  config.set_use_realtime_conversion(true);
 
   config::ConfigHandler::SetConfig(config);
 }

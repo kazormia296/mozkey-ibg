@@ -29,10 +29,13 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <cstddef>
 #include <cstdint>
 
+#include "base/coordinates.h"
 #include "protocol/candidate_window.pb.h"
 #include "protocol/renderer_command.pb.h"
+#include "renderer/mac/mac_writing_direction.h"
 
 namespace mozc {
 namespace client {
@@ -62,6 +65,9 @@ enum ColumnType {
 // setCandidateWindow: sets the candidate window to be rendered.
 - (void)setCandidateWindow:(const mozc::commands::CandidateWindow *)candidate_window;
 
+// Sets the host writing direction resolved by CandidateController.
+- (void)setWritingDirection:(mozc::renderer::mac::WritingDirection)writing_direction;
+
 // setController: sets the reference of MozcImkInputController.
 // It will be used when mouse clicks.  It doesn't take ownerships of
 // |controller|.
@@ -70,10 +76,20 @@ enum ColumnType {
 // Binds mouse callbacks to the RendererCommand that populated this view.
 - (void)setRendererCallbackToken:(uint64_t)token;
 
-// Checks the |candidates_| and recalculates the layout using |tableLayout_|.
-// It also returns the size which is necessary to draw all GUI elements.
+// Recalculates the active horizontal or vertical candidate layout and returns
+// the size necessary to draw all GUI elements.
 - (NSSize)updateLayout;
 
 // Returns the table layout of the current candidates.
+// Kept for compatibility with existing TableLayout consumers.
 - (const mozc::renderer::TableLayout *)tableLayout;
+
+// Returns the point inside the candidate window that should align to the
+// composition target. The concrete layout engine stays private to this view.
+- (mozc::Point)candidateAnchorOffset;
+
+// Returns the rectangle used to anchor a cascading candidate window.
+// For the current horizontal path this preserves the historical row +
+// scrollbar geometry exactly.
+- (mozc::Rect)cascadingAnchorRectForRow:(size_t)row;
 @end

@@ -61,8 +61,37 @@ namespace mozc {
 namespace engine {
 namespace {
 
+bool HasDeletableHistory(const converter::Candidate& candidate) {
+  return candidate.attributes &
+         (converter::Attribute::USER_HISTORY_PREDICTION |
+          converter::Attribute::USER_SEGMENT_HISTORY_REWRITER);
+}
+
+bool IsSuppressibleCandidate(const Segment& segment, int candidate_index) {
+  // Keep the footer capability identical to EngineConverter: never advertise
+  // suppression if it would remove the last regular candidate.
+  if (candidate_index < 0 || !segment.is_valid_index(candidate_index) ||
+      segment.candidates_size() <= 1) {
+    return false;
+  }
+  const converter::Candidate& candidate = segment.candidate(candidate_index);
+  if (candidate.key.empty() || candidate.value.empty()) {
+    return false;
+  }
+  if (candidate.attributes & converter::Attribute::COMMAND_CANDIDATE) {
+    return false;
+  }
+  // Mozkey IbG: keep in sync with EngineConverter. Project dictionary terms
+  // are never written to the global user dictionary.
+  if (candidate.ranking_constraints &
+      converter::RankingConstraint::PROJECT_DICTIONARY) {
+    return false;
+  }
+  return true;
+}
+
 bool FillAnnotation(const converter::Candidate& candidate_value,
-                    commands::Annotation* annotation) {
+                    bool suppressible, commands::Annotation* annotation) {
   bool is_modified = false;
   if (!candidate_value.prefix.empty()) {
     annotation->set_prefix(candidate_value.prefix);
@@ -80,10 +109,12 @@ bool FillAnnotation(const converter::Candidate& candidate_value,
     annotation->set_a11y_description(candidate_value.a11y_description);
     is_modified = true;
   }
-  if (candidate_value.attributes &
-          converter::Attribute::USER_HISTORY_PREDICTION &&
-      !(candidate_value.attributes & converter::Attribute::NO_DELETABLE)) {
+  if (HasDeletableHistory(candidate_value)) {
     annotation->set_deletable(true);
+    is_modified = true;
+  }
+  if (suppressible) {
+    annotation->set_suppressible(true);
     is_modified = true;
   }
   if (!candidate_value.display_value.empty()) {
@@ -96,6 +127,7 @@ bool FillAnnotation(const converter::Candidate& candidate_value,
 void FillCandidateWord(const converter::Candidate& segment_candidate,
                        const int id, const int index,
                        const absl::string_view base_key,
+                       const bool suppressible,
                        commands::CandidateWord* candidate_word_proto) {
   candidate_word_proto->set_id(id);
   candidate_word_proto->set_index(index);
@@ -105,22 +137,23 @@ void FillCandidateWord(const converter::Candidate& segment_candidate,
   candidate_word_proto->set_value(segment_candidate.value);
 
   commands::Annotation annotation;
-  if (FillAnnotation(segment_candidate, &annotation)) {
+  if (FillAnnotation(segment_candidate, suppressible, &annotation)) {
     *candidate_word_proto->mutable_annotation() = annotation;
   }
 
   if (segment_candidate.attributes & converter::Attribute::USER_DICTIONARY) {
     candidate_word_proto->add_attributes(commands::USER_DICTIONARY);
   }
-  if (segment_candidate.attributes & converter::Attribute::PROJECT_DICTIONARY) {
+  if (segment_candidate.ranking_constraints &
+      converter::RankingConstraint::PROJECT_DICTIONARY) {
     candidate_word_proto->add_attributes(commands::PROJECT_DICTIONARY);
   }
   if (segment_candidate.attributes &
       converter::Attribute::USER_HISTORY_PREDICTION) {
     candidate_word_proto->add_attributes(commands::USER_HISTORY);
-    if (!(segment_candidate.attributes & converter::Attribute::NO_DELETABLE)) {
-      candidate_word_proto->add_attributes(commands::DELETABLE);
-    }
+  }
+  if (HasDeletableHistory(segment_candidate)) {
+    candidate_word_proto->add_attributes(commands::DELETABLE);
   }
   if (segment_candidate.attributes &
       converter::Attribute::SPELLING_CORRECTION) {
@@ -173,6 +206,7 @@ void FillAllCandidateWordsInternal(
     }
     const converter::Candidate& segment_candidate = segment.candidate(id);
     FillCandidateWord(segment_candidate, id, index, segment.key(),
+                      IsSuppressibleCandidate(segment, id),
                       candidate_word_proto);
   }
 }
@@ -197,7 +231,9 @@ void FillCandidate(const Segment& segment, const Candidate& candidate,
   candidate_proto->set_id(candidate.id());
   // Set annotations
   commands::Annotation annotation;
-  if (FillAnnotation(candidate_value, &annotation)) {
+  if (FillAnnotation(candidate_value,
+                     IsSuppressibleCandidate(segment, candidate.id()),
+                     &annotation)) {
     *candidate_proto->mutable_annotation() = annotation;
   }
 
@@ -266,7 +302,8 @@ void FillRemovedCandidates(const Segment& segment,
   for (const converter::Candidate& candidate : candidates) {
     commands::CandidateWord* candidate_word_proto =
         candidate_list_proto->add_candidates();
-    FillCandidateWord(candidate, index, index, "", candidate_word_proto);
+    FillCandidateWord(candidate, index, index, "", false,
+                      candidate_word_proto);
     index++;
   }
 }
@@ -379,7 +416,9 @@ bool FillFooter(const commands::Category category,
   } else {
     // category is commands::PREDICTION or commands::CONVERSION.
     footer->set_index_visible(true);
-    footer->set_logo_visible(true);
+    // Mozkey keeps the footer compact. The candidate index remains visible,
+    // but the legacy product-logo area is intentionally omitted.
+    footer->set_logo_visible(false);
 
     // If the selected candidate is a user prediction history, tell the user
     // that it can be removed by Ctrl-Delete.
@@ -394,14 +433,27 @@ bool FillFooter(const commands::Category category,
           // TODO(noriyukit): Change the message depending on user's keymap.
           const absl::string_view kDeleteInstruction = []() {
             if constexpr (port::IsAppleBase()) {
-              return "control+fn+deleteで履歴から削除";
+              return "control+fn+deleteで履歴削除";
             } else if constexpr (port::IsChromeos()) {
-              return "ctrl+search+backspaceで履歴から削除";
+              return "ctrl+search+backspaceで履歴削除";
             } else {
-              return "Ctrl+Delで履歴から削除";
+              return "Ctrl+Delで履歴削除";
             }
           }();
           footer->set_label(kDeleteInstruction);
+          show_build_number = false;
+        } else if (cand.has_annotation() &&
+                   cand.annotation().suppressible()) {
+          const absl::string_view kSuppressInstruction = []() {
+            if constexpr (port::IsAppleBase()) {
+              return "control+fn+deleteで候補非表示";
+            } else if constexpr (port::IsChromeos()) {
+              return "ctrl+search+backspaceで候補非表示";
+            } else {
+              return "Ctrl+Delで候補非表示";
+            }
+          }();
+          footer->set_label(kSuppressInstruction);
           show_build_number = false;
         }
         break;
@@ -457,10 +509,47 @@ void FillPreedit(const composer::Composer& composer,
   const std::string output = composer.GetStringForPreedit();
 
   constexpr uint32_t kBaseType = PREEDIT;
-  AddSegment(output, output, kBaseType, preedit);
+  const size_t output_length = Util::CharsLen(output);
+  const size_t pending_length = composer.GetPendingRomanDisplayLength();
+  if (pending_length == 0 || pending_length > output_length) {
+    AddSegment(output, output, kBaseType, preedit);
+  } else {
+    const size_t stable_length = output_length - pending_length;
+    if (stable_length > 0) {
+      const absl::string_view stable =
+          Util::Utf8SubString(output, 0, stable_length);
+      AddSegment(stable, stable, kBaseType, preedit);
+    }
+
+    const absl::string_view pending =
+        Util::Utf8SubString(output, stable_length, pending_length);
+    if (AddSegment(pending, pending, kBaseType, preedit)) {
+      preedit->mutable_segment(preedit->segment_size() - 1)
+          ->set_is_pending_roman(true);
+    }
+  }
   preedit->set_cursor(static_cast<uint32_t>(composer.GetCursor()));
   preedit->set_is_toggleable(composer.IsToggleable());
 }
+
+namespace {
+size_t GetSegmentSpan(size_t current_index, size_t focused_index,
+                      const converter::Candidate& candidate) {
+  const size_t count = candidate.effective_converted_segment_count();
+  if (current_index < focused_index && current_index + count > focused_index) {
+    return focused_index - current_index;
+  }
+  return count;
+}
+
+absl::string_view GetKey(const Segment& segment,
+                         const converter::Candidate& candidate) {
+  return (candidate.effective_converted_segment_count() > 1 &&
+          !candidate.key.empty())
+             ? candidate.key
+             : segment.key();
+}
+}  // namespace
 
 void FillConversion(const Segments& segments, const size_t segment_index,
                     const int candidate_id, commands::Preedit* preedit) {
@@ -469,19 +558,29 @@ void FillConversion(const Segments& segments, const size_t segment_index,
   size_t cursor = 0;
   const Segments::const_range conversion_segments =
       segments.conversion_segments();
-  const Segment& current_segment = conversion_segments[segment_index];
-  for (const Segment& segment : conversion_segments) {
-    if (&segment == &current_segment) {
-      absl::string_view value = segment.candidate(candidate_id).value;
-      if (AddSegment(segment.key(), value, kBaseType | FOCUSED, preedit) &&
+  if (conversion_segments.empty()) {
+    return;
+  }
+  const size_t focused_segment_index =
+      std::min<size_t>(segment_index, conversion_segments.size() - 1);
+
+  for (size_t i = 0; i < conversion_segments.size();) {
+    const Segment& segment = conversion_segments[i];
+    if (i == focused_segment_index) {
+      const converter::Candidate& candidate = segment.candidate(candidate_id);
+      if (AddSegment(GetKey(segment, candidate), candidate.value,
+                     kBaseType | FOCUSED, preedit) &&
           (!preedit->has_highlighted_position())) {
         preedit->set_highlighted_position(cursor);
       }
-      cursor += Util::CharsLen(value);
+      cursor += Util::CharsLen(candidate.value);
+      i += GetSegmentSpan(i, focused_segment_index, candidate);
     } else {
-      absl::string_view value = segment.candidate(0).value;
-      AddSegment(segment.key(), value, kBaseType, preedit);
-      cursor += Util::CharsLen(value);
+      const converter::Candidate& candidate = segment.candidate(0);
+      AddSegment(GetKey(segment, candidate), candidate.value, kBaseType,
+                 preedit);
+      cursor += Util::CharsLen(candidate.value);
+      i += GetSegmentSpan(i, focused_segment_index, candidate);
     }
   }
   preedit->set_cursor(cursor);

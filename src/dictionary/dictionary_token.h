@@ -50,8 +50,13 @@ struct Token {
     // values than LABEL_SIZE!! The attributes having less values than it are
     // tightly integrated with the system dictionary codec.
 
-    // The following attribute is not stored in the system dictionary but is
-    // added by in-memory dictionary modules at lookup time.
+    // The following attributes are not stored in the system dictionary but
+    // are added by dictionary modules at lookup time.
+    // Explicit user-dictionary POS provenance. This is intentionally distinct
+    // from generic symbols even though both currently share the same lid/rid.
+    EMOTICON = 1 << 2,
+    // Mozkey IbG: session-scoped project (Grimodex) dictionary provenance,
+    // added by the in-memory project dictionary at lookup time.
     PROJECT_DICTIONARY = 1 << 5,
     SUFFIX_DICTIONARY = 1 << 6,
     USER_DICTIONARY = 1 << 7,

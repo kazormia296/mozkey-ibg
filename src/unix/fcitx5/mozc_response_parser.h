@@ -35,6 +35,7 @@
 
 #include "protocol/candidate_window.pb.h"
 #include "protocol/commands.pb.h"
+#include "unix/fcitx5/session_callback.h"
 
 namespace fcitx {
 
@@ -52,16 +53,25 @@ class MozcResponseParser {
   // Parses a response from Mozc server and sets persed information on
   // Mozkey Fcitx object. Returns true if response.consumed() is true. The
   // engine must be non-null. This function does not take ownership of it.
+  //
+  // A delayed callback in the response is scheduled whether or not the
+  // response is consumed.  The RECONVERT_SELECTION_OR_INSERT_SPACE callback is
+  // not handled here: MozcState resolves it before calling the parser.
   bool ParseResponse(const mozc::commands::Output& response,
                      InputContext* ic) const;
 
  private:
+  // `allow_immediate_callback` is false for the reply to an immediate
+  // callback (UNDO, CONVERT_REVERSE), so that callbacks never recurse.
+  bool ParseResponseInternal(const mozc::commands::Output& response,
+                             InputContext* ic,
+                             bool allow_immediate_callback) const;
   void UpdateDeletionRange(const mozc::commands::Output& response,
                            InputContext* ic) const;
   void LaunchTool(const mozc::commands::Output& response,
                   InputContext* ic) const;
-  void ExecuteCallback(const mozc::commands::Output& response,
-                       InputContext* ic) const;
+  // Runs the callbacks that are executed at once: kUndo and kConvertReverse.
+  void ExecuteCallback(CallbackAction action, InputContext* ic) const;
   void ParseResult(const mozc::commands::Result& result,
                    InputContext* ic) const;
   void ParseCandidates(const mozc::commands::CandidateWindow& candidates,

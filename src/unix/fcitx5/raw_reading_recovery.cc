@@ -15,8 +15,9 @@
 namespace fcitx {
 
 RawReadingRecovery::RawReadingRecovery(
-    SessionInitializer session_initializer)
-    : session_initializer_(std::move(session_initializer)) {}
+    SessionInitializer session_initializer, KeyFinalizer key_finalizer)
+    : session_initializer_(std::move(session_initializer)),
+      key_finalizer_(std::move(key_finalizer)) {}
 
 RawReadingRecovery::PrepareResult RawReadingRecovery::Prepare(
     MozcClientInterface* client, const mozc::commands::Context& context,
@@ -130,10 +131,24 @@ RawReadingRecovery::PrepareResult RawReadingRecovery::Prepare(
   return PrepareResult::kSessionChanged;
 }
 
+mozc::commands::KeyEvent RawReadingRecovery::FinalizeKey(
+    const mozc::commands::KeyEvent& key, PrepareResult prepare_result,
+    const mozc::commands::Output& recovered_output) const {
+  mozc::commands::KeyEvent finalized = key;
+  if (key_finalizer_) {
+    // Prepare leaves `recovered_output` empty unless it replayed the journal.
+    const bool replayed = prepare_result == PrepareResult::kSessionChanged &&
+                          recovered_output.has_consumed();
+    key_finalizer_(replayed ? &recovered_output : nullptr, &finalized);
+  }
+  return finalized;
+}
+
 bool RawReadingRecovery::DispatchKey(
     MozcClientInterface* client, const mozc::commands::KeyEvent& key,
     const mozc::commands::Context& context, bool secure_input,
-    mozc::commands::Output* output) {
+    mozc::commands::Output* output,
+    mozc::commands::KeyEvent* dispatched_key) {
   if (client == nullptr || output == nullptr) {
     return false;
   }
@@ -159,11 +174,19 @@ bool RawReadingRecovery::DispatchKey(
     return false;
   };
   mozc::commands::Output recovered_output;
-  if (Prepare(client, context, secure_input, &recovered_output) ==
-      PrepareResult::kFailed) {
+  const PrepareResult prepare_result =
+      Prepare(client, context, secure_input, &recovered_output);
+  if (prepare_result == PrepareResult::kFailed) {
     return fail_unconsumed_key();
   }
-  if (SendKeyWithGrimodexContext(client, key, context, output)) {
+  // Finalized only now: Prepare may have adopted a replacement session, whose
+  // initializer and replay decide the mode this key is typed in.
+  mozc::commands::KeyEvent wire_key =
+      FinalizeKey(key, prepare_result, recovered_output);
+  if (SendKeyWithGrimodexContext(client, wire_key, context, output)) {
+    if (dispatched_key != nullptr) {
+      *dispatched_key = std::move(wire_key);
+    }
     return true;
   }
   if (secure_input) {
@@ -177,8 +200,13 @@ bool RawReadingRecovery::DispatchKey(
       PrepareResult::kSessionChanged) {
     return fail_unconsumed_key();
   }
-  if (!SendKeyWithGrimodexContext(client, key, context, output)) {
+  // The first copy was stamped for the session that is gone.
+  wire_key = FinalizeKey(key, PrepareResult::kSessionChanged, recovered_output);
+  if (!SendKeyWithGrimodexContext(client, wire_key, context, output)) {
     return fail_unconsumed_key();
+  }
+  if (dispatched_key != nullptr) {
+    *dispatched_key = std::move(wire_key);
   }
   return true;
 }
@@ -231,6 +259,16 @@ void RawReadingRecovery::ClearReading() {
   last_snapshot_relation_ = SnapshotRelation::kUnknown;
 }
 
+void RawReadingRecovery::MarkCompositionNotReplayable() {
+  if (recovery_in_progress_) {
+    // Same rule as DispatchKey: never invalidate the journal an outer replay
+    // is iterating.  The replay loop observes the flag and suppresses itself.
+    journal_invalidation_pending_ = true;
+    return;
+  }
+  SuppressReading();
+}
+
 void RawReadingRecovery::ResetSessionBoundary() {
   ClearReading();
   observed_session_generation_ = 0;
@@ -260,9 +298,17 @@ bool RawReadingRecovery::IsRecoverableRawKey(
   };
 
   if (key.probable_key_event_size() != 0 || key.has_activated() ||
-      key.has_mode() || (key.has_modifiers() && key.modifiers() != 0) ||
+      (key.has_modifiers() && key.modifiers() != 0) ||
       (key.has_input_style() &&
        key.input_style() != mozc::commands::KeyEvent::FOLLOW_MODE)) {
+    return false;
+  }
+  // The composition mode a key was typed in is part of the reading and is
+  // replayed with it.  A key that would turn the IME off or carries no real
+  // composition mode is an action, not reading.
+  if (key.has_mode() &&
+      (key.mode() == mozc::commands::DIRECT ||
+       key.mode() >= mozc::commands::NUM_OF_COMPOSITIONS)) {
     return false;
   }
 

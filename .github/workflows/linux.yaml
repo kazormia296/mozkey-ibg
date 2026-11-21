@@ -479,6 +479,9 @@ jobs:
       - name: bazel test
         working-directory: ./src
         run: |
-          bazelisk test ... -c dbg \
+          # The release-approved profile never generates the nico/pixiv
+          # delta that the broader local daily filegroup requires.
+          bazelisk test -c dbg \
             --test_output=errors \
-            --define=mozkey_dictionary_profile=release-approved-only
+            --define=mozkey_dictionary_profile=release-approved-only \
+            -- ... -//data/dictionary_koyasi:mozcdic_ut_daily_local

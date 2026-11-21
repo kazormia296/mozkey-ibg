@@ -1,13 +1,14 @@
 load(
     "//:build_defs.bzl",
-    "MOZC_TAGS",
     "mozc_cc_binary",
     "mozc_cc_library",
     "mozc_cc_test",
+    "mozc_win32_resource_from_template",
 )
 
 package(default_visibility = ["//visibility:private"])
 
+# Mozkey IbG: strict JSON field extraction shared by the Windows/Linux scorer.
 mozc_cc_library(
     name = "json_parser",
     srcs = ["json_parser.cc"],
@@ -28,9 +29,167 @@ mozc_cc_test(
     ],
 )
 
+mozc_cc_test(
+    name = "synchronous_io_deadline_test",
+    size = "small",
+    srcs = [
+        "synchronous_io_deadline.h",
+        "synchronous_io_deadline_test.cc",
+    ],
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = ["//testing:gunit_main"],
+)
+
+mozc_cc_library(
+    name = "llama_http_client",
+    srcs = ["llama_http_client.cc"],
+    hdrs = ["llama_http_client.h"],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+mozc_cc_test(
+    name = "llama_http_client_test",
+    size = "small",
+    srcs = ["llama_http_client_test.cc"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":llama_http_client",
+        "//testing:gunit_main",
+    ],
+)
+
+mozc_cc_library(
+    name = "llama_server_process",
+    srcs = ["llama_server_process.cc"],
+    hdrs = [
+        "llama_server_guard_protocol.h",
+        "llama_server_process.h",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [":llama_http_client"],
+)
+
+mozc_cc_binary(
+    name = "mozc_zenz_guard",
+    srcs = [
+        "llama_server_guard.cc",
+        "llama_server_guard_protocol.h",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//mac/installer/zenz_runtime:__pkg__"],
+)
+
+mozc_cc_binary(
+    name = "llama_server_process_test_helper",
+    srcs = ["llama_server_process_test_helper.cc"],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+mozc_cc_test(
+    name = "llama_server_process_test",
+    size = "small",
+    srcs = ["llama_server_process_test.cc"],
+    data = [
+        ":llama_server_process_test_helper",
+        ":mozc_zenz_guard",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":llama_server_process",
+        "//testing:gunit_main",
+    ],
+)
+
+mozc_cc_library(
+    name = "llama_backend",
+    srcs = ["llama_backend.cc"],
+    hdrs = ["llama_backend.h"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":llama_http_client",
+        ":posix_server",
+        "//zenz:wire_protocol",
+    ],
+)
+
+mozc_cc_test(
+    name = "llama_backend_integration_test",
+    size = "small",
+    srcs = ["llama_backend_integration_test.cc"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":llama_backend",
+        ":posix_server",
+        "//testing:gunit_main",
+        "//zenz:wire_protocol",
+    ],
+)
+
+mozc_cc_library(
+    name = "posix_runtime",
+    srcs = ["posix_runtime.cc"],
+    hdrs = ["posix_runtime.h"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":llama_backend",
+        ":llama_server_process",
+        ":posix_server",
+        "//zenz:wire_protocol",
+    ],
+)
+
+mozc_cc_test(
+    name = "posix_runtime_test",
+    size = "small",
+    srcs = ["posix_runtime_test.cc"],
+    data = [
+        ":llama_server_process_test_helper",
+        ":mozc_zenz_guard",
+    ],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":posix_runtime",
+        "//testing:gunit_main",
+        "//zenz:wire_protocol",
+    ],
+)
+
+mozc_cc_library(
+    name = "posix_server",
+    srcs = ["posix_server.cc"],
+    hdrs = ["posix_server.h"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        "//zenz:unix_socket_path",
+        "//zenz:wire_protocol",
+    ],
+)
+
+mozc_cc_test(
+    name = "posix_server_test",
+    size = "small",
+    srcs = ["posix_server_test.cc"],
+    target_compatible_with = ["@platforms//os:macos"],
+    deps = [
+        ":posix_server",
+        "//testing:gunit_main",
+        "//zenz:wire_protocol",
+    ],
+)
+
+# macOS uses upstream's dedicated POSIX runtime (main_posix.cc).  Windows and
+# Linux build main.cc, which carries the Mozkey IbG additions: inference device
+# selection, reproducible diagnostics and the Linux Unix-domain socket server.
 mozc_cc_binary(
     name = "mozc_zenz_scorer",
-    srcs = ["main.cc"],
+    srcs = select({
+        "@platforms//os:macos": ["main_posix.cc"],
+        "@platforms//os:windows": [
+            "main.cc",
+            "synchronous_io_deadline.h",
+        ],
+        "//conditions:default": ["main.cc"],
+    }),
     linkopts = select({
         "@platforms//os:windows": [
             "Advapi32.lib",
@@ -38,13 +197,48 @@ mozc_cc_binary(
             "Winhttp.lib",
             "Ws2_32.lib",
         ],
-        "@platforms//os:macos": ["-lproc"],
         "//conditions:default": [],
     }),
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "@platforms//os:windows": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     visibility = ["//visibility:public"],
+    deps = ["//zenz:wire_protocol"] + select({
+        "@platforms//os:macos": [
+            ":posix_runtime",
+            "//zenz:unix_socket_path",
+        ],
+        "@platforms//os:windows": [
+            ":json_parser",
+            ":mozc_zenz_scorer_resources",
+            "//session:zenz_diagnostic",
+            "//session:zenz_named_pipe_endpoint",
+        ],
+        "//conditions:default": [
+            ":json_parser",
+            "//session:zenz_diagnostic",
+            "//session:zenz_named_pipe_endpoint",
+        ],
+    }),
+)
+
+mozc_win32_resource_from_template(
+    name = "mozc_zenz_scorer_resources",
+    src = "mozc_zenz_scorer.rc",
+)
+
+# Package-level release verification helper. Keep it in //zenz_scorer so it
+# consumes the same package-scoped Zenz wire/socket interfaces as the
+# production scorer without broadening //zenz target visibility.
+mozc_cc_binary(
+    name = "zenz_runtime_package_probe",
+    srcs = ["zenz_runtime_package_probe.cc"],
+    target_compatible_with = ["@platforms//os:macos"],
     deps = [
-        ":json_parser",
-        "//session:zenz_diagnostic",
-        "//session:zenz_named_pipe_endpoint",
+        "//zenz:unix_socket_path",
+        "//zenz:wire_protocol",
     ],
 )

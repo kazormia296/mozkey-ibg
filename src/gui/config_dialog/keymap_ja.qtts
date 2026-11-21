@@ -4,6 +4,14 @@
 <context>
     <name>mozc::gui::KeyMapEditorDialog</name>
     <message>
+        <source>LiveConversion</source>
+        <translation>ライブ変換中</translation>
+    </message>
+    <message>
+        <source>ZenzConversion</source>
+        <translation>Zenz補正中</translation>
+    </message>
+    <message>
         <source>Conversion</source>
         <translation>変換中</translation>
     </message>
@@ -261,7 +269,51 @@
     </message>
     <message>
         <source>DeleteSelectedCandidate</source>
-        <translation>選択候補を履歴から削除</translation>
+        <translation>選択候補を履歴から削除／候補を非表示</translation>
+    </message>
+    <message>
+        <source>RevertZenzToMozc</source>
+        <translation>通常のMozc変換に戻す</translation>
+    </message>
+    <message>
+        <source>BlockVisibleZenzCorrection</source>
+        <translation>表示中のZenz補正をブロック</translation>
+    </message>
+    <message>
+        <source>Return to Mozc conversion must be used alone.</source>
+        <translation>通常のMozc変換に戻す操作は単独で指定してください。</translation>
+    </message>
+    <message>
+        <source>Return to Mozc conversion or blocking Zenz must be used alone.</source>
+        <translation>通常のMozc変換への復帰とZenzブロックは単独で指定してください。</translation>
+    </message>
+    <message>
+        <source>ForceZenzLiveCorrection</source>
+        <translation>Zenz補正を未確定文字に対し実行</translation>
+    </message>
+    <message>
+        <source>ForceZenzLiveCorrectionWithoutFeedback</source>
+        <translation>Zenz補正を未確定文字に対し実行（フィードバック学習を無視）</translation>
+    </message>
+    <message>
+        <source>Delay</source>
+        <translation>遅延</translation>
+    </message>
+    <message>
+        <source>Delay %1 ms</source>
+        <translation>遅延 %1ms</translation>
+    </message>
+    <message>
+        <source>Delay (ms)</source>
+        <translation>遅延時間（ミリ秒）</translation>
+    </message>
+    <message>
+        <source>Invalid command sequence</source>
+        <translation>無効なコマンド列</translation>
+    </message>
+    <message>
+        <source>Delay cannot be first; manual Zenz correction must be last.</source>
+        <translation>遅延は先頭に置けません。手動Zenz補正は最後に配置してください。</translation>
     </message>
 </context>
 </TS>

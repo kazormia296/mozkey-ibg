@@ -342,8 +342,12 @@ std::string UserProfileDirectoryImpl::GetUserProfileDirectory() const {
 #endif  //  GOOGLE_JAPANESE_INPUT_BUILD
 
 #elif defined(__linux__)
-    // Keep the OSS Mozkey profile separate from system Mozc.  Official Google
-    // Japanese Input builds retain their existing product-specific behavior.
+    // Keep the Mozkey IbG Linux profile separate from system Mozc and from
+    // upstream Mozkey.  In particular, never adopt ~/.mozc, ~/.mozkey,
+    // $XDG_CONFIG_HOME/mozc or $XDG_CONFIG_HOME/mozkey even if they exist.  No
+    // automatic migration of existing Mozc or Mozkey history or user
+    // dictionaries is performed.  Official Google Japanese Input builds retain
+    // their existing product-specific behavior.
 #if !defined(GOOGLE_JAPANESE_INPUT_BUILD)
     constexpr absl::string_view kLegacyProfileName = ".mozkey-ibg";
     constexpr absl::string_view kXdgProfileName = "mozkey-ibg";

@@ -149,12 +149,13 @@ build target                     | installation location
 `//server:mozc_server`           | `/usr/lib/mozkey-ibg/mozc_server`
 `//gui/tool:mozc_tool`           | `/usr/lib/mozkey-ibg/mozc_tool`
 `//renderer:mozc_renderer`       | `/usr/lib/mozkey-ibg/mozc_renderer`
-`//unix/ibus/ibus_mozc`          | `/usr/lib/ibus-mozc/ibus-engine-mozc`
-`//unix/ibus:gen_mozc_xml`       | `/usr/share/ibus/component/mozc.xml`
-`//unix:icons`                   | `/usr/share/ibus-mozc/...`
+`//unix/ibus/ibus_mozc`          | `/usr/lib/ibus-mozkey-ibg/ibus-engine-mozkey-ibg`
+`//unix/ibus:gen_mozc_xml`       | `/usr/share/ibus/component/mozkey-ibg.xml`
+`//unix:icons`                   | `/usr/share/ibus-mozkey-ibg/...`
 `//unix:icons`                   | `/usr/share/icons/mozkey-ibg/...`
-`//unix/emacs:mozc.el`           | `/usr/share/emacs/site-lisp/emacs-mozc/mozc.el`
-`//unix/emacs:mozc_emacs_helper` | `/usr/bin/mozc_emacs_helper`
+
+The Emacs helper (`//unix/emacs:mozc_emacs_helper`, `mozc.el`) is no longer
+part of `mozc.zip`.
 
 To customize above installation locations, modify
 [`src/config.bzl`](../src/config.bzl).

@@ -7,15 +7,15 @@ filegroup(
 
 filegroup(
     name = "mozcdic_ut_daily_local",
-    srcs = glob(
-        [
-            "generated/profiled/dic-nico-pixiv-delta.txt",
-            "generated/profiled/koyasi-syntax-guard.txt",
-            "generated/profiled/mozcdic-ut-daily.txt",
-            "generated/profiled/mozcdic-ut-personal-names-daily.txt",
-        ],
-        allow_empty = True,
-    ),
+    # Explicit source labels: when daily is selected, a missing file is a
+    # build error instead of silently compiling a partial dictionary.
+    # These labels are not analyzed when the checked-in sample profile is used.
+    srcs = [
+        "generated/profiled/dic-nico-pixiv-delta.txt",
+        "generated/profiled/koyasi-syntax-guard.txt",
+        "generated/profiled/mozcdic-ut-daily.txt",
+        "generated/profiled/mozcdic-ut-personal-names-daily.txt",
+    ],
 )
 
 # Public artifacts use this target explicitly. dic-nico-intersection-pixiv is

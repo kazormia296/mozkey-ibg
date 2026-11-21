@@ -53,28 +53,16 @@
 #include "base/vlog.h"
 #include "protocol/candidate_window.pb.h"
 #include "protocol/commands.pb.h"
-#include "renderer/live_conversion_reading.h"
+#include "unix/fcitx5/display_status.h"
 #include "unix/fcitx5/i18nwrapper.h"
 #include "unix/fcitx5/mozc_engine.h"
 #include "unix/fcitx5/mozc_state.h"
+#include "unix/fcitx5/session_callback.h"
 #include "unix/fcitx5/surrounding_text_util.h"
 
 namespace fcitx {
 
 namespace {
-
-// Returns a position that determines a preedit cursor position _AND_ top-left
-// position of a candidate window. Note that we can't set these two positions
-// independently. That's a SCIM's limitation.
-uint32_t GetCursorPosition(const mozc::commands::Output& response) {
-  if (!response.has_preedit()) {
-    return 0;
-  }
-  if (response.preedit().has_highlighted_position()) {
-    return response.preedit().highlighted_position();
-  }
-  return response.preedit().cursor();
-}
 
 std::string CreateDescriptionString(const std::string& description) {
   return " [" + description + "]";
@@ -82,17 +70,23 @@ std::string CreateDescriptionString(const std::string& description) {
 
 class MozcCandidateWord final : public CandidateWord {
  public:
-  MozcCandidateWord(int id, std::string text, MozcEngine* engine)
-      : CandidateWord(Text(std::move(text))), id_(id), engine_(engine) {}
+  MozcCandidateWord(int id, std::string text, MozcEngine* engine,
+                    bool submit_on_select)
+      : CandidateWord(Text(std::move(text))),
+        id_(id),
+        engine_(engine),
+        submit_on_select_(submit_on_select) {}
 
   void select(InputContext* inputContext) const override {
     MozcState* mozc_state = engine_->mozcState(inputContext);
-    mozc_state->SelectCandidate(id_);
+    mozc_state->SelectCandidate(id_, submit_on_select_);
   }
 
  private:
   int id_;
   MozcEngine* engine_;
+  // True for entries of a passive suggestion list: clicking one commits it.
+  bool submit_on_select_;
 };
 
 class MozcCandidateList final : public CandidateList,
@@ -144,6 +138,10 @@ class MozcCandidateList final : public CandidateList,
     }
 
     labels_.reserve(candidates.candidate_size());
+
+    // Selecting an entry of a list nobody navigates would only focus it and
+    // leave live conversion; a click there means "commit this suggestion".
+    const bool submit_on_select = IsPassiveSuggestionWindow(candidates);
 
     for (int i = 0; i < candidates.candidate_size(); ++i) {
       const mozc::commands::CandidateWindow::Candidate& candidate =
@@ -208,8 +206,8 @@ class MozcCandidateList final : public CandidateList,
         id = candidate.id();
         DCHECK_NE(kBadCandidateId, id) << "Unexpected id is passed.";
       }
-      candidateWords_.emplace_back(
-          std::make_unique<MozcCandidateWord>(id, value, engine));
+      candidateWords_.emplace_back(std::make_unique<MozcCandidateWord>(
+          id, value, engine, submit_on_select));
     }
   }
 
@@ -283,109 +281,72 @@ void MozcResponseParser::LaunchTool(const mozc::commands::Output& response,
   }
 }
 
-void MozcResponseParser::ExecuteCallback(const mozc::commands::Output& response,
+void MozcResponseParser::ExecuteCallback(CallbackAction action,
                                          InputContext* ic) const {
-  if (!response.has_callback()) {
-    return;
-  }
-
-  if (!response.callback().has_session_command()) {
-    LOG(ERROR) << "callback does not have session_command";
-    return;
-  }
-
-  const mozc::commands::SessionCommand& callback_command =
-      response.callback().session_command();
-
-  if (!callback_command.has_type()) {
-    LOG(ERROR) << "callback_command has no type";
-    return;
-  }
-
-  mozc::commands::SessionCommand session_command;
-  session_command.set_type(callback_command.type());
-
-  // TODO(nona): Make a function to handle CONVERT_REVERSE.
-  // Used by CONVERT_REVERSE and/or UNDO
-  // This value represents how many characters are selected as a relative
-  // distance of characters. Positive value represents forward text selection
-  // and negative value represents backword text selection.
-  // Note that you should not allow 0x80000000 for |relative_selected_length|
-  // because you cannot safely use |-relative_selected_length| nor
-  // |abs(relative_selected_length)| in this case due to integer overflow.
-  SurroundingTextInfo surrounding_text_info;
+  // Delayed callbacks were scheduled by ParseResponseInternal already.  Only
+  // the callbacks that have to run right now, with the application text at
+  // hand, are executed here.
   auto* mozc_state = engine_->mozcState(ic);
+  mozc::commands::Output new_output;
 
-  switch (callback_command.type()) {
-    case mozc::commands::SessionCommand::UNDO:
+  switch (action) {
+    case CallbackAction::kUndo: {
+      mozc::commands::SessionCommand session_command;
+      session_command.set_type(mozc::commands::SessionCommand::UNDO);
+      if (!mozc_state->SendCommand(session_command, &new_output)) {
+        LOG(ERROR) << "Callback Command Failed";
+        return;
+      }
+      MOZC_VLOG(1) << "New output" << new_output.DebugString();
       break;
-    case mozc::commands::SessionCommand::CONVERT_REVERSE: {
+    }
+    case CallbackAction::kConvertReverse: {
+      // PlanCallback never selects this action in secure input; keep the
+      // guard next to the code that reads application text anyway.
       if (mozc_state->IsSecureInput()) {
         return;
       }
+      // |relative_selected_length| represents how many characters are
+      // selected as a relative distance of characters. Positive value
+      // represents forward text selection and negative value represents
+      // backword text selection.
+      SurroundingTextInfo surrounding_text_info;
       if (!GetSurroundingText(ic, &surrounding_text_info,
                               engine_->clipboardAddon())) {
         return;
       }
-
-      session_command.set_text(surrounding_text_info.selection_text);
-      break;
-    }
-    case mozc::commands::SessionCommand::APPLY_LIVE_CONVERSION:
-    case mozc::commands::SessionCommand::APPLY_ZENZ_LIVE_CORRECTION: {
-      if (mozc_state->IsSecureInput()) {
+      // The same rules as for the Space fallback, enforced in one place:
+      // only a short single-line selection that the reported text really
+      // covers is sent, the reply is accepted only from the session that was
+      // asked, and the selection is removed only when a reconversion really
+      // started.  The reply is not logged; it echoes application text.
+      if (mozc_state->ReverseConvertSelection(surrounding_text_info,
+                                              &new_output) ==
+          MozcState::ReverseConversionResult::kNotSent) {
         return;
       }
-      if (callback_command.has_live_conversion_generation()) {
-        session_command.set_live_conversion_generation(
-            callback_command.live_conversion_generation());
-      }
-      if (callback_command.has_live_conversion_key()) {
-        session_command.set_live_conversion_key(
-            callback_command.live_conversion_key());
-      }
-
-      uint32_t delay = response.callback().has_delay_millisec()
-                           ? response.callback().delay_millisec()
-                           : 0;
-      mozc_state->ScheduleLiveConversion(session_command, delay);
-      return;
+      // A refusal is still parsed below: it carries no deletion range and
+      // only brings the panel in line with what the server answered.
+      break;
     }
     default:
       return;
   }
 
-  mozc::commands::Output new_output;
-  if (!mozc_state->SendCommand(session_command, &new_output)) {
-    LOG(ERROR) << "Callback Command Failed";
-    return;
-  }
-
-  if (callback_command.type() ==
-      mozc::commands::SessionCommand::CONVERT_REVERSE) {
-    // We need to remove selected text as a first step of reconversion.
-    mozc::commands::DeletionRange* range = new_output.mutable_deletion_range();
-    // Use DeletionRange field to remove the selected text.
-    // For forward selection (that is, |relative_selected_length > 0|), the
-    // offset should be a negative value to delete preceding text.
-    // For backward selection (that is, |relative_selected_length < 0|),
-    // IBus and/or some applications seem to expect |offset == 0| somehow.
-    const int32_t offset =
-        surrounding_text_info.relative_selected_length > 0
-            ? -surrounding_text_info
-                   .relative_selected_length  // forward selection
-            : 0;                              // backward selection
-    range->set_offset(offset);
-    range->set_length(abs(surrounding_text_info.relative_selected_length));
-  }
-
-  MOZC_VLOG(1) << "New output" << new_output.DebugString();
-
-  ParseResponse(new_output, ic);
+  // The reply may still schedule a delayed callback (Undo re-arms live
+  // conversion), but an immediate callback inside it is not followed.
+  ParseResponseInternal(new_output, ic, /*allow_immediate_callback=*/false);
 }
 
 bool MozcResponseParser::ParseResponse(const mozc::commands::Output& response,
                                        InputContext* ic) const {
+  return ParseResponseInternal(response, ic,
+                               /*allow_immediate_callback=*/true);
+}
+
+bool MozcResponseParser::ParseResponseInternal(
+    const mozc::commands::Output& response, InputContext* ic,
+    bool allow_immediate_callback) const {
   auto* mozc_state = engine_->mozcState(ic);
   mozc_state->SetUsage("", "");
 
@@ -400,6 +361,17 @@ bool MozcResponseParser::ParseResponse(const mozc::commands::Output& response,
                                  "mozkey-ibg");
   }
 
+  // A delayed callback is independent of what the Output does with the key:
+  // the continuation of a keymap macro arrives on an Output that keeps the
+  // original key's "not consumed" answer.  Only the callback is delayed; the
+  // Output itself is applied below as usual.
+  const CallbackPlan callback_plan =
+      PlanCallback(response, mozc_state->IsSecureInput());
+  if (callback_plan.action == CallbackAction::kSchedule) {
+    mozc_state->ScheduleDelayedSessionCommand(callback_plan.command,
+                                              callback_plan.delay_msec);
+  }
+
   if (!response.consumed()) {
     // The key was not consumed by Mozc.
     return false;
@@ -411,12 +383,15 @@ bool MozcResponseParser::ParseResponse(const mozc::commands::Output& response,
   }
 
   mozc_state->SetLiveConversionReading(
-      mozc::renderer::BuildLiveConversionReading(response));
+      BuildDisplayReading(response),
+      /*before_live_conversion=*/!response.live_conversion());
+  mozc_state->SetConversionStatusLabel(ConversionStatusLabel(
+      response, mozc_state->conversion_status_label_style()));
 
   // First, determine the cursor position.
   if (response.has_preedit()) {
     const mozc::commands::Preedit& preedit = response.preedit();
-    ParsePreedit(preedit, GetCursorPosition(response), ic);
+    ParsePreedit(preedit, PreeditCaretPosition(response), ic);
   }
 
   // Then show the candidate window.
@@ -431,7 +406,9 @@ bool MozcResponseParser::ParseResponse(const mozc::commands::Output& response,
     mozc_state->SetUrl(url);
   }
   LaunchTool(response, ic);
-  ExecuteCallback(response, ic);
+  if (allow_immediate_callback) {
+    ExecuteCallback(callback_plan.action, ic);
+  }
 
   return true;  // mozc consumed the key.
 }

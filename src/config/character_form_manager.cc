@@ -67,6 +67,30 @@ constexpr uint32_t kLruSize = 128;           // enough?
 constexpr uint32_t kSeedValue = 0x7fe1fed1;  // random seed value for storage
 constexpr char kFileName[] = "user://cform.db";
 
+class NumberStyleManager;
+
+// Keep the existing on-disk cform.db representation while synchronizing
+// the two numeric preferences in memory, as in upstream c4b2aef7.
+NumberUtil::NumberString::Style AdaptNumberStyleToForm(
+    NumberUtil::NumberString::Style style, Config::CharacterForm form) {
+  DCHECK(form == Config::HALF_WIDTH || form == Config::FULL_WIDTH);
+  switch (style) {
+    case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH:
+    case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH:
+      return form == Config::HALF_WIDTH
+                 ? NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH
+                 : NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH;
+    case NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_HALFWIDTH:
+    case NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_FULLWIDTH:
+      return form == Config::HALF_WIDTH
+                 ? NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_HALFWIDTH
+                 : NumberUtil::NumberString::NUMBER_ARABIC_AND_KANJI_FULLWIDTH;
+    default:
+      // Fixed Kanji, circled, radix, and DEFAULT_STYLE do not encode width.
+      return style;
+  }
+}
+
 class CharacterFormManagerImpl {
  public:
   CharacterFormManagerImpl()
@@ -100,6 +124,10 @@ class CharacterFormManagerImpl {
 
   void set_storage(LruStorage* storage) { storage_ = storage; }
 
+  void set_number_style_manager(NumberStyleManager* manager) {
+    number_style_manager_ = manager;
+  }
+
   void set_require_consistent_conversion(bool val) {
     require_consistent_conversion_ = val;
   }
@@ -124,6 +152,8 @@ class CharacterFormManagerImpl {
                                 std::string* output) const;
 
   LruStorage* storage_;
+  // Only the conversion manager needs this: the preedit form is not learned.
+  NumberStyleManager* number_style_manager_ = nullptr;
 
   // store the setting of a character
   absl::flat_hash_map<char16_t, Config::CharacterForm> conversion_table_;
@@ -220,6 +250,20 @@ class NumberStyleManager {
 
   void set_storage(LruStorage* storage) { storage_ = storage; }
 
+  // Called after an explicit or mixed-script numeric width selection.  Do not
+  // initialize LastNumberStyle merely from a width selection.
+  void SynchronizeNumberForm(Config::CharacterForm form) {
+    const auto current = GetNumberStyle();
+    if (!current.has_value()) {
+      return;
+    }
+    const CharacterFormManager::NumberFormStyle synced = {
+        form, AdaptNumberStyleToForm(current->style, form)};
+    if (current->form != synced.form || current->style != synced.style) {
+      SetNumberStyle(synced);
+    }
+  }
+
  private:
   // Entry should fit value_size (sizeof uint32_t) of the storage.
   class NumberStyleEntry {
@@ -292,6 +336,57 @@ char16_t GetNormalizedCharacter(const absl::string_view str) {
   return ucs2;
 }
 
+struct CharToken {
+  char32_t cp;
+  absl::string_view view;
+  Util::ScriptType type;
+  Util::FormType form;
+};
+
+// Tokenizes |str| into unicode character tokens with their script type and form
+// type.
+//
+// Contextual adjustment:
+// Periods ('.', '．') and commas (',', '，') surrounded by numeric digits (e.g.
+// '.' in "3.14" or ',' in "1,000") are reclassified as Util::NUMBER.
+// Only '.' and ',' are reclassified because they represent internal decimal
+// and thousands separators forming a single numeric entity. Other separators
+// like '/' (dates: "2026/10/07") and ':' (times: "12:30") are not reclassified
+// because they separate distinct numeric components, and are guarded against
+// mixed-width artifacts by the run-based consistency check below.
+// Reclassified separators adopt GetCharacterForm("0") so they follow the
+// number rule instead of their own symbol group rule.
+std::vector<CharToken> TokenizeStringForConversion(absl::string_view str) {
+  std::vector<CharToken> tokens;
+  const Utf8AsChars32 chars(str);
+  for (auto it = chars.begin(); it != chars.end(); ++it) {
+    if (!it.ok()) {
+      continue;
+    }
+    tokens.push_back(
+        {*it, it.view(), Util::GetScriptType(*it), Util::GetFormType(*it)});
+  }
+  for (size_t i = 1; i + 1 < tokens.size(); ++i) {
+    if ((tokens[i].cp == '.' || tokens[i].cp == U'．' || tokens[i].cp == ',' ||
+         tokens[i].cp == U'，') &&
+        tokens[i - 1].type == Util::NUMBER &&
+        tokens[i + 1].type == Util::NUMBER) {
+      tokens[i].type = Util::NUMBER;
+    }
+  }
+  return tokens;
+}
+
+// Returns true if the token acts as a delimiter between separate
+// variable-width runs (e.g. kanji, hiragana, katakana, or fixed full-width
+// Japanese punctuation/brackets in "Tシャツ", "3時", "「Tシャツ」", or
+// "100。").
+bool IsVariableWidthRunDelimiter(const CharToken& token) {
+  return token.type == Util::KANJI || token.type == Util::HIRAGANA ||
+         token.type == Util::KATAKANA ||
+         Util::IsFullWidthSymbolInHalfWidthKatakana(token.view);
+}
+
 std::string ConvertToAlternative(std::string input, Util::FormType form,
                                  Util::ScriptType type) {
   switch (form) {
@@ -336,19 +431,56 @@ void CharacterFormManagerImpl::ClearHistory() {
   }
 }
 
-// TODO(taku): need to chunk str
 void CharacterFormManagerImpl::GuessAndSetCharacterForm(
     const absl::string_view str) {
-  const Util::FormType form = Util::GetFormType(str);
-  if (form == Util::FULL_WIDTH) {
-    SetCharacterForm(str, Config::FULL_WIDTH);
-    return;
-  }
+  Util::ScriptType prev_type = Util::UNKNOWN_SCRIPT;
+  absl::string_view chunk;
+  auto flush_chunk = [&](absl::string_view target, Util::ScriptType type) {
+    if (target.empty()) {
+      return;
+    }
+    // Ignore symbol chunks embedded in a larger string (e.g. ',' in "1,000")
+    // so they do not overwrite symbol group preferences, while still learning
+    // when the entire committed string is a symbol (e.g. "[").
+    if (type == Util::UNKNOWN_SCRIPT && target.size() != str.size()) {
+      return;
+    }
+    const Util::FormType form = Util::GetFormType(target);
+    if (form == Util::FULL_WIDTH) {
+      SetCharacterForm(target, Config::FULL_WIDTH);
+    } else if (form == Util::HALF_WIDTH) {
+      SetCharacterForm(target, Config::HALF_WIDTH);
+    }
+  };
 
-  if (form == Util::HALF_WIDTH) {
-    SetCharacterForm(str, Config::HALF_WIDTH);
-    return;
+  const Utf8AsChars32 chars(str);
+  for (auto it = chars.begin(); it != chars.end(); ++it) {
+    if (!it.ok()) {
+      flush_chunk(chunk, prev_type);
+      chunk = absl::string_view();
+      prev_type = Util::UNKNOWN_SCRIPT;
+      continue;
+    }
+    Util::ScriptType type = Util::GetScriptType(*it);
+    if (*it == U'・') {
+      // Treat full-width middle dot as UNKNOWN_SCRIPT (matching
+      // GetNormalizedCharacter("・")) so embedded middle dots (e.g. in
+      // "東京・大阪" or "ｱ・ｲ") are ignored like other symbols.
+      type = Util::UNKNOWN_SCRIPT;
+    }
+    if (!chunk.empty() && type != prev_type) {
+      flush_chunk(chunk, prev_type);
+      chunk = it.view();
+    } else if (chunk.empty()) {
+      chunk = it.view();
+    } else {
+      chunk = absl::string_view(
+          chunk.data(), static_cast<size_t>(it.view().data() +
+                                            it.view().size() - chunk.data()));
+    }
+    prev_type = type;
   }
+  flush_chunk(chunk, prev_type);
 }
 
 void CharacterFormManagerImpl::SetCharacterForm(const absl::string_view str,
@@ -398,6 +530,9 @@ void CharacterFormManagerImpl::SaveCharacterFormToStorage(
                               sizeof(ucs2));
   const char* value = storage_->Lookup(key);
   if (value != nullptr && static_cast<Config::CharacterForm>(*value) == form) {
+    if (ucs2 == u'0' && number_style_manager_ != nullptr) {
+      number_style_manager_->SynchronizeNumberForm(form);
+    }
     return;
   }
 
@@ -417,6 +552,9 @@ void CharacterFormManagerImpl::SaveCharacterFormToStorage(
       storage_->Insert(group_key, reinterpret_cast<const char*>(&iform));
     }
   }
+  if (ucs2 == u'0' && number_style_manager_ != nullptr) {
+    number_style_manager_->SynchronizeNumberForm(form);
+  }
   MOZC_VLOG(2) << static_cast<uint16_t>(ucs2) << " is stored to " << kFileName
                << " as " << form;
 }
@@ -429,41 +567,57 @@ void CharacterFormManagerImpl::ConvertString(const absl::string_view str,
 bool CharacterFormManagerImpl::TryConvertStringWithPreference(
     const absl::string_view str, std::string* output) const {
   DCHECK(output);
-  Config::CharacterForm target_form = Config::NO_CONVERSION;
+  const std::vector<CharToken> tokens = TokenizeStringForConversion(str);
+  if (tokens.empty()) {
+    return true;
+  }
+
+  Config::CharacterForm run_target_form = Config::NO_CONVERSION;
   Config::CharacterForm prev_form = Config::NO_CONVERSION;
   Util::ScriptType prev_type = Util::UNKNOWN_SCRIPT;
   bool ret = true;
 
   std::string buf;
-  const Utf8AsChars32 chars(str);
-  for (auto it = chars.begin(); it != chars.end(); ++it) {
-    if (!it.ok()) {
-      continue;
-    }
-    const Util::ScriptType type = Util::GetScriptType(*it);
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    const auto& token = tokens[i];
+    const Util::ScriptType type = token.type;
+
     // Cache previous ScriptType to reduce to call GetCharacterForm()
     Config::CharacterForm form = prev_form;
-    if ((type == Util::UNKNOWN_SCRIPT) ||
-        (type == Util::KATAKANA && prev_type != Util::KATAKANA) ||
-        (type == Util::NUMBER && prev_type != Util::NUMBER) ||
-        (type == Util::ALPHABET && prev_type != Util::ALPHABET)) {
-      form = GetCharacterForm(it.view());
+    if (type == Util::NUMBER) {
+      if (prev_type != Util::NUMBER) {
+        form = GetCharacterForm("0");
+      }
+    } else if (type == Util::UNKNOWN_SCRIPT) {
+      form = GetCharacterForm(token.view);
+    } else if (type == Util::KATAKANA && prev_type != Util::KATAKANA) {
+      form = GetCharacterForm(token.view);
+    } else if (type == Util::ALPHABET && prev_type != Util::ALPHABET) {
+      form = GetCharacterForm(token.view);
     } else if (type == Util::KANJI || type == Util::HIRAGANA) {
       form = Config::NO_CONVERSION;
     }
 
-    // Cache previous Form to reduce to call ConvertToFullWidthOrHalf
-    if (it != chars.begin() && prev_form != form) {
+    // Cache previous Form to reduce to call ConvertWidth
+    if (i > 0 && prev_form != form) {
       *output += CharacterFormManager::ConvertWidth(std::move(buf), prev_form);
       buf.clear();
     }
 
-    if (target_form == Config::NO_CONVERSION) {
-      target_form = form;
-    } else if (form != Config::NO_CONVERSION && form != target_form) {
-      ret = false;
+    if (IsVariableWidthRunDelimiter(token)) {
+      // Delimiters (kanji, hiragana, katakana, and fixed Japanese punctuation/
+      // brackets) delimit separate variable-width runs, allowing e.g. "Tシャツ"
+      // or "3時" to convert consistently without being blocked by mixed
+      // scripts.
+      run_target_form = Config::NO_CONVERSION;
+    } else {
+      if (run_target_form == Config::NO_CONVERSION) {
+        run_target_form = form;
+      } else if (form != Config::NO_CONVERSION && form != run_target_form) {
+        ret = false;
+      }
     }
-    absl::StrAppend(&buf, it.view());
+    absl::StrAppend(&buf, token.view);
     prev_type = type;
     prev_form = form;
   }
@@ -478,32 +632,36 @@ bool CharacterFormManagerImpl::TryConvertStringWithPreference(
 void CharacterFormManagerImpl::ConvertStringAlternative(
     const absl::string_view str, std::string* output) const {
   DCHECK(output);
+  const std::vector<CharToken> tokens = TokenizeStringForConversion(str);
+  if (tokens.empty()) {
+    return;
+  }
+
   Util::FormType prev_form = Util::UNKNOWN_FORM;
   Util::ScriptType prev_type = Util::UNKNOWN_SCRIPT;
 
   std::string buf;
-  const Utf8AsChars32 chars(str);
-  for (auto it = chars.begin(); it != chars.end(); ++it) {
-    const Util::ScriptType type = Util::GetScriptType(*it);
-    // Cache previous ScriptType to reduce to call GetFormType()
-    Util::FormType form = prev_form;
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    const auto& token = tokens[i];
+    const Util::ScriptType type = token.type;
 
+    Util::FormType form = prev_form;
     if ((type == Util::UNKNOWN_SCRIPT) ||
         (type == Util::KATAKANA && prev_type != Util::KATAKANA) ||
         (type == Util::NUMBER && prev_type != Util::NUMBER) ||
         (type == Util::ALPHABET && prev_type != Util::ALPHABET)) {
-      form = Util::GetFormType(*it);
+      form = token.form;
     } else if (type == Util::KANJI || type == Util::HIRAGANA) {
       form = Util::UNKNOWN_FORM;
     }
 
-    // Cache previous Form to reduce to call ConvertToFullWidthOrHalf
-    if (it != chars.begin() && prev_form != form) {
+    // Flush when form or script type changes.
+    if (i > 0 && (prev_form != form || prev_type != type)) {
       *output += ConvertToAlternative(std::move(buf), prev_form, prev_type);
       buf.clear();
     }
 
-    absl::StrAppend(&buf, it.view());
+    absl::StrAppend(&buf, token.view);
     prev_type = type;
     prev_form = form;
   }
@@ -516,12 +674,10 @@ void CharacterFormManagerImpl::ConvertStringAlternative(
 bool CharacterFormManagerImpl::ConvertStringWithAlternative(
     const absl::string_view str, std::string* output,
     std::string* alternative_output) const {
-  // If require_consistent_conversion_ is true,
-  // do not convert to inconsistent form string.
   DCHECK(output);
   output->clear();
-  if (!TryConvertStringWithPreference(str, output) &&
-      require_consistent_conversion_) {
+  const bool is_consistent = TryConvertStringWithPreference(str, output);
+  if (!is_consistent && require_consistent_conversion_) {
     strings::Assign(*output, str);
   }
 
@@ -618,6 +774,7 @@ CharacterFormManager::Data::Data() {
   preedit_->set_storage(storage_.get());
   conversion_->set_storage(storage_.get());
   number_style_->set_storage(storage_.get());
+  conversion_->set_number_style_manager(number_style_.get());
 }
 
 CharacterFormManager* CharacterFormManager::GetCharacterFormManager() {
@@ -721,6 +878,14 @@ void CharacterFormManager::GuessAndSetCharacterForm(
 
 void CharacterFormManager::SetLastNumberStyle(
     const NumberFormStyle& form_style) {
+  // A numeric style commit also establishes the conversion width of '0'.
+  // The inner update may reconcile the *previous* style; the explicit newly
+  // committed style must be written last.  Conversion rules set to a fixed
+  // width are still respected by CharacterFormManagerImpl::SetCharacterForm.
+  if (form_style.form == Config::HALF_WIDTH ||
+      form_style.form == Config::FULL_WIDTH) {
+    data_->GetConversionManager()->SetCharacterForm("0", form_style.form);
+  }
   data_->GetNumberStyleManager()->SetNumberStyle(form_style);
 }
 

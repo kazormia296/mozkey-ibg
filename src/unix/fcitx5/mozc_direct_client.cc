@@ -11,6 +11,7 @@
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "client/character_renderability.h"
 #include "config/config_handler.h"
 #include "data_manager/oss/oss_data_manager.h"
 #include "engine/engine.h"
@@ -45,16 +46,34 @@ MozcDirectClient::MozcDirectClient() : id_(0) {
   // Initialize direct_mode_keys_
   direct_mode_keys_ = mozc::KeyInfoUtil::ExtractSortedDirectModeKeys(
       *mozc::config::ConfigHandler::GetSharedConfig());
+  InitDefaultRequest();
   InitRequestForSvsJapanese(true);
 }
 
 MozcDirectClient::~MozcDirectClient() { DeleteSession(); }
 
-void MozcDirectClient::InitRequestForSvsJapanese(bool use_svs) {
-  request_ = std::make_unique<mozc::commands::Request>();
+// Mirrors mozc::client::Client::InitDefaultRequest, which the IPC flavour
+// inherits: tell the engine which newer character groups (emoji, ...) this
+// platform can render, so their candidates are not filtered out.
+void MozcDirectClient::InitDefaultRequest() {
+  if (!request_) {
+    request_ = std::make_unique<mozc::commands::Request>();
+  }
+  request_->clear_additional_renderable_character_groups();
+  for (const mozc::commands::Request::AdditionalRenderableCharacterGroup group :
+       mozc::client::CharacterRenderability::GetSupportedGroups()) {
+    request_->add_additional_renderable_character_groups(group);
+  }
+}
 
-  mozc::commands::DecoderExperimentParams params;
-  uint32_t variation_types = params.variation_character_types();
+void MozcDirectClient::InitRequestForSvsJapanese(bool use_svs) {
+  if (!request_) {
+    InitDefaultRequest();
+  }
+
+  // Modify the existing request; recreating it would drop the defaults above.
+  uint32_t variation_types =
+      request_->decoder_experiment_params().variation_character_types();
   if (use_svs) {
     variation_types |= mozc::commands::DecoderExperimentParams::SVS_JAPANESE;
   } else {

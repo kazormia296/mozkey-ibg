@@ -34,6 +34,7 @@
 
 #include "protocol/candidate_window.pb.h"
 #include "protocol/renderer_command.pb.h"
+#include "renderer/mac/mac_writing_direction.h"
 
 namespace mozc {
 namespace renderer {
@@ -46,10 +47,15 @@ class RendererStyle;
 @interface InfolistView : NSView {
  @private
   mozc::commands::CandidateWindow candidate_window_;
-  const mozc::renderer::RendererStyle *style_;
+  mozc::renderer::RendererStyle *style_;
   // The row which has focused background.
   int focusedRow_;
+  mozc::renderer::mac::WritingDirection writingDirection_;
 }
+
+// Sets the host writing direction resolved by CandidateController.
+- (void)setWritingDirection:
+    (mozc::renderer::mac::WritingDirection)writing_direction;
 
 // setCandidateWindow: sets the candidate window to be rendered.
 - (void)setCandidateWindow:(const mozc::commands::CandidateWindow *)candidate_window;

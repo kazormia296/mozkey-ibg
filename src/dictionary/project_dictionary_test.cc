@@ -42,8 +42,8 @@ std::shared_ptr<const ProjectDictionarySnapshot> Snapshot(
 class CollectTokens final : public DictionaryInterface::Callback {
  public:
   ResultType OnToken(absl::string_view, absl::string_view,
-                     const Token& token) override {
-    tokens.push_back(token);
+                     Token token) override {
+    tokens.push_back(std::move(token));
     return TRAVERSE_CONTINUE;
   }
 

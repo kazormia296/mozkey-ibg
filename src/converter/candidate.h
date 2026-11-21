@@ -30,6 +30,7 @@
 #ifndef MOZC_CONVERTER_CANDIDATE_H_
 #define MOZC_CONVERTER_CANDIDATE_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <ostream>
@@ -58,6 +59,22 @@
 namespace mozc {
 namespace converter {
 
+// Named lexical material from the N-best node path selected by Mozc.
+// Offsets are UTF-8 byte offsets within the original Candidate::key/value.
+// This is evidence about the chosen path, not a claim that the word is
+// unambiguous or that the candidate's surface was explicitly user-selected.
+struct ProperNounSpan {
+  size_t key_offset = 0;
+  size_t value_offset = 0;
+  std::string key;
+  std::string value;
+  // Keep original lexical readings for all-token exception-list matching.
+  std::vector<std::string> token_readings;
+  // A verified surname+given-name structure, not merely a proper-noun POS.
+  // Allows strong full-name evidence despite ambiguous component readings.
+  bool verified_personal_full_name = false;
+};
+
 class Candidate {
  public:
   Candidate() = default;
@@ -83,6 +100,24 @@ class Candidate {
   std::string content_value;
 
   size_t consumed_key_size = 0;
+
+  // Number of whole conversion segments covered/consumed by this candidate,
+  // starting from the current segment.
+  //
+  // Note: This assumes alignment with the existing segment boundaries
+  // (i.e. spans 1, 2, ..., N complete segments). Candidates with non-aligned
+  // boundaries (crossing mid-segment) cannot be represented by this field and
+  // require segment resizing (ResizeSegment).
+  //
+  // Defaults to 1 for standard segment candidates. Even if set to 0,
+  // callers should use effective_converted_segment_count() which clamps to 1.
+  uint32_t converted_segment_count = 1;
+
+  // Returns the effective number of segments covered by this candidate.
+  // Guaranteed to be at least 1 even if converted_segment_count is 0.
+  uint32_t effective_converted_segment_count() const {
+    return std::max<uint32_t>(1, converted_segment_count);
+  }
 
   // Meta information
   // TODO(taku): Better to introduce a struct to save heap usage.
@@ -124,6 +159,10 @@ class Candidate {
   // defined in enum |Attribute|.
   uint32_t attributes = 0;
 
+  // Final ordering constraints. These are separate from scoring attributes so
+  // that score/history changes cannot violate hard candidate-ordering policy.
+  uint8_t ranking_constraints = RankingConstraint::NONE;
+
   Category category = DEFAULT_CATEGORY;
 
   // Candidate style. This is not a bit-field.
@@ -139,6 +178,10 @@ class Candidate {
   // real time conversion result candidates.  Each element is the encoded
   // lengths of key, value, content key and content value.
   InnerSegmentBoundary inner_segment_boundary;
+
+  // Derived from the real dictionary node path, when available.  Derived
+  // candidates must clear these if their key/value are rewritten.
+  std::vector<ProperNounSpan> proper_noun_spans;
   // LINT.ThenChange(//converter/segments_matchers.h)
 
   // The original cost before rescoring. Used for debugging purpose.

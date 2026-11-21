@@ -59,12 +59,18 @@ class UserSegmentHistoryRewriter : public RewriterInterface {
   bool Rewrite(const ConversionRequest& request,
                Segments* segments) const override;
 
+  void PrepareForSuggestionLearning(
+      const ConversionRequest& request) override;
   void Finish(const ConversionRequest& request,
               const Segments& segments) override;
+  void FinishWithSuggestionLearningSegments(
+      const ConversionRequest& request, const Segments& committed_segments,
+      const Segments* suggestion_learning_segments) override;
   bool Sync() override;
   bool Reload() override;
   void Clear() override;
   void Revert(const Segments& segments) override;
+  void DiscardRevert(const Segments& segments) override;
   bool ClearHistoryEntry(const Segments& segments, size_t segment_index,
                          int candidate_index) override;
 
@@ -101,9 +107,19 @@ class UserSegmentHistoryRewriter : public RewriterInterface {
     size_t value_end = 0;
   };
 
+  struct StorageRevertEntry {
+    std::string key;
+    std::optional<std::string> previous_value;
+  };
+
   struct PendingRevert {
     std::vector<RevertEntry> entries;
     std::string committed_value;
+
+    // Ordinary Mozc commits use deferred partial revert. External Zenz commits
+    // are one transaction and restore every touched segment.db key immediately.
+    bool reversible_external_learning = false;
+    std::vector<StorageRevertEntry> external_storage_entries;
   };
 
   static Segments MakeLearningSegmentsFromInnerSegments(
@@ -118,28 +134,37 @@ class UserSegmentHistoryRewriter : public RewriterInterface {
                    const converter::Candidate& target_candidate) const;
   // |revert_entries| will be stored to Segments and used to revert last
   // Finish() operation in Revert().
-  void RememberFirstCandidate(const ConversionRequest& request,
-                              const Segments& segments, size_t segment_index,
-                              size_t value_begin, size_t value_end,
-                              std::vector<RevertEntry>& revert_entries);
+  void RememberFirstCandidate(
+      const ConversionRequest& request, const Segments& segments,
+      size_t segment_index, size_t value_begin, size_t value_end,
+      std::vector<RevertEntry>& revert_entries,
+      std::vector<StorageRevertEntry>* external_storage_entries);
 
-  void RememberNumberPreference(const Segment& segment,
-                                std::vector<RevertEntry>& revert_entries);
-  bool RewriteNumber(Segment* segment) const;
   bool ShouldRewrite(const Segment& segment, size_t* max_candidates_size) const;
-  void InsertTriggerKey(const Segment& segment);
+  void InsertTriggerKey(
+      const Segment& segment,
+      std::vector<StorageRevertEntry>* external_storage_entries);
   bool IsPunctuation(const Segment& seg,
                      const converter::Candidate& candidate) const;
   bool SortCandidates(absl::Span<const ScoreCandidate> sorted_scores,
                       Segment* segment) const;
   Score Fetch(absl::string_view key, uint32_t weight) const;
-  void Insert(absl::string_view key, absl::string_view value,
-              size_t value_begin, size_t value_end, bool force,
-              std::vector<RevertEntry>& revert_entries);
+  void Insert(
+      absl::string_view key, absl::string_view value,
+      size_t value_begin, size_t value_end, bool force,
+      std::vector<RevertEntry>& revert_entries,
+      std::vector<StorageRevertEntry>* external_storage_entries);
 
   void MaybeInsertRevertEntry(absl::string_view key, absl::string_view value,
                               size_t value_begin, size_t value_end,
                               std::vector<RevertEntry>& revert_entries);
+
+  // Captures the exact raw 4-byte segment.db value before an external
+  // transaction touches |key|. Returns false when a new insertion would evict
+  // unrelated history from a full LRU, in which case that enrichment is skipped.
+  bool PrepareExternalStorageWrite(
+      absl::string_view key,
+      std::vector<StorageRevertEntry>* external_storage_entries);
 
   void MaybeApplyPendingRevert(const ConversionRequest& request) const;
   // Returns true if deletion succeeded.

@@ -32,13 +32,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <ostream>
 #include <type_traits>
 
 namespace mozc {
 
+namespace dictionary {
+class ProjectDictionarySnapshot;
+}  // namespace dictionary
+
 inline constexpr size_t kMaxConversionCandidatesSize = 200;
 
-enum RequestType {
+enum class RequestType {
   CONVERSION,          // normal conversion
   REVERSE_CONVERSION,  // reverse conversion
   PREDICTION,          // show prediction with user tab key
@@ -46,6 +51,10 @@ enum RequestType {
   PARTIAL_PREDICTION,  // show prediction using the text before cursor
   PARTIAL_SUGGESTION,  // show suggestion using the text before cursor
 };
+
+inline std::ostream& operator<<(std::ostream& os, RequestType type) {
+  return os << static_cast<int>(type);
+}
 
 enum ComposerKeySelection {
   // Use Composer::GetQueryForConversion() to generate conversion key. This
@@ -67,7 +76,7 @@ enum ComposerKeySelection {
 // Since it is small (~40 bytes), passing and returning by value is preferred
 // to avoid reference lifetime issues.
 struct ConversionOptions {
-  RequestType request_type = CONVERSION;
+  RequestType request_type = RequestType::CONVERSION;
 
   // Which composer's method to use for conversion key; see the comment around
   // the definition of ComposerKeySelection above.
@@ -98,12 +107,58 @@ struct ConversionOptions {
   // Please refer to session/internal/keymap.h
   bool enable_user_history_for_conversion = true;
 
+  // Internal marker for an externally supplied conversion commit whose history
+  // learning must remain reversible until the caller closes its rollback
+  // window. Ordinary Mozc conversions leave this false.
+  bool reversible_external_learning = false;
+
+  // The candidate was explicitly accepted from the full desktop suggestion
+  // list. Only the legacy user-segment-history rewriter may use a separately
+  // verified learning view. No other Finish hooks or result paths change.
+  bool enable_verified_suggestion_segment_learning = false;
+
+  // When reproducing ordinary conversion for suggestion learning, do not
+  // consume a pending undo's delayed history cleanup. Normal requests leave
+  // this false, so their existing pending-revert semantics are unchanged.
+  bool skip_pending_revert_for_suggestion_learning = false;
+
+  // The temporary full-reading conversion used for verified suggestion
+  // learning keeps the user's original (prefix) ComposerData for input mode
+  // and context. UserHistoryPredictor::Convert must search using the explicit
+  // full request.key(), not the still-incomplete composer conversion query.
+  // Normal conversion and prediction leave this false.
+  bool use_explicit_key_for_user_history_conversion = false;
+
   // If true, enable kana modifier insensitive conversion.
   bool kana_modifier_insensitive_conversion = true;
 
   // If true, use conversion_segment(0).key() instead of ComposerData.
   // TODO(b/365909808): Create a new string field to store the key.
   bool use_already_typing_corrected_key = false;
+
+  // Transition cost bonus for particle omission.
+  int particle_omission_transition_cost_bonus = 0;
+
+  // Input mode for key corrector.
+  enum class InputMode {
+    ROMAN,
+    KANA,
+  };
+  InputMode input_mode = InputMode::ROMAN;
+
+  // Spelling correction. Populated from Config.
+  bool use_spelling_correction = true;
+
+  // Zip code conversion. Populated from Config.
+  bool use_zip_code_conversion = true;
+
+  // Allow a seven-digit alias of a hyphenated postal-code dictionary entry.
+  // ConversionRequest enables this for ordinary and live full conversion;
+  // lattice and dictionary lookups enforce ASCII-alphanumeric boundaries.
+  bool enable_hyphenless_zipcode_alias = false;
+
+  // T13N conversion. Populated from Config.
+  bool use_t13n_conversion = true;
 
   // Enables incognito mode even when Config.incognito_mode() or
   // Request.is_incognito_mode() is false. Use this flag to dynamically change
@@ -121,6 +176,15 @@ struct ConversionOptions {
 
   // This conversion request is called by predictor for realtime conversion.
   bool used_in_predictor_realtime_conversion = false;
+
+  // Mozkey IbG: session/composition-scoped project (Grimodex) dictionary
+  // generation consulted by DictionaryImpl in addition to the system and user
+  // dictionaries. Non-owning so that ConversionOptions stays trivially
+  // copyable: the snapshot is pinned by the ConversionRequest that produced
+  // these options (ConversionRequest::project_dictionary()), and options must
+  // not outlive that request. Populated by ConversionRequestBuilder::Build();
+  // nullptr when no project dictionary is attached.
+  const dictionary::ProjectDictionarySnapshot* project_dictionary = nullptr;
 };
 
 static_assert(std::is_trivially_copyable<ConversionOptions>::value,

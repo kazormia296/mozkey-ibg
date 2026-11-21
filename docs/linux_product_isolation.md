@@ -1,8 +1,10 @@
 # Linux product isolation
 
-Mozkey's OSS Linux build is intentionally installable alongside a distribution
-Mozc package. The two products do not share an Fcitx addon identity, profile,
-server endpoint, or installed executable directory.
+Mozkey IbG's OSS Linux build is intentionally installable alongside both a
+distribution Mozc package and an upstream Mozkey installation. The three
+products do not share an Fcitx or IBus identity, profile, server endpoint,
+named event, or installed executable directory. Mozkey IbG never reads or
+migrates a Mozc or upstream Mozkey profile.
 
 | Resource | Mozkey path or identity |
 | --- | --- |
@@ -11,10 +13,52 @@ server endpoint, or installed executable directory.
 | Profile | `$XDG_CONFIG_HOME/mozkey-ibg`, otherwise `~/.config/mozkey-ibg` |
 | Legacy profile | `~/.mozkey-ibg` |
 | Linux abstract IPC prefix | `/tmp/.mozkey-ibg.` (the leading slash becomes NUL) |
+| Named event prefix | `mozkey-ibg.event.` |
 | Server and tools | `/usr/lib/mozkey-ibg` |
 | Zenz socket and lock | `~/.mozkey-ibg_zenz_scorer_pipe`, `~/.mozkey-ibg_zenz_scorer.lock` |
 | Zenz runtime | Arch/source: link to distro `/usr/bin/llama-server`; deb/rpm: attested regular file at `/usr/lib/mozkey-ibg/llama-server` |
 | Zenz model | `/usr/lib/mozkey-ibg/models/zenz-v3.2-small-Q5_K_M.gguf` |
+
+## Relationship to upstream Mozkey's Linux isolation
+
+Upstream Mozkey 1.1.0 isolates its own Linux build from Mozc. Mozkey IbG
+adopts the same mechanism (the Linux-desktop-only `kEventPathPrefix` and
+`kIPCPrefix` branches, the `LINUX_MOZC_*`/`IBUS_MOZC_*` values in
+`src/config.bzl`, the strict `src/unix/build_package.py` input manifest, the
+`--branding=Mozkey` IBus component generator, and upstream's
+`//ipc:linux_mozkey_namespace_test`), but every resulting identifier is the
+Mozkey IbG one:
+
+| Resource | Stock Mozc | Upstream Mozkey 1.1.0 | Mozkey IbG |
+| --- | --- | --- | --- |
+| Server and tools | `/usr/lib/mozc` | `/usr/lib/mozkey` | `/usr/lib/mozkey-ibg` |
+| Icons | `/usr/share/icons/mozc` | `/usr/share/icons/mozkey` | `/usr/share/icons/mozkey-ibg` |
+| XDG profile | `mozc` | `mozkey` | `mozkey-ibg` |
+| Legacy home profile | `~/.mozc` (adopted if present) | none | `~/.mozkey-ibg` (adopted if present) |
+| Named event prefix | `mozc.event.` | `mozkey.event.` | `mozkey-ibg.event.` |
+| Abstract IPC prefix | `/tmp/.mozc.` | `/tmp/.mozkey.` | `/tmp/.mozkey-ibg.` |
+| IBus component file | `mozc.xml` | `mozkey.xml` | `mozkey-ibg.xml` |
+| IBus component name | `com.google.IBus.Mozc` | `org.mozkey.IBus.Mozkey` | `io.github.kazormia296.IBus.MozkeyIbG` |
+| IBus engine binary | `/usr/lib/ibus-mozc/ibus-engine-mozc` | `/usr/lib/ibus-mozkey/ibus-engine-mozkey` | `/usr/lib/ibus-mozkey-ibg/ibus-engine-mozkey-ibg` |
+| IBus icons and text domain | `/usr/share/ibus-mozc`, `ibus-mozc` | `/usr/share/ibus-mozkey`, `ibus-mozkey` | `/usr/share/ibus-mozkey-ibg`, `ibus-mozkey-ibg` |
+| IBus engine names | `mozc-jp`, `mozc-on`, `mozc-off` | `mozkey-jp`, `mozkey-on`, `mozkey-off` | `mozkey-ibg-jp`, `mozkey-ibg-on`, `mozkey-ibg-off` |
+
+The one deliberate difference from upstream is the legacy home profile:
+upstream Mozkey has none, while Mozkey IbG keeps honouring its own
+pre-existing `~/.mozkey-ibg`. Neither `~/.mozc`, `~/.mozkey`,
+`$XDG_CONFIG_HOME/mozc` nor `$XDG_CONFIG_HOME/mozkey` is ever adopted, and no
+history or user dictionary is migrated from them.
+
+The released Linux packages ship the Fcitx5 frontend only. The IBus frontend
+is still buildable from source through `//unix:package`; the install scripts,
+deb/rpm/Arch packaging and the install manifest do not contain it. The rows
+above keep such a source build from replacing a Mozc or upstream Mozkey IBus
+component. The Emacs helper is not part of `//unix:package`.
+
+`tools/release/product_identity_contract_test.py` pins these values so that a
+later upstream merge cannot silently reintroduce the `mozkey` names.
+
+## Grimodex scope
 
 Grimodex project data is application-scoped independently of these product
 paths. The default `MOZKEY_GRIMODEX_SCOPE` is `grimodex-only`: only exact,

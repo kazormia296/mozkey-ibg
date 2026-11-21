@@ -92,8 +92,26 @@ class RewriterInterface {
   virtual void Finish(const ConversionRequest& request,
                       const Segments& segments) {}
 
+  // Before probing the visible ranking for a new suggestion commit, flush any
+  // pending history undo. Default rewriters have no deferred undo storage.
+  // This is invoked only for the verified suggestion-learning path.
+  virtual void PrepareForSuggestionLearning(const ConversionRequest& request) {}
+
+  // An opt-in suggestion commit can provide a separately verified view of
+  // the same committed text, with native reading/segment correspondence.
+  // The default implementation must learn the original commit exactly once.
+  // Only the user-segment-history rewriter consumes the optional view.
+  virtual void FinishWithSuggestionLearningSegments(
+      const ConversionRequest& request, const Segments& committed_segments,
+      const Segments* suggestion_learning_segments) {
+    Finish(request, committed_segments);
+  }
+
   // Reverts the last Finish operation.
   virtual void Revert(const Segments& segments) {}
+
+  // Discards only rollback metadata for a confirmed Finish operation.
+  virtual void DiscardRevert(const Segments& segments) {}
 
   // Delete the user history based entry corresponding to the specified
   // candidate.
@@ -142,6 +160,17 @@ class RewriterInterface {
                  .decoder_experiment_params()
                  .disable_legacy_rewriter_mode() &
              mode));
+  }
+
+  // Returns true if (disable_legacy_rewriter_in_all_conversion_mode() & mode)
+  // is true.
+  // TODO(taku): Remove this function once the migration finishes.
+  static bool DisableLegacyRewriter(const ConversionRequest& request,
+                                    int mode) {
+    return (request.request()
+                .decoder_experiment_params()
+                .disable_legacy_rewriter_in_all_conversion_mode() &
+            mode);
   }
 
  protected:

@@ -275,14 +275,18 @@ bool IPCPathManager::GetPathName(std::string *ipc_name) const {
   *ipc_name = mozc::kIPCPrefix;
 #elif defined(__APPLE__)
   ipc_name->assign(MacUtil::GetLabelForSuffix(""));
-#elif defined(__linux__) && !defined(GOOGLE_JAPANESE_INPUT_BUILD)
-  // OSS Mozkey uses its own abstract namespace and cannot attach to a system
-  // Mozc server belonging to the same user.
+#else   // not _WIN32 nor __APPLE__
+  // On Linux the leading slash is replaced with NUL (abstract socket).
+  // Use a distinct product namespace even when the profile key is unique, so
+  // that Mozkey IbG can attach neither to a system Mozc server ("/tmp/.mozc.")
+  // nor to an upstream Mozkey server ("/tmp/.mozkey.") of the same user.
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(OS_CHROMEOS) && \
+    !defined(GOOGLE_JAPANESE_INPUT_BUILD)
   constexpr char kIPCPrefix[] = "/tmp/.mozkey-ibg.";
-  *ipc_name = kIPCPrefix;
-#else   // not _WIN32, __APPLE__, or OSS Linux
+#else
   // GetUserIPCName("<name>") => "/tmp/.mozc.<key>.<name>"
   constexpr char kIPCPrefix[] = "/tmp/.mozc.";
+#endif  // Linux Mozkey
   *ipc_name = kIPCPrefix;
 #endif  // _WIN32
 

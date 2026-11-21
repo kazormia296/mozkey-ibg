@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"
@@ -45,6 +46,7 @@
 #include "absl/types/span.h"
 #include "base/vlog.h"
 #include "converter/attribute.h"
+#include "converter/caching_connector.h"
 #include "converter/candidate.h"
 #include "converter/candidate_filter.h"
 #include "converter/connector.h"
@@ -56,7 +58,8 @@
 #include "dictionary/dictionary_interface.h"
 #include "dictionary/pos_matcher.h"
 #include "prediction/suggestion_filter.h"
-#include "request/conversion_request.h"
+#include "request/options.h"
+
 
 namespace mozc {
 namespace {
@@ -64,6 +67,7 @@ namespace {
 using ::mozc::converter::Attribute;
 using ::mozc::converter::Candidate;
 using ::mozc::converter::CandidateFilter;
+using ::mozc::converter::RankingConstraint;
 using ::mozc::dictionary::PosMatcher;
 using ::mozc::dictionary::UserDictionaryInterface;
 
@@ -78,11 +82,11 @@ bool IsBetweenAlphabetKeys(const Node& left, const Node& right) {
 
 }  // namespace
 
-const NBestGenerator::QueueElement* absl_nonnull
-NBestGenerator::CreateNewElement(const Node* absl_nonnull node,
-                                 const QueueElement* absl_nullable next,
-                                 int32_t fx, int32_t gx, int32_t structure_gx,
-                                 int32_t w_gx) {
+template <typename TConnector>
+const typename NBestGenerator<TConnector>::QueueElement* absl_nonnull
+NBestGenerator<TConnector>::CreateNewElement(
+    const Node* absl_nonnull node, const QueueElement* absl_nullable next,
+    int32_t fx, int32_t gx, int32_t structure_gx, int32_t w_gx) {
   QueueElement* absl_nonnull elm = arena_.Alloc();
   elm->node = node;
   elm->next = next;
@@ -93,26 +97,28 @@ NBestGenerator::CreateNewElement(const Node* absl_nonnull node,
   return elm;
 }
 
-void NBestGenerator::Agenda::Push(
-    const NBestGenerator::QueueElement* absl_nonnull element) {
+template <typename TConnector>
+void NBestGenerator<TConnector>::Agenda::Push(
+    const typename NBestGenerator<TConnector>::QueueElement* absl_nonnull
+        element) {
   priority_queue_.push_back(element);
   std::push_heap(priority_queue_.begin(), priority_queue_.end(),
                  QueueElement::Comparator);
 }
 
-void NBestGenerator::Agenda::Pop() {
+template <typename TConnector>
+void NBestGenerator<TConnector>::Agenda::Pop() {
   DCHECK(!priority_queue_.empty());
   std::pop_heap(priority_queue_.begin(), priority_queue_.end(),
                 QueueElement::Comparator);
   priority_queue_.pop_back();
 }
 
-NBestGenerator::NBestGenerator(const UserDictionaryInterface& user_dictionary,
-                               const Segmenter& segmenter,
-                               const Connector& connector,
-                               const PosMatcher& pos_matcher,
-                               const Lattice& lattice,
-                               const SuggestionFilter& suggestion_filter)
+template <typename TConnector>
+NBestGenerator<TConnector>::NBestGenerator(
+    const UserDictionaryInterface& user_dictionary, const Segmenter& segmenter,
+    TConnector& connector, const PosMatcher& pos_matcher,
+    const Lattice& lattice, const SuggestionFilter& suggestion_filter)
     : user_dictionary_(user_dictionary),
       segmenter_(segmenter),
       connector_(connector),
@@ -127,9 +133,10 @@ NBestGenerator::NBestGenerator(const UserDictionaryInterface& user_dictionary,
   agenda_.Reserve(kArenaChunkSize);
 }
 
-void NBestGenerator::Reset(const Node* absl_nonnull begin_node,
-                           const Node* absl_nonnull end_node,
-                           const Options options) {
+template <typename TConnector>
+void NBestGenerator<TConnector>::Reset(const Node& begin_node,
+                                       const Node& end_node,
+                                       const Options options) {
   agenda_.Clear();
   arena_.Clear();
   top_nodes_.clear();
@@ -137,8 +144,8 @@ void NBestGenerator::Reset(const Node* absl_nonnull begin_node,
   viterbi_result_checked_ = false;
   options_ = options;
 
-  begin_node_ = begin_node;
-  end_node_ = end_node;
+  begin_node_ = &begin_node;
+  end_node_ = &end_node;
 
   for (const Node* node : lattice_.begin_nodes(end_node_->begin_pos)) {
     if (node == end_node_ ||
@@ -155,7 +162,8 @@ void NBestGenerator::Reset(const Node* absl_nonnull begin_node,
   }
 }
 
-void NBestGenerator::MakeCandidate(
+template <typename TConnector>
+void NBestGenerator<TConnector>::MakeCandidate(
     Candidate& candidate, int32_t cost, int32_t structure_cost, int32_t wcost,
     absl::Span<const Node* absl_nonnull const> nodes) const {
   DCHECK(!nodes.empty());
@@ -196,11 +204,14 @@ void NBestGenerator::MakeCandidate(
     if (node->attributes & Node::USER_DICTIONARY) {
       candidate.attributes |= Attribute::USER_DICTIONARY;
     }
+    if (node->attributes & Node::EMOTICON) {
+      candidate.ranking_constraints |= RankingConstraint::NO_TOP;
+    }
     if (node->attributes & Node::PROJECT_DICTIONARY) {
       candidate.attributes |=
-          (Attribute::PROJECT_DICTIONARY | Attribute::NO_LEARNING |
-           Attribute::NO_DELETABLE | Attribute::NO_VARIANTS_EXPANSION |
-           Attribute::NO_MODIFICATION);
+          (Attribute::NO_LEARNING | Attribute::NO_DELETABLE |
+           Attribute::NO_VARIANTS_EXPANSION | Attribute::NO_MODIFICATION);
+      candidate.ranking_constraints |= RankingConstraint::PROJECT_DICTIONARY;
     }
     if (node->attributes & Node::SUFFIX_DICTIONARY) {
       candidate.attributes |= Attribute::SUFFIX_DICTIONARY;
@@ -220,9 +231,273 @@ void NBestGenerator::MakeCandidate(
   if (options_.candidate_mode & CandidateMode::FILL_INNER_SEGMENT_INFO) {
     FillInnerSegmentInfo(nodes, candidate);
   }
+
+  // Keep selected-path evidence for both single- and multi-segment
+  // conversion modes. Zenz may inspect either, so a realtime-only flag would
+  // silently lose protection on ordinary multi-segment conversion paths.
+  {
+    // These endings explicitly extend a selected proper name into a place or
+    // organization expression. This is not a general-purpose suffix parser.
+    constexpr std::pair<absl::string_view, absl::string_view> kNameEndings[] = {
+        {"けん", "県"}, {"と", "都"}, {"ふ", "府"}, {"どう", "道"},
+        {"し", "市"}, {"く", "区"}, {"ちょう", "町"},
+        {"むら", "村"}, {"ぐん", "郡"}, {"しょうじ", "商事"},
+    };
+    // Recognize a place-name node whose RID is a typed regional suffix.
+    // Do not change the existing kNameEndings concatenation policy.
+    size_t key_offset = 0;
+    size_t value_offset = 0;
+    bool expression_open = false;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      const Node* node = nodes[i];
+      // SYSTEM_DICTIONARY is currently unused on Node.  Consequently the
+      // evidence here is a normal lexical path with proper-noun POS, *not*
+      // a cryptographic guarantee of system-dictionary origin.
+      const bool eligible_node =
+          node->node_type == Node::NOR_NODE &&
+          // Mozkey IbG: project (Grimodex) dictionary nodes are user-supplied
+          // like USER_DICTIONARY nodes, so they are not system evidence.
+          !(node->attributes & (Node::USER_DICTIONARY |
+                                 Node::PROJECT_DICTIONARY |
+                                 Node::SPELLING_CORRECTION)) &&
+          !node->key.empty() && !node->value.empty();
+      // LID and RID encode connection characteristics, not two independent
+      // semantic labels. A geographic RID must agree with the actual ending.
+      // The generic regional suffix (without a specific type) is deliberately
+      // excluded: a matching character string is not sufficient evidence.
+      bool geographic_compound = false;
+      if (eligible_node &&
+          pos_matcher_.IsGeographicProperNoun(node->lid) &&
+          pos_matcher_.IsGeographicSuffix(node->rid)) {
+        const absl::string_view key(node->key);
+        const absl::string_view value(node->value);
+        geographic_compound =
+            (pos_matcher_.IsGeographicWardSuffix(node->rid) &&
+             key.ends_with("く") && value.ends_with("区")) ||
+            (pos_matcher_.IsGeographicCitySuffix(node->rid) &&
+             key.ends_with("し") && value.ends_with("市")) ||
+            (pos_matcher_.IsGeographicPrefectureFuSuffix(node->rid) &&
+             key.ends_with("ふ") && value.ends_with("府")) ||
+            (pos_matcher_.IsGeographicVillageSuffix(node->rid) &&
+             (key.ends_with("むら") || key.ends_with("そん")) &&
+             value.ends_with("村")) ||
+            (pos_matcher_.IsGeographicTownSuffix(node->rid) &&
+             (key.ends_with("ちょう") || key.ends_with("まち")) &&
+             value.ends_with("町")) ||
+            (pos_matcher_.IsGeographicPrefectureKenSuffix(node->rid) &&
+             key.ends_with("けん") && value.ends_with("県")) ||
+            (pos_matcher_.IsGeographicCountySuffix(node->rid) &&
+             key.ends_with("ぐん") && value.ends_with("郡")) ||
+            (pos_matcher_.IsGeographicStationSuffix(node->rid) &&
+             key.ends_with("えき") && value.ends_with("駅"));
+      }
+      const bool is_proper =
+          eligible_node &&
+          ((pos_matcher_.IsUniqueNoun(node->lid) &&
+            pos_matcher_.IsUniqueNoun(node->rid)) ||
+           geographic_compound);
+      bool named_ending = false;
+      if (eligible_node && expression_open && !is_proper) {
+        for (const auto& ending : kNameEndings) {
+          if (absl::string_view(node->key) == ending.first &&
+              absl::string_view(node->value) == ending.second) {
+            named_ending = true;
+            break;
+          }
+        }
+      }
+      const bool surname_given_boundary =
+          is_proper && expression_open && i != 0 &&
+          pos_matcher_.IsLastName(nodes[i - 1]->rid) &&
+          pos_matcher_.IsFirstName(node->lid);
+      const bool continues_proper =
+          is_proper && expression_open && i != 0 &&
+          (surname_given_boundary ||
+           !segmenter_.IsBoundary(*nodes[i - 1], *node, false));
+      // A designated name ending may cross an ordinary segmenter boundary;
+      // adjacency on the selected node path is what establishes the compound.
+      if (named_ending || continues_proper) {
+        converter::ProperNounSpan& span = candidate.proper_noun_spans.back();
+        span.key.append(node->key);
+        span.value.append(node->value);
+        span.token_readings.push_back(node->key);
+        // Only assert a full name when the span began at the surname,
+        // not if a preceding unrelated proper noun was merged into it.
+        if (surname_given_boundary &&
+            span.key_offset == key_offset - nodes[i - 1]->key.size() &&
+            span.value_offset ==
+                value_offset - nodes[i - 1]->value.size()) {
+          span.verified_personal_full_name = true;
+        }
+      } else if (is_proper) {
+        converter::ProperNounSpan span;
+        span.key_offset = key_offset;
+        span.value_offset = value_offset;
+        span.key = node->key;
+        span.value = node->value;
+        span.token_readings.push_back(node->key);
+        // A single surname-to-given-name dictionary token is a
+        // full-name candidate even when its reading is ambiguous.
+        span.verified_personal_full_name =
+            pos_matcher_.IsLastName(node->lid) &&
+            pos_matcher_.IsFirstName(node->rid);
+        candidate.proper_noun_spans.push_back(std::move(span));
+      }
+      expression_open = is_proper || named_ending;
+      key_offset += node->key.size();
+      value_offset += node->value.size();
+    }
+  }
+
+  // Recover a verified surname+given-name from an alternative lexical path,
+  // even when the SELECTED path appends particles or other text to the name.
+  // Only the exact surname+given-name surface is protected, never the suffix.
+  // A general-noun selected node supplies an anchor; it is not itself proof
+  // of a name.  All name evidence is drawn from the same conversion lattice.
+  size_t selected_key_offset = 0;
+  size_t selected_value_offset = 0;
+  for (const Node* selected : nodes) {
+    const bool eligible_selected =
+        selected->node_type == Node::NOR_NODE &&
+        !(selected->attributes &
+          (Node::USER_DICTIONARY | Node::PROJECT_DICTIONARY |
+           Node::SPELLING_CORRECTION)) &&
+        pos_matcher_.IsGeneralNoun(selected->lid) &&
+        pos_matcher_.IsGeneralNoun(selected->rid) &&
+        !selected->key.empty() && !selected->value.empty() &&
+        selected->key.size() >= 3 && selected->key.size() <= 72 &&
+        selected->value.size() >= 3 && selected->value.size() <= 36 &&
+        selected->begin_pos < selected->end_pos &&
+        selected_key_offset <= candidate.key.size() &&
+        selected_value_offset <= candidate.value.size();
+    if (eligible_selected) {
+      const absl::string_view key_tail(candidate.key.data() +
+                                           selected_key_offset,
+                                       candidate.key.size() -
+                                           selected_key_offset);
+      const absl::string_view value_tail(candidate.value.data() +
+                                             selected_value_offset,
+                                         candidate.value.size() -
+                                             selected_value_offset);
+      bool found = false;
+      bool ambiguous = false;
+      std::string surname_key, surname_value;
+      std::string given_key, given_value;
+      // Bound the number of genuinely matching surname+given paths, not the
+      // unrelated lexical alternatives in the lattice.  A raw node budget
+      // caused name protection to vary with following particles because
+      // extra words changed the number of unrelated given-position nodes.
+      // If there are too many matches, fail closed (no name protection).
+      constexpr size_t kMaxMatchingNamePaths = 64;
+      size_t matching_name_paths = 0;
+      for (const Node* surname : lattice_.begin_nodes(selected->begin_pos)) {
+        if (surname->node_type != Node::NOR_NODE ||
+            (surname->attributes &
+             (Node::USER_DICTIONARY | Node::PROJECT_DICTIONARY |
+              Node::SPELLING_CORRECTION)) ||
+            !pos_matcher_.IsLastName(surname->lid) ||
+            !pos_matcher_.IsLastName(surname->rid) ||
+            surname->key.empty() || surname->value.empty() ||
+            surname->end_pos <= selected->begin_pos ||
+            surname->end_pos >= lattice_.key().size() ||
+            !key_tail.starts_with(surname->key) ||
+            !value_tail.starts_with(surname->value)) {
+          continue;
+        }
+        for (const Node* given : lattice_.begin_nodes(surname->end_pos)) {
+          if (given->node_type != Node::NOR_NODE ||
+              (given->attributes &
+               (Node::USER_DICTIONARY | Node::PROJECT_DICTIONARY |
+                Node::SPELLING_CORRECTION)) ||
+              !pos_matcher_.IsFirstName(given->lid) ||
+              !pos_matcher_.IsFirstName(given->rid) ||
+              given->key.empty() || given->value.empty() ||
+              given->end_pos <= surname->end_pos ||
+              !key_tail.substr(surname->key.size()).starts_with(given->key) ||
+              !value_tail.substr(surname->value.size()).starts_with(given->value)) {
+            continue;
+          }
+          const size_t name_key_size =
+              surname->key.size() + given->key.size();
+          const size_t name_value_size =
+              surname->value.size() + given->value.size();
+          if (name_key_size < 9 || name_key_size > 72 ||
+              name_value_size < 9 || name_value_size > 36) {
+            continue;
+          }
+
+          // If the name ends INSIDE a selected general-noun node, require
+          // independent evidence for the immediately following functional
+          // morpheme. Otherwise a random noun prefix could be overprotected.
+          if (given->end_pos < selected->end_pos) {
+            bool validated_suffix_boundary = false;
+            for (const Node* suffix : lattice_.begin_nodes(given->end_pos)) {
+              if (suffix->node_type != Node::NOR_NODE ||
+                  (suffix->attributes &
+                   (Node::USER_DICTIONARY | Node::PROJECT_DICTIONARY |
+                    Node::SPELLING_CORRECTION)) ||
+                  !pos_matcher_.IsFunctional(suffix->lid) ||
+                  suffix->key.empty() || suffix->value.empty() ||
+                  !key_tail.substr(name_key_size).starts_with(suffix->key) ||
+                  !value_tail.substr(name_value_size).starts_with(suffix->value)) {
+                continue;
+              }
+              validated_suffix_boundary = true;
+              break;
+            }
+            if (!validated_suffix_boundary) continue;
+          }
+          if (++matching_name_paths > kMaxMatchingNamePaths) {
+            ambiguous = true;
+            break;
+          }
+          if (found &&
+              (surname_key != surname->key ||
+               surname_value != surname->value ||
+               given_key != given->key ||
+               given_value != given->value)) {
+            ambiguous = true;
+            break;
+          }
+          found = true;
+          surname_key = surname->key;
+          surname_value = surname->value;
+          given_key = given->key;
+          given_value = given->value;
+        }
+        if (ambiguous) break;
+      }
+      if (found && !ambiguous) {
+        const size_t name_key_size =
+            surname_key.size() + given_key.size();
+        bool overlaps_existing = false;
+        for (const converter::ProperNounSpan& existing :
+             candidate.proper_noun_spans) {
+          if (existing.key_offset < selected_key_offset + name_key_size &&
+              selected_key_offset < existing.key_offset + existing.key.size()) {
+            overlaps_existing = true;
+            break;
+          }
+        }
+        if (!overlaps_existing) {
+          converter::ProperNounSpan span;
+          span.key_offset = selected_key_offset;
+          span.value_offset = selected_value_offset;
+          span.key = surname_key + given_key;
+          span.value = surname_value + given_value;
+          span.token_readings = {surname_key, given_key};
+          span.verified_personal_full_name = true;
+          candidate.proper_noun_spans.push_back(std::move(span));
+        }
+      }
+    }
+    selected_key_offset += selected->key.size();
+    selected_value_offset += selected->value.size();
+  }
 }
 
-void NBestGenerator::FillInnerSegmentInfo(
+template <typename TConnector>
+void NBestGenerator<TConnector>::FillInnerSegmentInfo(
     absl::Span<const Node* absl_nonnull const> nodes,
     Candidate& candidate) const {
   size_t key_len = nodes[0]->key.size(), value_len = nodes[0]->value.size();
@@ -283,9 +558,12 @@ void NBestGenerator::FillInnerSegmentInfo(
       builder.Build(candidate.key, candidate.value);
 }
 
-CandidateFilter::ResultType NBestGenerator::MakeCandidateFromElement(
-    const ConversionRequest& request, absl::string_view original_key,
-    const NBestGenerator::QueueElement& element, Candidate& candidate) {
+template <typename TConnector>
+CandidateFilter::ResultType
+NBestGenerator<TConnector>::MakeCandidateFromElement(
+    const ConversionOptions& options, absl::string_view original_key,
+    const typename NBestGenerator<TConnector>::QueueElement& element,
+    Candidate& candidate) {
   std::vector<const Node* absl_nonnull> nodes;
 
   if (element.next == nullptr) {
@@ -323,15 +601,16 @@ CandidateFilter::ResultType NBestGenerator::MakeCandidateFromElement(
                   nodes);
   }
 
-  return filter_.FilterCandidate(request, original_key, &candidate, top_nodes_,
+  return filter_.FilterCandidate(options, original_key, &candidate, top_nodes_,
                                  nodes);
 }
 
 // Set candidates.
-void NBestGenerator::SetCandidates(const ConversionRequest& request,
-                                   absl::string_view original_key,
-                                   const size_t expand_size,
-                                   Segment* absl_nonnull segment) {
+template <typename TConnector>
+void NBestGenerator<TConnector>::SetCandidates(const ConversionOptions& options,
+                                               absl::string_view original_key,
+                                               const size_t expand_size,
+                                               Segment& segment) {
   DCHECK(begin_node_);
   DCHECK(end_node_);
 
@@ -340,29 +619,30 @@ void NBestGenerator::SetCandidates(const ConversionRequest& request,
     return;
   }
 
-  while (segment->candidates_size() < expand_size) {
-    Candidate* candidate = segment->push_back_candidate();
+  while (segment.candidates_size() < expand_size) {
+    Candidate* candidate = segment.push_back_candidate();
     DCHECK(candidate);
 
     // if Next() returns false, no more entries are generated.
-    if (!Next(request, original_key, *candidate)) {
-      segment->pop_back_candidate();
+    if (!Next(options, original_key, *candidate)) {
+      segment.pop_back_candidate();
       break;
     }
   }
 #ifdef MOZC_CANDIDATE_DEBUG
-  // Append moved bad_candidates_ to segment->removed_candidates_for_debug_.
-  segment->removed_candidates_for_debug_.insert(
-      segment->removed_candidates_for_debug_.end(),
+  // Append moved bad_candidates_ to segment.removed_candidates_for_debug_.
+  segment.removed_candidates_for_debug_.insert(
+      segment.removed_candidates_for_debug_.end(),
       std::make_move_iterator(bad_candidates_.begin()),
       std::make_move_iterator(bad_candidates_.end()));
   bad_candidates_.clear();
 #endif  // MOZC_CANDIDATE_DEBUG
 }
 
-bool NBestGenerator::Next(const ConversionRequest& request,
-                          absl::string_view original_key,
-                          Candidate& candidate) {
+template <typename TConnector>
+bool NBestGenerator<TConnector>::Next(const ConversionOptions& options,
+                                      absl::string_view original_key,
+                                      Candidate& candidate) {
   // |cost| and |structure_cost| are calculated as follows:
   //
   // Example:
@@ -394,7 +674,7 @@ bool NBestGenerator::Next(const ConversionRequest& request,
     viterbi_result_checked_ = true;
     // Use CandidateFilter so that filter is initialized with the
     // Viterbi-best path.
-    switch (InsertTopResult(request, original_key, candidate)) {
+    switch (InsertTopResult(options, original_key, candidate)) {
       case CandidateFilter::GOOD_CANDIDATE:
         return true;
       case CandidateFilter::STOP_ENUMERATION:
@@ -427,7 +707,7 @@ bool NBestGenerator::Next(const ConversionRequest& request,
     // reached to the goal.
     if (rnode->end_pos == begin_node_->end_pos) {
       const CandidateFilter::ResultType filter_result =
-          MakeCandidateFromElement(request, original_key, *top, candidate);
+          MakeCandidateFromElement(options, original_key, *top, candidate);
 
       switch (filter_result) {
         case CandidateFilter::GOOD_CANDIDATE:
@@ -563,17 +843,19 @@ bool NBestGenerator::Next(const ConversionRequest& request,
   return false;
 }
 
-NBestGenerator::BoundaryCheckResult NBestGenerator::BoundaryCheck(
-    const Node& lnode, const Node& rnode, bool is_edge) const {
+template <typename TConnector>
+typename NBestGenerator<TConnector>::BoundaryCheckResult
+NBestGenerator<TConnector>::BoundaryCheck(const Node& lnode, const Node& rnode,
+                                          bool is_edge) const {
   // Special case, no boundary check
   if (rnode.node_type == Node::CON_NODE || lnode.node_type == Node::CON_NODE) {
     return VALID;
   }
 
-  // We don't want to connect alphabet keys.
+  // We don't want to connect alphabet keys within a segment.
   // If "eupho" is not in the dictionary, "eupho" as an as-is fallback is
   // expected rather than "EUpho" (EU + pho).
-  if (IsBetweenAlphabetKeys(lnode, rnode)) {
+  if (!is_edge && IsBetweenAlphabetKeys(lnode, rnode)) {
     return INVALID;
   }
 
@@ -590,8 +872,10 @@ NBestGenerator::BoundaryCheckResult NBestGenerator::BoundaryCheck(
   return INVALID;
 }
 
-NBestGenerator::BoundaryCheckResult NBestGenerator::CheckOnlyMid(
-    const Node& lnode, const Node& rnode, bool is_edge) const {
+template <typename TConnector>
+typename NBestGenerator<TConnector>::BoundaryCheckResult
+NBestGenerator<TConnector>::CheckOnlyMid(const Node& lnode, const Node& rnode,
+                                         bool is_edge) const {
   // is_boundary is true if there is a grammar-based boundary
   // between lnode and rnode
   const bool is_boundary = (lnode.node_type == Node::HIS_NODE ||
@@ -610,8 +894,10 @@ NBestGenerator::BoundaryCheckResult NBestGenerator::CheckOnlyMid(
   return VALID;
 }
 
-NBestGenerator::BoundaryCheckResult NBestGenerator::CheckOnlyEdge(
-    const Node& lnode, const Node& rnode, bool is_edge) const {
+template <typename TConnector>
+typename NBestGenerator<TConnector>::BoundaryCheckResult
+NBestGenerator<TConnector>::CheckOnlyEdge(const Node& lnode, const Node& rnode,
+                                          bool is_edge) const {
   // is_boundary is true if there is a grammar-based boundary
   // between lnode and rnode
   const bool is_boundary = (lnode.node_type == Node::HIS_NODE ||
@@ -625,8 +911,10 @@ NBestGenerator::BoundaryCheckResult NBestGenerator::CheckOnlyEdge(
   }
 }
 
-NBestGenerator::BoundaryCheckResult NBestGenerator::CheckStrict(
-    const Node& lnode, const Node& rnode, bool is_edge) const {
+template <typename TConnector>
+typename NBestGenerator<TConnector>::BoundaryCheckResult
+NBestGenerator<TConnector>::CheckStrict(const Node& lnode, const Node& rnode,
+                                        bool is_edge) const {
   // is_boundary is true if there is a grammar-based boundary
   // between lnode and rnode
   const bool is_boundary = (lnode.node_type == Node::HIS_NODE ||
@@ -641,7 +929,9 @@ NBestGenerator::BoundaryCheckResult NBestGenerator::CheckStrict(
   }
 }
 
-bool NBestGenerator::MakeCandidateFromBestPath(Candidate& candidate) {
+template <typename TConnector>
+bool NBestGenerator<TConnector>::MakeCandidateFromBestPath(
+    Candidate& candidate) {
   top_nodes_.clear();
   int total_wcost = 0;
   DCHECK(begin_node_);
@@ -671,7 +961,9 @@ bool NBestGenerator::MakeCandidateFromBestPath(Candidate& candidate) {
   return true;
 }
 
-void NBestGenerator::MakePrefixCandidateFromBestPath(Candidate& candidate) {
+template <typename TConnector>
+void NBestGenerator<TConnector>::MakePrefixCandidateFromBestPath(
+    Candidate& candidate) {
   top_nodes_.clear();
   int total_extra_wcost = 0;  // wcost sum excepting the first node
   DCHECK(begin_node_);
@@ -705,9 +997,10 @@ void NBestGenerator::MakePrefixCandidateFromBestPath(Candidate& candidate) {
   MakeCandidate(candidate, cost, structure_cost, wcost, top_nodes_);
 }
 
-int NBestGenerator::InsertTopResult(const ConversionRequest& request,
-                                    absl::string_view original_key,
-                                    Candidate& candidate) {
+template <typename TConnector>
+int NBestGenerator<TConnector>::InsertTopResult(
+    const ConversionOptions& options, absl::string_view original_key,
+    Candidate& candidate) {
   if (options_.candidate_mode &
       CandidateMode::BUILD_FROM_ONLY_FIRST_INNER_SEGMENT) {
     MakePrefixCandidateFromBestPath(candidate);
@@ -716,22 +1009,26 @@ int NBestGenerator::InsertTopResult(const ConversionRequest& request,
       return CandidateFilter::STOP_ENUMERATION;
     }
   }
-  if (request.request_type() == ConversionRequest::SUGGESTION) {
+  if (options.request_type == RequestType::SUGGESTION) {
     candidate.attributes |= Attribute::REALTIME_CONVERSION;
   }
 
-  const int result = filter_.FilterCandidate(request, original_key, &candidate,
+  const int result = filter_.FilterCandidate(options, original_key, &candidate,
                                              top_nodes_, top_nodes_);
   return result;
 }
 
-int NBestGenerator::GetTransitionCost(const Node& lnode,
-                                      const Node& rnode) const {
+template <typename TConnector>
+int NBestGenerator<TConnector>::GetTransitionCost(const Node& lnode,
+                                                  const Node& rnode) {
   constexpr int kInvalidPenaltyCost = 100000;
   if (rnode.constrained_prev != nullptr && &lnode != rnode.constrained_prev) {
     return kInvalidPenaltyCost;
   }
+  connector_.ResetCacheIfNecessary(rnode.lid);
   return connector_.GetTransitionCost(lnode.rid, rnode.lid);
 }
 
+template class NBestGenerator<CachingConnector<true>>;
+template class NBestGenerator<CachingConnector<false>>;
 }  // namespace mozc

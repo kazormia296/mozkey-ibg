@@ -72,6 +72,8 @@ inline constexpr wchar_t kMessageReceiverMessageName[] =
     L"googlejapaneseinput.renderer.message";
 inline constexpr wchar_t kMessageReceiverHighlightMessageName[] =
     L"googlejapaneseinput.renderer.highlight.message";
+inline constexpr wchar_t kMessageReceiverSubmitMessageName[] =
+    L"googlejapaneseinput.renderer.submit.message";
 inline constexpr wchar_t kMessageReceiverClassName[] =
     L"googlejapaneseinput.renderer.window";
 inline constexpr wchar_t kCandidateWindowClassName[] =
@@ -127,6 +129,8 @@ inline constexpr wchar_t kMessageReceiverMessageName[] =
     L"mozkeyibg.renderer.message";
 inline constexpr wchar_t kMessageReceiverHighlightMessageName[] =
     L"mozkeyibg.renderer.highlight.message";
+inline constexpr wchar_t kMessageReceiverSubmitMessageName[] =
+    L"mozkeyibg.renderer.submit.message";
 inline constexpr wchar_t kMessageReceiverClassName[] =
     L"mozkeyibg.renderer.window";
 inline constexpr wchar_t kCandidateWindowClassName[] =
@@ -159,7 +163,14 @@ inline constexpr char kEventPathPrefix[] = "MozkeyIbG.event.";
 #else   // __linux__ including __ANDROID__
 inline constexpr char kMozcServerName[] = "mozc_server";
 inline constexpr char kMozcRenderer[] = "mozc_renderer";
+// Mozkey IbG uses its own Linux event namespace so that it shares named
+// events with neither stock Mozc ("mozc.event.") nor upstream Mozkey
+// ("mozkey.event.").  Keep Android/ChromeOS event names unchanged.
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(OS_CHROMEOS)
 inline constexpr char kEventPathPrefix[] = "mozkey-ibg.event.";
+#else
+inline constexpr char kEventPathPrefix[] = "mozc.event.";
+#endif  // Linux Mozkey IbG
 inline constexpr char kMozcTool[] = "mozc_tool";
 #endif  // _WIN32, __APPLE__, or else
 

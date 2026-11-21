@@ -65,18 +65,19 @@ TEST(TipEnumDisplayAttributesTest, BasicTest) {
 TEST(TipEnumDisplayAttributesTest, NextTest) {
   TipEnumDisplayAttributes enum_display_attribute;
 
-  ITfDisplayAttributeInfo* infolist[4] = {};
+  ITfDisplayAttributeInfo* infolist[5] = {};
 
   ULONG fetched = 0;
   const HRESULT result =
       enum_display_attribute.Next(std::size(infolist), infolist, &fetched);
   EXPECT_EQ(result, S_FALSE);
-  EXPECT_EQ(fetched, 2);
+  EXPECT_EQ(fetched, 4);
 
   EXPECT_NE(infolist[0], nullptr);
   EXPECT_NE(infolist[1], nullptr);
-  EXPECT_EQ(infolist[2], nullptr);
-  EXPECT_EQ(infolist[3], nullptr);
+  EXPECT_NE(infolist[2], nullptr);
+  EXPECT_NE(infolist[3], nullptr);
+  EXPECT_EQ(infolist[4], nullptr);
 
   // Clean up.
   for (auto& i : infolist) {
@@ -85,6 +86,43 @@ TEST(TipEnumDisplayAttributesTest, NextTest) {
       i = nullptr;
     }
   }
+}
+
+TEST(TipEnumDisplayAttributesTest, SkipContract) {
+  TipEnumDisplayAttributes enum_display_attribute;
+
+  EXPECT_EQ(enum_display_attribute.Skip(0), S_OK);
+  EXPECT_EQ(enum_display_attribute.Skip(2), S_OK);
+
+  wil::com_ptr_nothrow<ITfDisplayAttributeInfo> info;
+  ULONG fetched = 0;
+  EXPECT_EQ(enum_display_attribute.Next(1, &info, &fetched), S_OK);
+  EXPECT_EQ(fetched, 1);
+  EXPECT_NE(info, nullptr);
+
+  info.reset();
+  fetched = 0;
+  EXPECT_EQ(enum_display_attribute.Next(1, &info, &fetched), S_OK);
+  EXPECT_EQ(fetched, 1);
+  EXPECT_NE(info, nullptr);
+
+  info.reset();
+  fetched = 0;
+  EXPECT_EQ(enum_display_attribute.Next(1, &info, &fetched), S_FALSE);
+  EXPECT_EQ(fetched, 0);
+  EXPECT_EQ(info, nullptr);
+
+  ASSERT_EQ(enum_display_attribute.Reset(), S_OK);
+  EXPECT_EQ(enum_display_attribute.Skip(4), S_OK);
+  fetched = 0;
+  EXPECT_EQ(enum_display_attribute.Next(1, &info, &fetched), S_FALSE);
+  EXPECT_EQ(fetched, 0);
+
+  ASSERT_EQ(enum_display_attribute.Reset(), S_OK);
+  EXPECT_EQ(enum_display_attribute.Skip(5), S_FALSE);
+  fetched = 0;
+  EXPECT_EQ(enum_display_attribute.Next(1, &info, &fetched), S_FALSE);
+  EXPECT_EQ(fetched, 0);
 }
 
 }  // namespace

@@ -22,7 +22,11 @@
 namespace mozc::renderer {
 
 std::string BuildLiveConversionReading(const commands::Output& output) {
-  if (!output.live_conversion() || !output.has_preedit()) {
+  // Upstream v1.0.0 also shows the reading while
+  // live_conversion_min_key_length still delays the actual conversion
+  // (Output.pre_live_conversion_reading).
+  if ((!output.live_conversion() && !output.pre_live_conversion_reading()) ||
+      !output.has_preedit()) {
     return {};
   }
 

@@ -40,6 +40,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "converter/attribute.h"
+#include "converter/caching_connector.h"
 #include "converter/candidate.h"
 #include "converter/immutable_converter.h"
 #include "converter/lattice.h"
@@ -56,8 +57,17 @@
 
 namespace mozc {
 
-using ::mozc::converter::Candidate;
 using ::mozc::converter::Attribute;
+using ::mozc::converter::Candidate;
+using ::mozc::converter::RankingConstraint;
+
+class NBestGeneratorTestPeer
+    : public testing::TestPeer<NBestGenerator<CachingConnector<true>>> {
+ public:
+  explicit NBestGeneratorTestPeer(NBestGenerator<CachingConnector<true>>& g)
+      : testing::TestPeer<NBestGenerator<CachingConnector<true>>>(g) {}
+  PEER_METHOD(MakeCandidate);
+};
 
 class ImmutableConverterTestPeer : testing::TestPeer<ImmutableConverter> {
  public:
@@ -91,16 +101,24 @@ class MockDataAndImmutableConverter {
     return ImmutableConverterTestPeer(*immutable_converter_);
   }
 
-  std::unique_ptr<NBestGenerator> CreateNBestGenerator(const Lattice& lattice) {
-    return std::make_unique<NBestGenerator>(
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> CreateNBestGenerator(
+      const Lattice& lattice, const ConversionRequest& request) {
+    caching_connector_ = std::make_unique<CachingConnector<true>>(
+        modules_->GetConnector(),
+        request.request()
+            .decoder_experiment_params()
+            .particle_omission_transition_cost_bonus(),
+        modules_->GetPosMatcher());
+    return std::make_unique<NBestGenerator<CachingConnector<true>>>(
         modules_->GetUserDictionary(), modules_->GetSegmenter(),
-        modules_->GetConnector(), modules_->GetPosMatcher(), lattice,
+        *caching_connector_, modules_->GetPosMatcher(), lattice,
         modules_->GetSuggestionFilter());
   }
 
  private:
   std::unique_ptr<const engine::Modules> modules_;
   std::unique_ptr<ImmutableConverter> immutable_converter_;
+  std::unique_ptr<CachingConnector<true>> caching_connector_;
 };
 
 ConversionRequest ConvReq(ConversionRequest::RequestType request_type) {
@@ -120,7 +138,7 @@ class NBestGeneratorTest : public ::testing::Test {
     for (const Node* node = begin_node.next; node->next != nullptr;
          node = node->next) {
       end_node = node->next;
-      if (converter.IsSegmentEndNode(request, segments, node, group,
+      if (converter.IsSegmentEndNode(request.options(), segments, node, group,
                                      is_single_segment)) {
         break;
       }
@@ -148,13 +166,13 @@ TEST_F(NBestGeneratorTest, MultiSegmentConnectionTest) {
   Lattice lattice;
   lattice.SetKey("しんこうする");
   const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
-  converter.MakeLattice(request, &segments, &lattice);
+  converter.MakeLattice(request.options(), &segments, &lattice);
 
   const std::vector<uint16_t> group = converter.MakeGroup(segments);
-  converter.Viterbi(segments, &lattice);
+  converter.Viterbi(request.options(), segments, &lattice);
 
-  std::unique_ptr<NBestGenerator> nbest_generator =
-      data_and_converter->CreateNBestGenerator(lattice);
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
 
   constexpr bool kSingleSegment = false;  // For 'normal' conversion
   const Node* begin_node = lattice.bos_node();
@@ -162,10 +180,11 @@ TEST_F(NBestGeneratorTest, MultiSegmentConnectionTest) {
                                     group, kSingleSegment);
   {
     nbest_generator->Reset(
-        begin_node, end_node,
-        {NBestGenerator::STRICT, NBestGenerator::CANDIDATE_MODE_NONE});
+        *begin_node, *end_node,
+        {NBestGenerator<CachingConnector<true>>::STRICT,
+         NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
     Segment result_segment;
-    nbest_generator->SetCandidates(request, "", 10, &result_segment);
+    nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
     // The top result is treated exceptionally and has no boundary check
     // in NBestGenerator.
     // The best route is calculated in ImmutalbeConverter with boundary check.
@@ -177,10 +196,11 @@ TEST_F(NBestGeneratorTest, MultiSegmentConnectionTest) {
 
   {
     nbest_generator->Reset(
-        begin_node, end_node,
-        {NBestGenerator::ONLY_MID, NBestGenerator::CANDIDATE_MODE_NONE});
+        *begin_node, *end_node,
+        {NBestGenerator<CachingConnector<true>>::ONLY_MID,
+         NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
     Segment result_segment;
-    nbest_generator->SetCandidates(request, "", 10, &result_segment);
+    nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
     ASSERT_EQ(result_segment.candidates_size(), 3);
     EXPECT_EQ(result_segment.candidate(0).value, "進行");
     EXPECT_EQ(result_segment.candidate(1).value, "信仰");
@@ -204,13 +224,13 @@ TEST_F(NBestGeneratorTest, SingleSegmentConnectionTest) {
   Lattice lattice;
   lattice.SetKey(kText);
   const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
-  converter.MakeLattice(request, &segments, &lattice);
+  converter.MakeLattice(request.options(), &segments, &lattice);
 
   const std::vector<uint16_t> group = converter.MakeGroup(segments);
-  converter.Viterbi(segments, &lattice);
+  converter.Viterbi(request.options(), segments, &lattice);
 
-  std::unique_ptr<NBestGenerator> nbest_generator =
-      data_and_converter->CreateNBestGenerator(lattice);
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
 
   constexpr bool kSingleSegment = true;  // For real time conversion
   const Node* begin_node = lattice.bos_node();
@@ -218,10 +238,11 @@ TEST_F(NBestGeneratorTest, SingleSegmentConnectionTest) {
                                     group, kSingleSegment);
   {
     nbest_generator->Reset(
-        begin_node, end_node,
-        {NBestGenerator::STRICT, NBestGenerator::CANDIDATE_MODE_NONE});
+        *begin_node, *end_node,
+        {NBestGenerator<CachingConnector<true>>::STRICT,
+         NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
     Segment result_segment;
-    nbest_generator->SetCandidates(request, "", 10, &result_segment);
+    nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
     // Top result should be inserted, but other candidates will be cut
     // due to boundary check.
     ASSERT_EQ(result_segment.candidates_size(), 1);
@@ -229,10 +250,11 @@ TEST_F(NBestGeneratorTest, SingleSegmentConnectionTest) {
   }
   {
     nbest_generator->Reset(
-        begin_node, end_node,
-        {NBestGenerator::ONLY_EDGE, NBestGenerator::FILL_INNER_SEGMENT_INFO});
+        *begin_node, *end_node,
+        {NBestGenerator<CachingConnector<true>>::ONLY_EDGE,
+         NBestGenerator<CachingConnector<true>>::FILL_INNER_SEGMENT_INFO});
     Segment result_segment;
-    nbest_generator->SetCandidates(request, "", 10, &result_segment);
+    nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
     // We can get several candidates.
     ASSERT_LT(1, result_segment.candidates_size());
     EXPECT_EQ(result_segment.candidate(0).value, "私の名前は中ノです");
@@ -270,27 +292,30 @@ TEST_F(NBestGeneratorTest, ProjectDictionaryAttributesSurviveNBest) {
           .SetProjectDictionary(*snapshot)
           .SetRequestType(ConversionRequest::CONVERSION)
           .Build();
-  converter.MakeLattice(request, &segments, &lattice);
+  converter.MakeLattice(request.options(), &segments, &lattice);
   const std::vector<uint16_t> group = converter.MakeGroup(segments);
-  converter.Viterbi(segments, &lattice);
+  converter.Viterbi(request.options(), segments, &lattice);
 
-  std::unique_ptr<NBestGenerator> nbest_generator =
-      data_and_converter->CreateNBestGenerator(lattice);
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
   const Node* begin_node = lattice.bos_node();
   const Node* end_node =
       GetEndNode(request, converter, segments, *begin_node, group, true);
   nbest_generator->Reset(
-      begin_node, end_node,
-      {NBestGenerator::ONLY_EDGE, NBestGenerator::CANDIDATE_MODE_NONE});
+      *begin_node, *end_node,
+      {NBestGenerator<CachingConnector<true>>::ONLY_EDGE,
+       NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
   Segment result_segment;
-  nbest_generator->SetCandidates(request, "", 20, &result_segment);
+  nbest_generator->SetCandidates(request.options(), "", 20, result_segment);
 
   const auto project_candidate = std::find_if(
       result_segment.candidates().begin(), result_segment.candidates().end(),
       [](const Candidate* candidate) { return candidate->value == "Codex辞書"; });
   ASSERT_NE(project_candidate, result_segment.candidates().end());
   const Candidate& candidate = **project_candidate;
-  EXPECT_NE(candidate.attributes & Attribute::PROJECT_DICTIONARY, 0);
+  EXPECT_NE(
+      candidate.ranking_constraints & RankingConstraint::PROJECT_DICTIONARY,
+      0);
   EXPECT_NE(candidate.attributes & Attribute::NO_LEARNING, 0);
   EXPECT_NE(candidate.attributes & Attribute::NO_DELETABLE, 0);
   EXPECT_NE(candidate.attributes & Attribute::NO_VARIANTS_EXPANSION, 0);
@@ -313,13 +338,13 @@ TEST_F(NBestGeneratorTest, InnerSegmentBoundary) {
   Lattice lattice;
   lattice.SetKey(kInput);
   const ConversionRequest request = ConvReq(ConversionRequest::PREDICTION);
-  converter.MakeLattice(request, &segments, &lattice);
+  converter.MakeLattice(request.options(), &segments, &lattice);
 
   const std::vector<uint16_t> group = converter.MakeGroup(segments);
-  converter.Viterbi(segments, &lattice);
+  converter.Viterbi(request.options(), segments, &lattice);
 
-  std::unique_ptr<NBestGenerator> nbest_generator =
-      data_and_converter->CreateNBestGenerator(lattice);
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
 
   constexpr bool kSingleSegment = true;  // For real time conversion
   const Node* begin_node = lattice.bos_node();
@@ -327,10 +352,11 @@ TEST_F(NBestGeneratorTest, InnerSegmentBoundary) {
                                     group, kSingleSegment);
 
   nbest_generator->Reset(
-      begin_node, end_node,
-      {NBestGenerator::ONLY_EDGE, NBestGenerator::FILL_INNER_SEGMENT_INFO});
+      *begin_node, *end_node,
+      {NBestGenerator<CachingConnector<true>>::ONLY_EDGE,
+       NBestGenerator<CachingConnector<true>>::FILL_INNER_SEGMENT_INFO});
   Segment result_segment;
-  nbest_generator->SetCandidates(request, "", 10, &result_segment);
+  nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
   ASSERT_LE(1, result_segment.candidates_size());
 
   const Candidate& top_cand = result_segment.candidate(0);
@@ -369,6 +395,29 @@ TEST_F(NBestGeneratorTest, InnerSegmentBoundary) {
   EXPECT_EQ(values[2], "行きたい");
   EXPECT_EQ(content_keys[2], "いきたい");
   EXPECT_EQ(content_values[2], "行きたい");
+
+  // The selected dictionary node path must expose the proper nouns embedded
+  // in a longer, single-candidate conversion, not only the first/last POS.
+  // Verify UTF-8 byte offsets against the actual candidate strings.
+  bool saw_tokyo = false;
+  bool saw_nagoya = false;
+  for (const converter::ProperNounSpan& span : top_cand.proper_noun_spans) {
+    ASSERT_LE(span.key_offset, top_cand.key.size());
+    ASSERT_LE(span.value_offset, top_cand.value.size());
+    EXPECT_EQ(top_cand.key.substr(span.key_offset, span.key.size()), span.key);
+    EXPECT_EQ(top_cand.value.substr(span.value_offset, span.value.size()),
+              span.value);
+    if (span.key == "とうきょう" && span.value == "東京") {
+      EXPECT_EQ(span.key_offset, 0);
+      EXPECT_EQ(span.value_offset, 0);
+      saw_tokyo = true;
+    }
+    if (span.key == "なごや" && span.value == "名古屋") {
+      saw_nagoya = true;
+    }
+  }
+  EXPECT_TRUE(saw_tokyo);
+  EXPECT_TRUE(saw_nagoya);
 }
 
 TEST_F(NBestGeneratorTest, NoPartialCandidateBetweenAlphabets) {
@@ -387,13 +436,13 @@ TEST_F(NBestGeneratorTest, NoPartialCandidateBetweenAlphabets) {
   Lattice lattice;
   lattice.SetKey(kInput);
   const ConversionRequest request = ConvReq(ConversionRequest::PREDICTION);
-  converter.MakeLattice(request, &segments, &lattice);
+  converter.MakeLattice(request.options(), &segments, &lattice);
 
   const std::vector<uint16_t> group = converter.MakeGroup(segments);
-  converter.Viterbi(segments, &lattice);
+  converter.Viterbi(request.options(), segments, &lattice);
 
-  std::unique_ptr<NBestGenerator> nbest_generator =
-      data_and_converter->CreateNBestGenerator(lattice);
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
 
   constexpr bool kSingleSegment = true;  // For real time conversion
   const Node* begin_node = lattice.bos_node();
@@ -403,14 +452,16 @@ TEST_F(NBestGeneratorTest, NoPartialCandidateBetweenAlphabets) {
   // Since the test dictionary contains "A", partial candidates "A" and "AA" can
   // be generated but they should be suppressed because they are split between
   // alphabets.
-  const NBestGenerator::Options options = {
-      .boundary_mode = NBestGenerator::ONLY_EDGE,
-      .candidate_mode = NBestGenerator::BUILD_FROM_ONLY_FIRST_INNER_SEGMENT |
-                        NBestGenerator::FILL_INNER_SEGMENT_INFO,
+  const NBestGenerator<CachingConnector<true>>::Options options = {
+      .boundary_mode = NBestGenerator<CachingConnector<true>>::ONLY_EDGE,
+      .candidate_mode =
+          NBestGenerator<
+              CachingConnector<true>>::BUILD_FROM_ONLY_FIRST_INNER_SEGMENT |
+          NBestGenerator<CachingConnector<true>>::FILL_INNER_SEGMENT_INFO,
   };
-  nbest_generator->Reset(begin_node, end_node, options);
+  nbest_generator->Reset(*begin_node, *end_node, options);
   Segment result_segment;
-  nbest_generator->SetCandidates(request, "", 10, &result_segment);
+  nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
   EXPECT_THAT(result_segment, HasSingleCandidate(::testing::Field(
                                   "value", &Candidate::value, "AAA")));
 }
@@ -431,23 +482,24 @@ TEST_F(NBestGeneratorTest, NoAlphabetsConnection2Nodes) {
   Lattice lattice;
   lattice.SetKey(kText);
   const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
-  converter.MakeLattice(request, &segments, &lattice);
+  converter.MakeLattice(request.options(), &segments, &lattice);
 
   const std::vector<uint16_t> group = converter.MakeGroup(segments);
-  converter.Viterbi(segments, &lattice);
+  converter.Viterbi(request.options(), segments, &lattice);
 
-  std::unique_ptr<NBestGenerator> nbest_generator =
-      data_and_converter->CreateNBestGenerator(lattice);
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
 
   constexpr bool kSingleSegment = true;  // For real time conversion
   const Node* begin_node = lattice.bos_node();
   const Node* end_node = GetEndNode(request, converter, segments, *begin_node,
                                     group, kSingleSegment);
   nbest_generator->Reset(
-      begin_node, end_node,
-      {NBestGenerator::ONLY_EDGE, NBestGenerator::FILL_INNER_SEGMENT_INFO});
+      *begin_node, *end_node,
+      {NBestGenerator<CachingConnector<true>>::ONLY_EDGE,
+       NBestGenerator<CachingConnector<true>>::FILL_INNER_SEGMENT_INFO});
   Segment result_segment;
-  nbest_generator->SetCandidates(request, "", 10, &result_segment);
+  nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
   // The test dictionary contains key value pairs (eu, EU) and (pho, pho), but
   // "EUpho" should not be generated as it is a concatenation of two alphabet
   // words. The only expected candidate is (eupho, eupho).
@@ -471,23 +523,24 @@ TEST_F(NBestGeneratorTest, NoAlphabetsConnection3Nodes) {
   Lattice lattice;
   lattice.SetKey(kText);
   const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
-  converter.MakeLattice(request, &segments, &lattice);
+  converter.MakeLattice(request.options(), &segments, &lattice);
 
   const std::vector<uint16_t> group = converter.MakeGroup(segments);
-  converter.Viterbi(segments, &lattice);
+  converter.Viterbi(request.options(), segments, &lattice);
 
-  std::unique_ptr<NBestGenerator> nbest_generator =
-      data_and_converter->CreateNBestGenerator(lattice);
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
 
   constexpr bool kSingleSegment = true;  // For real time conversion
   const Node* begin_node = lattice.bos_node();
   const Node* end_node = GetEndNode(request, converter, segments, *begin_node,
                                     group, kSingleSegment);
   nbest_generator->Reset(
-      begin_node, end_node,
-      {NBestGenerator::ONLY_EDGE, NBestGenerator::FILL_INNER_SEGMENT_INFO});
+      *begin_node, *end_node,
+      {NBestGenerator<CachingConnector<true>>::ONLY_EDGE,
+       NBestGenerator<CachingConnector<true>>::FILL_INNER_SEGMENT_INFO});
   Segment result_segment;
-  nbest_generator->SetCandidates(request, "", 10, &result_segment);
+  nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
   // Tne top candidate consists of two elements, "eupho" and "東京". Such
   // connection from English word to a normal word is possible.
   ASSERT_GE(result_segment.candidates_size(), 1);
@@ -496,6 +549,845 @@ TEST_F(NBestGeneratorTest, NoAlphabetsConnection3Nodes) {
   // However, we should not concatenate "EU", "pho", and "東京".
   for (size_t i = 0; i < result_segment.candidates_size(); ++i) {
     EXPECT_NE(result_segment.candidate(i).value, "EUpho東京");
+  }
+}
+
+TEST_F(NBestGeneratorTest, AlphabetsConnectionAcrossSegmentBoundary) {
+  auto data_and_converter = std::make_unique<MockDataAndImmutableConverter>();
+  ImmutableConverterTestPeer converter =
+      data_and_converter->GetConverterTestPeer();
+
+  Segments segments;
+  {
+    Segment* segment = segments.add_segment();
+    segment->set_segment_type(Segment::HISTORY);
+    segment->set_key("eu");
+    Candidate* candidate = segment->add_candidate();
+    candidate->key = "eu";
+    candidate->value = "EU";
+  }
+  {
+    Segment* segment = segments.add_segment();
+    segment->set_segment_type(Segment::FREE);
+    segment->set_key("pho");
+  }
+
+  Lattice lattice;
+  lattice.SetKey("pho");
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  converter.MakeLattice(request.options(), &segments, &lattice);
+
+  const std::vector<uint16_t> group = converter.MakeGroup(segments);
+  converter.Viterbi(request.options(), segments, &lattice);
+
+  std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+      data_and_converter->CreateNBestGenerator(lattice, request);
+
+  // Skip HIS_NODE(s) to find the begin_node for the conversion segment.
+  const Node* begin_node = lattice.bos_node();
+  for (const Node* node = lattice.bos_node()->next;
+       node->next != nullptr && node->node_type == Node::HIS_NODE;
+       node = node->next) {
+    begin_node = node;
+  }
+
+  constexpr bool kSingleSegment = false;
+  const Node* end_node = GetEndNode(request, converter, segments, *begin_node,
+                                    group, kSingleSegment);
+  nbest_generator->Reset(
+      *begin_node, *end_node,
+      {NBestGenerator<CachingConnector<true>>::STRICT,
+       NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
+  Segment result_segment;
+  nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
+  // Connection between "eu" and "pho" across the segment boundary should be
+  // allowed even though both keys end/start with alphabets.
+  ASSERT_GE(result_segment.candidates_size(), 1);
+  EXPECT_EQ(result_segment.candidate(0).value, "pho");
+}
+
+TEST_F(NBestGeneratorTest, ParticleOmissionBonusTest) {
+  auto data_and_converter = std::make_unique<MockDataAndImmutableConverter>();
+  ImmutableConverterTestPeer converter =
+      data_and_converter->GetConverterTestPeer();
+
+  // Case 1: Noun ("あんけーと") + Verb ("ひかえる")
+  {
+    Segments segments;
+    {
+      Segment* segment = segments.add_segment();
+      segment->set_segment_type(Segment::FREE);
+      segment->set_key("あんけーと");
+      segment = segments.add_segment();
+      segment->set_segment_type(Segment::FREE);
+      segment->set_key("ひかえる");
+    }
+
+    Lattice lattice_without_bonus;
+    lattice_without_bonus.SetKey("あんけーとひかえる");
+
+    int cost_without_bonus = 0;
+    {
+      const ConversionRequest request =
+          ConversionRequestBuilder()
+              .SetRequestType(ConversionRequest::CONVERSION)
+              .Build();
+      converter.MakeLattice(request.options(), &segments,
+                            &lattice_without_bonus);
+      const std::vector<uint16_t> group = converter.MakeGroup(segments);
+      converter.Viterbi(request.options(), segments, &lattice_without_bonus);
+
+      std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+          data_and_converter->CreateNBestGenerator(lattice_without_bonus,
+                                                   request);
+      const Node* begin_node = lattice_without_bonus.bos_node();
+      const Node* end_node =
+          GetEndNode(request, converter, segments, *begin_node, group, false);
+      nbest_generator->Reset(
+          *begin_node, *end_node,
+          {NBestGenerator<CachingConnector<true>>::STRICT,
+           NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
+      Segment result_segment;
+      nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
+      ASSERT_GE(result_segment.candidates_size(), 1);
+      EXPECT_EQ(result_segment.candidate(0).value, "アンケート");
+      cost_without_bonus = result_segment.candidate(0).cost;
+    }
+
+    int cost_bonus_2000 = 0;
+    {
+      commands::Request request_proto;
+      request_proto.mutable_decoder_experiment_params()
+          ->set_particle_omission_transition_cost_bonus(2000);
+      const ConversionRequest request =
+          ConversionRequestBuilder()
+              .SetRequest(request_proto)
+              .SetRequestType(ConversionRequest::CONVERSION)
+              .Build();
+
+      Lattice lattice_with_bonus;
+      lattice_with_bonus.SetKey("あんけーとひかえる");
+      converter.MakeLattice(request.options(), &segments, &lattice_with_bonus);
+      const std::vector<uint16_t> group = converter.MakeGroup(segments);
+      converter.Viterbi(request.options(), segments, &lattice_with_bonus);
+
+      std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+          data_and_converter->CreateNBestGenerator(lattice_with_bonus, request);
+      const Node* begin_node = lattice_with_bonus.bos_node();
+      const Node* end_node =
+          GetEndNode(request, converter, segments, *begin_node, group, false);
+      nbest_generator->Reset(
+          *begin_node, *end_node,
+          {NBestGenerator<CachingConnector<true>>::STRICT,
+           NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
+      Segment result_segment;
+      nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
+      ASSERT_GE(result_segment.candidates_size(), 1);
+      EXPECT_EQ(result_segment.candidate(0).value, "アンケート");
+      cost_bonus_2000 = result_segment.candidate(0).cost;
+    }
+
+    int cost_bonus_2001 = 0;
+    {
+      commands::Request request_proto;
+      request_proto.mutable_decoder_experiment_params()
+          ->set_particle_omission_transition_cost_bonus(2001);
+      const ConversionRequest request =
+          ConversionRequestBuilder()
+              .SetRequest(request_proto)
+              .SetRequestType(ConversionRequest::CONVERSION)
+              .Build();
+
+      Lattice lattice_with_bonus;
+      lattice_with_bonus.SetKey("あんけーとひかえる");
+      converter.MakeLattice(request.options(), &segments, &lattice_with_bonus);
+      const std::vector<uint16_t> group = converter.MakeGroup(segments);
+      converter.Viterbi(request.options(), segments, &lattice_with_bonus);
+
+      std::unique_ptr<NBestGenerator<CachingConnector<true>>> nbest_generator =
+          data_and_converter->CreateNBestGenerator(lattice_with_bonus, request);
+      const Node* begin_node = lattice_with_bonus.bos_node();
+      const Node* end_node =
+          GetEndNode(request, converter, segments, *begin_node, group, false);
+      nbest_generator->Reset(
+          *begin_node, *end_node,
+          {NBestGenerator<CachingConnector<true>>::STRICT,
+           NBestGenerator<CachingConnector<true>>::CANDIDATE_MODE_NONE});
+      Segment result_segment;
+      nbest_generator->SetCandidates(request.options(), "", 10, result_segment);
+      ASSERT_GE(result_segment.candidates_size(), 1);
+      EXPECT_EQ(result_segment.candidate(0).value, "アンケート");
+      cost_bonus_2001 = result_segment.candidate(0).cost;
+    }
+
+    // Cost should be reduced by 1 for bonus 2001 compared to 2000.
+    EXPECT_EQ(cost_bonus_2000 - cost_bonus_2001, 1);
+  }
+}
+
+
+// These tests use synthetic lattice nodes.  They neither require daily-profile
+// data nor rely on whichever candidate happened to rank first.
+TEST_F(NBestGeneratorTest, GeneralNounFullNameRecoveredFromLattice) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();  // general noun
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();  // surname
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();  // given name
+  lattice.Insert(std::string("みかみ").size(), given);
+
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  const auto& span = candidate.proper_noun_spans[0];
+  EXPECT_EQ(span.key, "みかみあい");
+  EXPECT_EQ(span.value, "見上愛");
+  EXPECT_EQ(span.key_offset, 0);
+  EXPECT_EQ(span.value_offset, 0);
+  ASSERT_EQ(span.token_readings.size(), 2);
+  EXPECT_EQ(span.token_readings[0], "みかみ");
+  EXPECT_EQ(span.token_readings[1], "あい");
+  EXPECT_TRUE(span.verified_personal_full_name);
+}
+
+TEST_F(NBestGeneratorTest, GeneralNounNotProtectedWithoutExactNamePair) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, surname);
+  // The given-name reading matches, but its surface does NOT.
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "アイ";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), given);
+
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+TEST_F(NBestGeneratorTest, UserDictionaryDecompositionCannotProveFullName) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();
+  surname->attributes |= Node::USER_DICTIONARY;
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), given);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+TEST_F(NBestGeneratorTest, FullNameDictionaryNodeCarriesStrongEvidence) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("さとうあい");
+  auto* full = lattice.NewNode();
+  full->key = "さとうあい";
+  full->value = "佐藤愛";
+  full->lid = fixture->GetPosMatcher().GetLastNameId();
+  full->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(0, full);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {full};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+TEST_F(NBestGeneratorTest, TwoSelectedNameNodesFormOneStrongFullName) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), given);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {surname, given};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+TEST_F(NBestGeneratorTest, AmbiguousSurnameGivenSplitsAreNotPromoted) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("みかみあい");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = fixture->GetPosMatcher().GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* family1 = lattice.NewNode();
+  family1->key = "みかみ";
+  family1->value = "見上";
+  family1->lid = family1->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, family1);
+  auto* name1 = lattice.NewNode();
+  name1->key = "あい";
+  name1->value = "愛";
+  name1->lid = name1->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("みかみ").size(), name1);
+  auto* family2 = lattice.NewNode();
+  family2->key = "み";
+  family2->value = "見";
+  family2->lid = family2->rid = fixture->GetPosMatcher().GetLastNameId();
+  lattice.Insert(0, family2);
+  auto* name2 = lattice.NewNode();
+  name2->key = "かみあい";
+  name2->value = "上愛";
+  name2->lid = name2->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(std::string("み").size(), name2);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+TEST_F(NBestGeneratorTest, SingleAmbiguousGivenNameIsNotStrongFullName) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  Lattice lattice;
+  lattice.SetKey("あい");
+  auto* single = lattice.NewNode();
+  single->key = "あい";
+  single->value = "愛";
+  single->lid = single->rid = fixture->GetPosMatcher().GetFirstNameId();
+  lattice.Insert(0, single);
+  const ConversionRequest request = ConvReq(ConversionRequest::CONVERSION);
+  auto generator = fixture->CreateNBestGenerator(lattice, request);
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {single};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_FALSE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+
+// v8.2: Evidence must survive a following particle, without protecting it.
+TEST_F(NBestGeneratorTest, GeneralNounFullNameBeforeParticle) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいが");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto* particle = lattice.NewNode();
+  particle->key = "が";
+  particle->value = "が";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(whole->key.size(), particle);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  const auto& span = candidate.proper_noun_spans[0];
+  EXPECT_EQ(span.key, "みかみあい");
+  EXPECT_EQ(span.value, "見上愛");
+  EXPECT_EQ(span.key_offset, 0);
+  EXPECT_EQ(span.value_offset, 0);
+  EXPECT_TRUE(span.verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "見上愛が");
+}
+
+TEST_F(NBestGeneratorTest, EmbeddedNameAtSelectedNodeBoundaryHasOffsets) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("きょうはみかみあいが");
+  auto* prefix = lattice.NewNode();
+  prefix->key = "きょうは";
+  prefix->value = "今日は";
+  prefix->lid = prefix->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, prefix);
+  const auto name_offset = prefix->key.size();
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(name_offset, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(name_offset, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(name_offset + surname->key.size(), given);
+  auto* particle = lattice.NewNode();
+  particle->key = "が";
+  particle->value = "が";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(name_offset + whole->key.size(), particle);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {prefix, whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_EQ(candidate.proper_noun_spans[0].key_offset, prefix->key.size());
+  EXPECT_EQ(candidate.proper_noun_spans[0].value_offset, prefix->value.size());
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+}
+
+// Even if a whole candidate is one general-noun node, a validated external
+// functional suffix boundary permits guarding only the name prefix.
+TEST_F(NBestGeneratorTest, WholeNodeWithFunctionalSuffixCanGuardNamePrefix) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいが");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあいが";
+  whole->value = "見上愛が";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto* functional = lattice.NewNode();
+  functional->key = "が";
+  functional->value = "が";
+  // Functional suffix should be a grammatical particle in real data.  The
+  // mock table offers a stable functional POS through the rule getter.
+  functional->lid = functional->rid = pos.GetFunctionalId();
+  lattice.Insert(surname->key.size() + given->key.size(), functional);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].key, "みかみあい");
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+}
+
+TEST_F(NBestGeneratorTest, WholeNodeWithoutFunctionalSuffixRemainsUnguarded) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいが");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあいが";
+  whole->value = "見上愛が";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  EXPECT_TRUE(candidate.proper_noun_spans.empty());
+}
+
+
+// v8.3: A large number of unrelated nodes at the surname's start position
+// must not suppress exact surname+given-name evidence. v8.2's raw 192-node
+// traversal budget rejected this case before reaching the surname node.
+TEST_F(NBestGeneratorTest, UnrelatedPrefixNodesCannotExhaustNameEvidence) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいの");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  for (int i = 0; i < 210; ++i) {
+    auto* unrelated = lattice.NewNode();
+    unrelated->key = "み";
+    unrelated->value = "み";
+    unrelated->lid = unrelated->rid = pos.GetGeneralNounId();
+    lattice.Insert(0, unrelated);
+  }
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  auto* particle = lattice.NewNode();
+  particle->key = "の";
+  particle->value = "の";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(whole->key.size(), particle);
+
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].key, "みかみあい");
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "見上愛の");
+}
+
+// v8.3: v8.2 found the exact given name but discarded it because unrelated
+// candidates at its position pushed the total examined count above 192.
+TEST_F(NBestGeneratorTest, UnrelatedGivenPositionNodesCannotDiscardNameEvidence) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("みかみあいから");
+  auto* whole = lattice.NewNode();
+  whole->key = "みかみあい";
+  whole->value = "見上愛";
+  whole->lid = whole->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, whole);
+  auto* surname = lattice.NewNode();
+  surname->key = "みかみ";
+  surname->value = "見上";
+  surname->lid = surname->rid = pos.GetLastNameId();
+  lattice.Insert(0, surname);
+  auto* given = lattice.NewNode();
+  given->key = "あい";
+  given->value = "愛";
+  given->lid = given->rid = pos.GetFirstNameId();
+  lattice.Insert(surname->key.size(), given);
+  for (int i = 0; i < 210; ++i) {
+    auto* unrelated = lattice.NewNode();
+    unrelated->key = "あ";
+    unrelated->value = "あ";
+    unrelated->lid = unrelated->rid = pos.GetGeneralNounId();
+    lattice.Insert(surname->key.size(), unrelated);
+  }
+  auto* particle = lattice.NewNode();
+  particle->key = "から";
+  particle->value = "から";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(whole->key.size(), particle);
+
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {whole, particle};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1);
+  EXPECT_EQ(candidate.proper_noun_spans[0].key, "みかみあい");
+  EXPECT_EQ(candidate.proper_noun_spans[0].value, "見上愛");
+  EXPECT_TRUE(candidate.proper_noun_spans[0].verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "見上愛から");
+}
+
+// A geographic proper noun can contain its regional suffix in one node.
+// Never promote an ordinary noun or a mismatched suffix to proper-name proof.
+TEST_F(NBestGeneratorTest, GeographicCompoundRequiresMatchingPOSAndEnding) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  const uint16_t geographic_lid = pos.GetGeographicProperNounId();
+  const uint16_t city_rid = pos.GetGeographicCitySuffixId();
+  const uint16_t town_rid = pos.GetGeographicTownSuffixId();
+  ASSERT_TRUE(pos.IsGeographicProperNoun(geographic_lid));
+  ASSERT_TRUE(pos.IsGeographicSuffix(city_rid));
+  ASSERT_TRUE(pos.IsGeographicCitySuffix(city_rid));
+  ASSERT_TRUE(pos.IsGeographicTownSuffix(town_rid));
+  ASSERT_FALSE(pos.IsGeographicTownSuffix(city_rid));
+
+  const auto verify = [&](absl::string_view key, absl::string_view value,
+                          uint16_t lid, uint16_t rid, bool expected,
+                          bool user_dictionary = false) {
+    Lattice lattice;
+    lattice.SetKey(std::string(key));
+    auto* node = lattice.NewNode();
+    node->key = std::string(key);
+    node->value = std::string(value);
+    node->lid = lid;
+    node->rid = rid;
+    if (user_dictionary) {
+      node->attributes |= Node::USER_DICTIONARY;
+    }
+    lattice.Insert(0, node);
+
+    auto generator = fixture->CreateNBestGenerator(
+        lattice, ConvReq(ConversionRequest::CONVERSION));
+    NBestGeneratorTestPeer peer(*generator);
+    const std::vector<const Node*> selected = {node};
+    Candidate candidate;
+    peer.MakeCandidate(candidate, 0, 0, 0,
+                       absl::Span<const Node* const>(selected.data(),
+                                                     selected.size()));
+    ASSERT_EQ(candidate.proper_noun_spans.size(), expected ? 1u : 0u)
+        << std::string(key) << " / " << std::string(value);
+    if (expected) {
+      ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+      EXPECT_EQ(candidate.proper_noun_spans[0].key, std::string(key));
+      EXPECT_EQ(candidate.proper_noun_spans[0].value, std::string(value));
+      EXPECT_EQ(candidate.proper_noun_spans[0].key_offset, 0u);
+      EXPECT_EQ(candidate.proper_noun_spans[0].value_offset, 0u);
+      EXPECT_FALSE(candidate.proper_noun_spans[0].verified_personal_full_name);
+    }
+  };
+
+  verify("あいおいし", "相生市", geographic_lid, city_rid, true);
+  verify("あいおいちょう", "相生町", geographic_lid, town_rid, true);
+  verify("あいおいまち", "相生町", geographic_lid, town_rid, true);
+  verify("しぶやく", "渋谷区", geographic_lid,
+         pos.GetGeographicWardSuffixId(), true);
+  verify("あおがしまむら", "青ヶ島村", geographic_lid,
+         pos.GetGeographicVillageSuffixId(), true);
+  verify("やまぐちけん", "山口県", geographic_lid,
+         pos.GetGeographicPrefectureKenSuffixId(), true);
+  verify("おおさかふ", "大阪府", geographic_lid,
+         pos.GetGeographicPrefectureFuSuffixId(), true);
+  verify("えちぜんぐん", "越前郡", geographic_lid,
+         pos.GetGeographicCountySuffixId(), true);
+  verify("はかたえき", "博多駅", geographic_lid,
+         pos.GetGeographicStationSuffixId(), true);
+
+  // The ending must agree with the exact regional-suffix subtype, not merely
+  // with some ending in the region family. Generic region suffix is unsafe.
+  verify("あいおいまち", "相生町", geographic_lid, city_rid, false);
+  verify("あいおいし", "相生市", geographic_lid, town_rid, false);
+  verify("あいおいし", "相生市", geographic_lid,
+         pos.GetGeographicSuffixId(), false);
+  verify("あいおいし", "相生市", pos.GetGeneralNounId(), city_rid, false);
+  verify("あいおいし", "相生市", geographic_lid,
+         pos.GetGeneralNounId(), false);
+  verify("あいおいし", "相生市", pos.GetLastNameId(), city_rid, false);
+  verify("あいおいか", "相生市", geographic_lid, city_rid, false);
+  verify("あいおいし", "相生山", geographic_lid, city_rid, false);
+  verify("あいおいし", "相生市", geographic_lid, city_rid, false, true);
+}
+
+TEST_F(NBestGeneratorTest, GeographicCompoundSpanDoesNotIncludeSurroundingText) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+  Lattice lattice;
+  lattice.SetKey("きょうはあいおいしにいく");
+  auto* prefix = lattice.NewNode();
+  prefix->key = "きょうは";
+  prefix->value = "今日は";
+  prefix->lid = prefix->rid = pos.GetGeneralNounId();
+  lattice.Insert(0, prefix);
+  auto* place = lattice.NewNode();
+  place->key = "あいおいし";
+  place->value = "相生市";
+  place->lid = pos.GetGeographicProperNounId();
+  place->rid = pos.GetGeographicCitySuffixId();
+  lattice.Insert(prefix->key.size(), place);
+  auto* particle = lattice.NewNode();
+  particle->key = "に";
+  particle->value = "に";
+  particle->lid = particle->rid = pos.GetGeneralNounId();
+  lattice.Insert(prefix->key.size() + place->key.size(), particle);
+  auto* verb = lattice.NewNode();
+  verb->key = "いく";
+  verb->value = "行く";
+  verb->lid = verb->rid = pos.GetGeneralNounId();
+  lattice.Insert(prefix->key.size() + place->key.size() + particle->key.size(),
+                 verb);
+  auto generator = fixture->CreateNBestGenerator(
+      lattice, ConvReq(ConversionRequest::CONVERSION));
+  NBestGeneratorTestPeer peer(*generator);
+  const std::vector<const Node*> selected = {prefix, place, particle, verb};
+  Candidate candidate;
+  peer.MakeCandidate(candidate, 0, 0, 0,
+                     absl::Span<const Node* const>(selected.data(),
+                                                   selected.size()));
+  ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+  const auto& span = candidate.proper_noun_spans[0];
+  EXPECT_EQ(span.key, "あいおいし");
+  EXPECT_EQ(span.value, "相生市");
+  EXPECT_EQ(span.key_offset, prefix->key.size());
+  EXPECT_EQ(span.value_offset, prefix->value.size());
+  EXPECT_FALSE(span.verified_personal_full_name);
+  EXPECT_EQ(candidate.value, "今日は相生市に行く");
+}
+
+TEST_F(NBestGeneratorTest, AmbiguousCityHasSameFullSpanForOneOrTwoNodes) {
+  auto fixture = std::make_unique<MockDataAndImmutableConverter>();
+  const auto& pos = fixture->GetPosMatcher();
+
+  // One selected dictionary node with a regional city suffix RID.
+  {
+    Lattice lattice;
+    lattice.SetKey("あきたし");
+    auto* place = lattice.NewNode();
+    place->key = "あきたし";
+    place->value = "秋田市";
+    place->lid = pos.GetGeographicProperNounId();
+    place->rid = pos.GetGeographicCitySuffixId();
+    lattice.Insert(0, place);
+    auto generator = fixture->CreateNBestGenerator(
+        lattice, ConvReq(ConversionRequest::CONVERSION));
+    NBestGeneratorTestPeer peer(*generator);
+    const std::vector<const Node*> selected = {place};
+    Candidate candidate;
+    peer.MakeCandidate(candidate, 0, 0, 0,
+                       absl::Span<const Node* const>(selected.data(),
+                                                     selected.size()));
+    ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+    EXPECT_EQ(candidate.proper_noun_spans[0].key, "あきたし");
+    EXPECT_EQ(candidate.proper_noun_spans[0].value, "秋田市");
+    EXPECT_EQ(candidate.proper_noun_spans[0].token_readings,
+              (std::vector<std::string>{"あきたし"}));
+  }
+
+  // Alternative selected path: ordinary geographical noun + city ending.
+  {
+    Lattice lattice;
+    lattice.SetKey("あきたし");
+    auto* place = lattice.NewNode();
+    place->key = "あきた";
+    place->value = "秋田";
+    place->lid = place->rid = pos.GetGeographicProperNounId();
+    lattice.Insert(0, place);
+    auto* suffix = lattice.NewNode();
+    suffix->key = "し";
+    suffix->value = "市";
+    suffix->lid = suffix->rid = pos.GetGeneralNounId();
+    lattice.Insert(place->key.size(), suffix);
+    auto generator = fixture->CreateNBestGenerator(
+        lattice, ConvReq(ConversionRequest::CONVERSION));
+    NBestGeneratorTestPeer peer(*generator);
+    const std::vector<const Node*> selected = {place, suffix};
+    Candidate candidate;
+    peer.MakeCandidate(candidate, 0, 0, 0,
+                       absl::Span<const Node* const>(selected.data(),
+                                                     selected.size()));
+    ASSERT_EQ(candidate.proper_noun_spans.size(), 1u);
+    EXPECT_EQ(candidate.proper_noun_spans[0].key, "あきたし");
+    EXPECT_EQ(candidate.proper_noun_spans[0].value, "秋田市");
+    EXPECT_EQ(candidate.proper_noun_spans[0].token_readings,
+              (std::vector<std::string>{"あきた", "し"}));
   }
 }
 

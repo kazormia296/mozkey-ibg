@@ -1,3 +1,4 @@
+import itertools
 import os
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ def _create_runtime(top_dir: Path, *, oss: bool):
         top_dir
         / "root/Library/Input Methods"
         / f"{name}.app/Contents/Resources"
-        / f"{name}Converter.app/Contents/Resources"
+        / "ZenzRuntime"
     )
     models = resources / "models"
     licenses = resources / "licenses"
@@ -24,8 +25,9 @@ def _create_runtime(top_dir: Path, *, oss: bool):
     expected = {
         resources / "llama-server": 0o755,
         resources / "mozc_zenz_scorer": 0o755,
+        resources / "mozc_zenz_guard": 0o755,
         models / target._ZENZ_MODEL_NAME: 0o644,
-        resources / "zenz-runtime-manifest.json": 0o644,
+        resources / "BUILD-CONTRACT.txt": 0o644,
     }
     expected.update(
         {
@@ -54,21 +56,22 @@ class TweakInstallerFilesRuntimeLayoutTest(unittest.TestCase):
                     top_dir
                     / "root/Library/Input Methods"
                     / f"{expected_brand}.app/Contents/Resources"
-                    / f"{expected_brand}Converter.app/Contents/Resources",
+                    / "ZenzRuntime",
                 )
                 for path, expected_mode in expected.items():
                     self.assertEqual(path.stat().st_mode & 0o777, expected_mode)
 
     def test_rejects_missing_empty_and_symlinked_runtime_files(self):
         mutations = ("missing", "empty", "symlink")
-        for mutation in mutations:
+        names = ("llama-server", "mozc_zenz_guard", "BUILD-CONTRACT.txt")
+        for mutation, runtime_name in itertools.product(mutations, names):
             with (
-                self.subTest(mutation=mutation),
+                self.subTest(mutation=mutation, runtime_name=runtime_name),
                 tempfile.TemporaryDirectory() as temporary,
             ):
                 top_dir = Path(temporary) / "installer"
                 resources, _ = _create_runtime(top_dir, oss=True)
-                server = resources / "llama-server"
+                server = resources / runtime_name
                 if mutation == "missing":
                     server.unlink()
                 elif mutation == "empty":
@@ -150,12 +153,13 @@ class TweakInstallerFilesRuntimeLayoutTest(unittest.TestCase):
 class TweakInstallerFilesCodesignTest(unittest.TestCase):
     def test_signs_nested_runtime_before_enclosing_app(self):
         with tempfile.TemporaryDirectory() as temporary:
-            app = Path(temporary) / "MozkeyIbGConverter.app"
-            resources = app / "Contents/Resources"
+            app = Path(temporary) / "MozkeyIbG.app"
+            resources = app / "Contents/Resources/ZenzRuntime"
             resources.mkdir(parents=True)
             server = resources / "llama-server"
             scorer = resources / "mozc_zenz_scorer"
-            for executable in (server, scorer):
+            guard = resources / "mozc_zenz_guard"
+            for executable in (server, scorer, guard):
                 executable.write_bytes(b"mach-o fixture")
                 executable.chmod(0o755)
 
@@ -164,7 +168,9 @@ class TweakInstallerFilesCodesignTest(unittest.TestCase):
 
             commands = [call.args[0] for call in run.call_args_list]
             signed_targets = [Path(command[-1]) for command in commands]
-            self.assertEqual(set(signed_targets[:2]), {server, scorer})
+            # Each helper is signed exactly once, before the enclosing app.
+            self.assertEqual(len(signed_targets), 4)
+            self.assertEqual(set(signed_targets[:3]), {server, scorer, guard})
             self.assertEqual(signed_targets[-1], app)
 
     def test_release_identity_enables_timestamped_hardened_runtime(self):

@@ -30,11 +30,15 @@ bool HasCompleteWindowsZenzRuntime(
 
 bool HasCompleteMacosZenzRuntime(
     const std::function<bool(absl::string_view)> &file_probe) {
-  constexpr std::array<absl::string_view, 4> kRequiredFiles = {
+  // Upstream Mozkey v1.0.0 macOS runtime layout (Resources/ZenzRuntime): the
+  // scorer always starts llama-server through mozc_zenz_guard, and the staged
+  // runtime carries its source contract next to the worker.
+  constexpr std::array<absl::string_view, 5> kRequiredFiles = {
       "mozc_zenz_scorer",
+      "mozc_zenz_guard",
       "llama-server",
       "models/zenz-v3.2-small-Q5_K_M.gguf",
-      "zenz-runtime-manifest.json",
+      "BUILD-CONTRACT.txt",
   };
   for (const absl::string_view path : kRequiredFiles) {
     if (!file_probe(path)) {

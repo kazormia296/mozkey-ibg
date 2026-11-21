@@ -68,8 +68,10 @@ QString ReplaceString(const QString &str) {
           "https://support.google.com/gboard/community?hl=ja");
   Replace(replaced, "[ForumName]", QObject::tr("product forum"));
 #else  // GOOGLE_JAPANESE_INPUT_BUILD
-  Replace(replaced, "[ProductUrl]", "https://github.com/koyasi777/mozkey");
-  Replace(replaced, "[ForumUrl]", "https://github.com/koyasi777/mozkey/issues");
+  Replace(replaced, "[ProductUrl]",
+          "https://github.com/kazormia296/mozkey-ibg");
+  Replace(replaced, "[ForumUrl]",
+          "https://github.com/kazormia296/mozkey-ibg/issues");
   Replace(replaced, "[ForumName]", QObject::tr("issues"));
 #endif  // GOOGLE_JAPANESE_INPUT_BUILD
 
@@ -98,9 +100,7 @@ AboutDialog::AboutDialog(QWidget *parent)
 #ifdef GOOGLE_JAPANESE_INPUT_BUILD
   const std::string version_info = "(" + Version::GetMozcVersion() + ")";
 #else  // GOOGLE_JAPANESE_INPUT_BUILD
-  const std::string version_info =
-      Version::GetMozkeyReleaseVersion() + "\nBuild " +
-      Version::GetMozcVersion();
+  const std::string version_info = Version::GetMozkeyReleaseVersion();
 #endif  // GOOGLE_JAPANESE_INPUT_BUILD
   version_label->setText(QLatin1String(version_info.c_str()));
   GuiUtil::ReplaceWidgetLabels(this);

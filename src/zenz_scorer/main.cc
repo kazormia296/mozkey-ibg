@@ -1,11 +1,15 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 
+// Windows SDK headers require Winsock and Windows types before bcrypt/sddl.
+// clang-format off
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <bcrypt.h>
 #include <sddl.h>
 #include <winhttp.h>
+// clang-format on
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -49,9 +53,12 @@
 
 #include "session/zenz_diagnostic.h"
 #include "session/zenz_named_pipe_endpoint.h"
+#include "zenz/zenz_wire_protocol.h"
 #include "zenz_scorer/json_parser.h"
 
 #if defined(_WIN32)
+#include "zenz_scorer/synchronous_io_deadline.h"
+
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Bcrypt.lib")
 #pragma comment(lib, "Winhttp.lib")
@@ -60,15 +67,52 @@
 
 namespace {
 
+using ::mozc::zenz::kZenzWireKindRequest;
+using ::mozc::zenz::kZenzWireKindResponse;
+using ::mozc::zenz::kZenzWireMagic;
+using ::mozc::zenz::kZenzWireStatusError;
+using ::mozc::zenz::kZenzWireStatusOk;
+using ::mozc::zenz::kZenzWireStatusTimeout;
+using ::mozc::zenz::ZenzWireResponseHeader;
+
+// Mozkey IbG extends upstream's v1 scorer request with the inference device
+// selected by Config.zenz_live_correction_device.  The request header carries
+// one extra length field and the device name follows the prompt, so this
+// scorer and the Mozkey IbG client (session/zenz_named_pipe_client.cc) speak
+// version 2.  Keep this layout in sync with the client.  Magic, kinds,
+// statuses and the response header are shared with //zenz:wire_protocol.
+constexpr uint16_t kZenzWireVersion = 2;
+
+#pragma pack(push, 1)
+struct ZenzWireRequestHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t kind;
+  uint32_t generation;
+  uint32_t timeout_msec;
+  uint32_t max_output_chars;
+  uint32_t prompt_size;
+  uint32_t backend_device_size;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(ZenzWireRequestHeader) == 28);
+
 std::atomic<bool> g_llama_launch_started{false};
-std::atomic<bool> g_llama_ready_probe_started{false};
 std::atomic<bool> g_llama_server_ready{false};
 std::atomic<bool> g_shutdown_requested{false};
-#if !defined(_WIN32)
+#if defined(_WIN32)
+// Loopback port of the supervised llama-server; 0 while none is running.
+std::atomic<int> g_llama_port{0};
+#else
+// The POSIX runtime keeps a separate readiness-probe thread.
+std::atomic<bool> g_llama_ready_probe_started{false};
 volatile sig_atomic_t g_posix_shutdown_requested = 0;
 #endif
 
+#if !defined(_WIN32)
 constexpr int kRandomPortMin = 49152;
+#endif
 constexpr int kRandomPortMax = 65535;
 
 #if defined(_WIN32)
@@ -80,7 +124,10 @@ class LoopbackPortReservation {
   ~LoopbackPortReservation() { Close(); }
 
   bool Reserve(int requested_port) {
-    if (requested_port < kRandomPortMin || requested_port > kRandomPortMax) {
+    // The port is assigned by the OS (FindAvailableLoopbackPort), so only
+    // reject values that cannot be a TCP port at all; the dynamic port range
+    // is administrator-configurable on Windows.
+    if (requested_port <= 0 || requested_port > kRandomPortMax) {
       return false;
     }
 
@@ -289,6 +336,7 @@ std::string g_effective_backend_device;
 #if defined(_WIN32)
 HANDLE g_llama_process = nullptr;
 HANDLE g_llama_job = nullptr;
+DWORD g_llama_process_id = 0;
 
 constexpr wchar_t kSingleInstanceMutexName[] =
     LR"(Local\MozkeyIbGZenzScorerSingleInstance)";
@@ -307,15 +355,11 @@ constexpr int kDefaultCtx = 256;
 constexpr int kDefaultThreads = 4;
 constexpr int kDefaultNPredict = 64;
 constexpr char kDefaultFlashAttention[] = "auto";
-
-constexpr uint32_t kZenzWireMagic = 0x315A4E5A;  // "ZNZ1"
-constexpr uint16_t kZenzWireVersion = 2;
-constexpr uint16_t kZenzWireKindRequest = 1;
-constexpr uint16_t kZenzWireKindResponse = 2;
-
-constexpr uint32_t kStatusOk = 0;
-constexpr uint32_t kStatusError = 1;
-constexpr uint32_t kStatusTimeout = 2;
+#if defined(_WIN32)
+constexpr int kMaxLlamaLaunchAttempts = 3;
+constexpr int kLlamaReadyProbeAttempts = 120;
+constexpr int kLlamaReadyProbeIntervalMsec = 500;
+#endif
 
 // Minimum wait budget used only while llama-server is still loading.
 // The actual completion request still uses the request timeout from Mozc.
@@ -330,7 +374,14 @@ constexpr uint32_t kMaxRequestTimeoutMsec = 5000;
 // llama-server is usable.  Give it the full request budget: a shorter probe
 // can permanently keep the scorer in server_loading when inference succeeds
 // within the client SLA but takes longer than the probe-only timeout.
+// (Mozkey IbG keeps this instead of upstream's 1500 msec probe timeout.)
 constexpr uint32_t kLlamaReadyProbeTimeoutMsec = kMaxRequestTimeoutMsec;
+#if defined(_WIN32)
+constexpr uint32_t kPipeConnectSafetyTimeoutMsec = 1000;
+constexpr uint32_t kPipeIoSafetyTimeoutMsec =
+    kMinLlamaReadyWaitMsec + kMaxRequestTimeoutMsec + 1500;
+constexpr uint32_t kPipeFlushSafetyTimeoutMsec = 1000;
+#endif
 constexpr size_t kMaxHttpResponseBytes = 65536;
 constexpr uint32_t kMaxBackendDeviceBytes = 128;
 
@@ -339,37 +390,12 @@ constexpr int kMaxCtx = 1024;
 constexpr int kMaxThreads = 16;
 constexpr int kMaxNPredict = 256;
 
-#pragma pack(push, 1)
-struct ZenzWireRequestHeader {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t kind;
-  uint32_t generation;
-  uint32_t timeout_msec;
-  uint32_t max_output_chars;
-  uint32_t prompt_size;
-  uint32_t backend_device_size;
-};
-
-struct ZenzWireResponseHeader {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t kind;
-  uint32_t generation;
-  uint32_t status;
-  uint32_t latency_msec;
-  uint32_t value_size;
-  uint32_t debug_size;
-};
-#pragma pack(pop)
-
 #if defined(_WIN32)
 struct Options {
   std::wstring pipe_name;
   std::wstring host = kDefaultHost;
-  int port = 0;
   std::string api_key;
-  bool random_ok = false;
+  bool api_key_ok = false;
 
   int ctx = kDefaultCtx;
   int threads = kDefaultThreads;
@@ -530,16 +556,6 @@ std::string HexEncode(const uint8_t* data, size_t size) {
   return output;
 }
 
-int GenerateRandomPort() {
-  uint32_t value = 0;
-  if (!FillRandomBytes(&value, sizeof(value))) {
-    return 0;
-  }
-
-  constexpr int kRange = kRandomPortMax - kRandomPortMin + 1;
-  return kRandomPortMin + static_cast<int>(value % kRange);
-}
-
 std::string GenerateApiKey() {
   std::vector<uint8_t> bytes(kApiKeyBytes);
   if (!FillRandomBytes(bytes.data(), bytes.size())) {
@@ -607,11 +623,8 @@ Options LoadOptions() {
         JoinPath(JoinPath(exe_dir, L"models"), L"zenz-v3.2-small-Q5_K_M.gguf");
   }
 
-  options.port = GenerateRandomPort();
   options.api_key = GenerateApiKey();
-  options.random_ok = options.port >= kRandomPortMin &&
-                      options.port <= kRandomPortMax &&
-                      !options.api_key.empty();
+  options.api_key_ok = !options.api_key.empty();
 
   options.ctx = std::clamp(
       GetEnvInt(L"MOZC_ZENZ_CTX", kDefaultCtx),
@@ -1066,16 +1079,152 @@ std::string CleanGeneratedText(std::string text, uint32_t max_output_chars) {
 }
 
 #if defined(_WIN32)
-bool ReadAll(HANDLE handle, void* data, uint32_t size) {
+using Clock = std::chrono::steady_clock;
+using PipeDeadline = Clock::time_point;
+
+enum class PipeIoResult {
+  kOk,
+  kTimeout,
+  kError,
+};
+
+class ScopedWinHandle {
+ public:
+  explicit ScopedWinHandle(HANDLE handle = nullptr) : handle_(handle) {}
+  ~ScopedWinHandle() { Reset(); }
+
+  ScopedWinHandle(const ScopedWinHandle&) = delete;
+  ScopedWinHandle& operator=(const ScopedWinHandle&) = delete;
+
+  HANDLE get() const { return handle_; }
+
+  void Reset(HANDLE handle = nullptr) {
+    if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
+      ::CloseHandle(handle_);
+    }
+    handle_ = handle;
+  }
+
+ private:
+  HANDLE handle_;
+};
+
+DWORD RemainingMsec(PipeDeadline deadline) {
+  const auto remaining =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - Clock::now());
+  if (remaining.count() <= 0) {
+    return 0;
+  }
+  return static_cast<DWORD>(std::min<int64_t>(
+      std::max<int64_t>(1, remaining.count()),
+      std::numeric_limits<DWORD>::max()));
+}
+
+// CancelIoEx is asynchronous. Keep the OVERLAPPED and its event alive until
+// GetOverlappedResult has reaped the cancellation.
+void CancelAndReap(HANDLE handle, OVERLAPPED* overlapped) {
+  if (!::CancelIoEx(handle, overlapped)) {
+    const DWORD error = ::GetLastError();
+    if (error != ERROR_NOT_FOUND) {
+      Debug(L"CancelIoEx failed error=" + std::to_wstring(error));
+    }
+  }
+
+  DWORD ignored = 0;
+  if (!::GetOverlappedResult(handle, overlapped, &ignored, TRUE)) {
+    const DWORD error = ::GetLastError();
+    if (error != ERROR_OPERATION_ABORTED) {
+      Debug(L"GetOverlappedResult after cancel failed error=" +
+            std::to_wstring(error));
+    }
+  }
+}
+
+PipeIoResult WaitForPendingIo(HANDLE handle, OVERLAPPED* overlapped,
+                              PipeDeadline deadline, DWORD* transferred) {
+  const DWORD remaining = RemainingMsec(deadline);
+  if (remaining == 0) {
+    CancelAndReap(handle, overlapped);
+    return PipeIoResult::kTimeout;
+  }
+
+  const DWORD wait = ::WaitForSingleObject(overlapped->hEvent, remaining);
+  if (wait == WAIT_OBJECT_0) {
+    return ::GetOverlappedResult(handle, overlapped, transferred, FALSE)
+               ? PipeIoResult::kOk
+               : PipeIoResult::kError;
+  }
+
+  CancelAndReap(handle, overlapped);
+  return wait == WAIT_TIMEOUT ? PipeIoResult::kTimeout
+                              : PipeIoResult::kError;
+}
+
+PipeIoResult ReadSomeUntil(HANDLE handle, void* data, DWORD size,
+                           PipeDeadline deadline, DWORD* transferred) {
+  if (transferred == nullptr) {
+    return PipeIoResult::kError;
+  }
+  *transferred = 0;
+
+  ScopedWinHandle event(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  if (event.get() == nullptr) {
+    return PipeIoResult::kError;
+  }
+
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = event.get();
+
+  if (::ReadFile(handle, data, size, nullptr, &overlapped)) {
+    return ::GetOverlappedResult(handle, &overlapped, transferred, FALSE)
+               ? PipeIoResult::kOk
+               : PipeIoResult::kError;
+  }
+
+  if (::GetLastError() != ERROR_IO_PENDING) {
+    return PipeIoResult::kError;
+  }
+  return WaitForPendingIo(handle, &overlapped, deadline, transferred);
+}
+
+PipeIoResult WriteSomeUntil(HANDLE handle, const void* data, DWORD size,
+                            PipeDeadline deadline, DWORD* transferred) {
+  if (transferred == nullptr) {
+    return PipeIoResult::kError;
+  }
+  *transferred = 0;
+
+  ScopedWinHandle event(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  if (event.get() == nullptr) {
+    return PipeIoResult::kError;
+  }
+
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = event.get();
+
+  if (::WriteFile(handle, data, size, nullptr, &overlapped)) {
+    return ::GetOverlappedResult(handle, &overlapped, transferred, FALSE)
+               ? PipeIoResult::kOk
+               : PipeIoResult::kError;
+  }
+
+  if (::GetLastError() != ERROR_IO_PENDING) {
+    return PipeIoResult::kError;
+  }
+  return WaitForPendingIo(handle, &overlapped, deadline, transferred);
+}
+
+bool ReadAll(HANDLE handle, void* data, uint32_t size,
+             PipeDeadline deadline) {
   uint8_t* ptr = static_cast<uint8_t*>(data);
   uint32_t remaining = size;
 
   while (remaining > 0) {
     DWORD read = 0;
-    if (!ReadFile(handle, ptr, remaining, &read, nullptr)) {
-      return false;
-    }
-    if (read == 0) {
+    if (ReadSomeUntil(handle, ptr, remaining, deadline, &read) !=
+            PipeIoResult::kOk ||
+        read == 0) {
       return false;
     }
     ptr += read;
@@ -1085,16 +1234,16 @@ bool ReadAll(HANDLE handle, void* data, uint32_t size) {
   return true;
 }
 
-bool WriteAll(HANDLE handle, const void* data, uint32_t size) {
+bool WriteAll(HANDLE handle, const void* data, uint32_t size,
+              PipeDeadline deadline) {
   const uint8_t* ptr = static_cast<const uint8_t*>(data);
   uint32_t remaining = size;
 
   while (remaining > 0) {
     DWORD written = 0;
-    if (!WriteFile(handle, ptr, remaining, &written, nullptr)) {
-      return false;
-    }
-    if (written == 0) {
+    if (WriteSomeUntil(handle, ptr, remaining, deadline, &written) !=
+            PipeIoResult::kOk ||
+        written == 0) {
       return false;
     }
     ptr += written;
@@ -1102,6 +1251,30 @@ bool WriteAll(HANDLE handle, const void* data, uint32_t size) {
   }
 
   return true;
+}
+
+PipeIoResult ConnectPipeUntil(HANDLE pipe, PipeDeadline deadline) {
+  ScopedWinHandle event(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  if (event.get() == nullptr) {
+    return PipeIoResult::kError;
+  }
+
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = event.get();
+  if (::ConnectNamedPipe(pipe, &overlapped)) {
+    return PipeIoResult::kOk;
+  }
+
+  const DWORD error = ::GetLastError();
+  if (error == ERROR_PIPE_CONNECTED) {
+    return PipeIoResult::kOk;
+  }
+  if (error != ERROR_IO_PENDING) {
+    return PipeIoResult::kError;
+  }
+
+  DWORD ignored = 0;
+  return WaitForPendingIo(pipe, &overlapped, deadline, &ignored);
 }
 
 bool GetCurrentUserSidString(std::wstring* sid_string) {
@@ -1186,23 +1359,70 @@ bool BuildCurrentUserOnlyPipeSecurityDescriptor(
   return true;
 }
 
+struct LlamaProcessSnapshot {
+  bool has_process = false;
+  bool running = false;
+  DWORD process_id = 0;
+  DWORD exit_code = STILL_ACTIVE;
+  DWORD wait_error = ERROR_SUCCESS;
+};
+
 void ResetLlamaReadyState() {
   g_llama_launch_started = false;
-  g_llama_ready_probe_started = false;
   g_llama_server_ready = false;
+  g_llama_port = 0;
 }
 
-void StopLlamaServer() {
-  g_llama_runtime_generation.fetch_add(1);
+LlamaProcessSnapshot GetLlamaProcessSnapshot() {
   std::lock_guard<std::mutex> lock(g_llama_process_mutex);
 
-  if (g_llama_job != nullptr) {
-    ::TerminateJobObject(g_llama_job, 0);
+  LlamaProcessSnapshot snapshot;
+  if (g_llama_process == nullptr) {
+    return snapshot;
+  }
+
+  snapshot.has_process = true;
+  snapshot.process_id = g_llama_process_id;
+
+  const DWORD wait_result = ::WaitForSingleObject(g_llama_process, 0);
+  if (wait_result == WAIT_TIMEOUT) {
+    snapshot.running = true;
+    return snapshot;
+  }
+
+  if (wait_result == WAIT_FAILED) {
+    snapshot.wait_error = ::GetLastError();
+    return snapshot;
+  }
+
+  DWORD exit_code = 0;
+  if (::GetExitCodeProcess(g_llama_process, &exit_code)) {
+    snapshot.exit_code = exit_code;
+  } else {
+    snapshot.wait_error = ::GetLastError();
+  }
+
+  return snapshot;
+}
+
+// Requires g_llama_process_mutex.
+void CleanupLlamaProcessLocked(bool terminate_running_process) {
+  if (g_llama_process != nullptr && terminate_running_process) {
+    const DWORD wait_result = ::WaitForSingleObject(g_llama_process, 0);
+    if (wait_result == WAIT_TIMEOUT) {
+      if (g_llama_job != nullptr) {
+        ::TerminateJobObject(g_llama_job, 0);
+      }
+
+      if (::WaitForSingleObject(g_llama_process, 100) == WAIT_TIMEOUT) {
+        ::TerminateProcess(g_llama_process, 0);
+      }
+
+      ::WaitForSingleObject(g_llama_process, 3000);
+    }
   }
 
   if (g_llama_process != nullptr) {
-    ::TerminateProcess(g_llama_process, 0);
-    ::WaitForSingleObject(g_llama_process, 3000);
     ::CloseHandle(g_llama_process);
     g_llama_process = nullptr;
   }
@@ -1212,6 +1432,47 @@ void StopLlamaServer() {
     g_llama_job = nullptr;
   }
 
+  g_llama_process_id = 0;
+}
+
+// |owner_generation| is passed by the launch supervisor.  StopLlamaServer()
+// bumps g_llama_runtime_generation under the process lock, so a supervisor
+// whose runtime was stopped (shutdown or a Mozkey IbG backend device change)
+// can no longer touch the process owned by its successor.  Returns false,
+// without modifying anything, in that case.
+bool CleanupLlamaProcess(bool terminate_running_process,
+                         const uint64_t* owner_generation = nullptr) {
+  std::lock_guard<std::mutex> lock(g_llama_process_mutex);
+
+  if (owner_generation != nullptr &&
+      *owner_generation != g_llama_runtime_generation.load()) {
+    return false;
+  }
+
+  CleanupLlamaProcessLocked(terminate_running_process);
+  return true;
+}
+
+// Publishes supervisor-owned launch/readiness state.  The generation check
+// and the update share the process lock with StopLlamaServer(), so a
+// superseded supervisor can never overwrite the state of its successor.
+// Returns false, without running |update|, when |owner_generation| is stale.
+template <typename Update>
+bool UpdateLlamaStateIfOwner(uint64_t owner_generation, Update update) {
+  std::lock_guard<std::mutex> lock(g_llama_process_mutex);
+  if (owner_generation != g_llama_runtime_generation.load()) {
+    return false;
+  }
+  update();
+  return true;
+}
+
+void StopLlamaServer() {
+  std::lock_guard<std::mutex> lock(g_llama_process_mutex);
+  // Invalidate the running launch supervisor (if any) before the process is
+  // torn down, so it exits instead of relaunching the stopped runtime.
+  g_llama_runtime_generation.fetch_add(1);
+  CleanupLlamaProcessLocked(/*terminate_running_process=*/true);
   ResetLlamaReadyState();
 }
 
@@ -1229,12 +1490,6 @@ std::string SelectBackendDevice(const std::string& backend_device) {
   return g_effective_backend_device;
 }
 
-bool LlamaServerExited() {
-  std::lock_guard<std::mutex> lock(g_llama_process_mutex);
-  return g_llama_process != nullptr &&
-         ::WaitForSingleObject(g_llama_process, 0) == WAIT_OBJECT_0;
-}
-
 BOOL WINAPI ConsoleCtrlHandler(DWORD control_type) {
   switch (control_type) {
     case CTRL_C_EVENT:
@@ -1250,9 +1505,57 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD control_type) {
   }
 }
 
-void RememberLlamaProcess(PROCESS_INFORMATION* process) {
+int FindAvailableLoopbackPort(int* socket_error) {
+  if (socket_error != nullptr) {
+    *socket_error = 0;
+  }
+
+  SOCKET socket_handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (socket_handle == INVALID_SOCKET) {
+    if (socket_error != nullptr) {
+      *socket_error = ::WSAGetLastError();
+    }
+    return 0;
+  }
+
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+  address.sin_port = ::htons(0);
+
+  if (::bind(socket_handle,
+             reinterpret_cast<const sockaddr*>(&address),
+             sizeof(address)) == SOCKET_ERROR) {
+    if (socket_error != nullptr) {
+      *socket_error = ::WSAGetLastError();
+    }
+    ::closesocket(socket_handle);
+    return 0;
+  }
+
+  int address_length = sizeof(address);
+  if (::getsockname(socket_handle,
+                    reinterpret_cast<sockaddr*>(&address),
+                    &address_length) == SOCKET_ERROR) {
+    if (socket_error != nullptr) {
+      *socket_error = ::WSAGetLastError();
+    }
+    ::closesocket(socket_handle);
+    return 0;
+  }
+
+  const int port = static_cast<int>(::ntohs(address.sin_port));
+  ::closesocket(socket_handle);
+  return port;
+}
+
+// Returns false when |owner_generation| is stale: the caller's runtime was
+// stopped while the child was being created, so the child is terminated
+// instead of being published as the current llama-server.
+bool RememberLlamaProcess(PROCESS_INFORMATION* process,
+                          uint64_t owner_generation) {
   if (process == nullptr || process->hProcess == nullptr) {
-    return;
+    return false;
   }
 
   HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
@@ -1279,6 +1582,16 @@ void RememberLlamaProcess(PROCESS_INFORMATION* process) {
 
   std::lock_guard<std::mutex> lock(g_llama_process_mutex);
 
+  if (owner_generation != g_llama_runtime_generation.load()) {
+    if (job != nullptr) {
+      ::TerminateJobObject(job, 0);
+      ::CloseHandle(job);
+    }
+    ::TerminateProcess(process->hProcess, 0);
+    ::WaitForSingleObject(process->hProcess, 3000);
+    return false;
+  }
+
   if (g_llama_process != nullptr) {
     ::CloseHandle(g_llama_process);
     g_llama_process = nullptr;
@@ -1290,12 +1603,22 @@ void RememberLlamaProcess(PROCESS_INFORMATION* process) {
   }
 
   g_llama_process = process->hProcess;
+  g_llama_process_id = process->dwProcessId;
   process->hProcess = nullptr;
 
   g_llama_job = job;
+  return true;
 }
 
-bool LaunchLlamaServer(const Options& options, std::wstring* error) {
+bool LaunchLlamaServer(const Options& options,
+                       int port,
+                       uint64_t owner_generation,
+                       DWORD* process_id,
+                       std::wstring* error) {
+  if (process_id != nullptr) {
+    *process_id = 0;
+  }
+
   if (!FileExists(options.llama_server_path)) {
     *error = L"llama_server_not_found";
     return false;
@@ -1306,12 +1629,12 @@ bool LaunchLlamaServer(const Options& options, std::wstring* error) {
     return false;
   }
 
-  // Reserve the exact loopback port until the child has been created.  The
-  // llama.cpp server does not currently accept an inherited listening socket,
-  // so the reservation is released immediately before exec/CreateProcess and
-  // the resulting child is checked before it is trusted.
+  // Hold the OS-assigned loopback port exclusively until the child has been
+  // created.  The llama.cpp server does not currently accept an inherited
+  // listening socket, so the reservation is released right after
+  // CreateProcess and the resulting child is checked before it is trusted.
   LoopbackPortReservation port_reservation;
-  if (!port_reservation.Reserve(options.port)) {
+  if (!port_reservation.Reserve(port)) {
     *error = L"loopback_port_reservation_failed";
     return false;
   }
@@ -1325,8 +1648,17 @@ bool LaunchLlamaServer(const Options& options, std::wstring* error) {
   cmd += std::to_wstring(options.ctx);
   cmd += L" -t ";
   cmd += std::to_wstring(options.threads);
+  // Keep the llama-server execution contract deterministic across upstream
+  // versions.  Mozkey has one local scorer client and does not need multiple
+  // parallel server slots.
+  cmd += L" --parallel 1";
+  // Disable llama-server's global RAM prompt cache. Mozkey uses one local
+  // scorer client, and retaining historical prompt states causes private-memory
+  // growth during continuous IME use. Request-level cache_prompt remains
+  // enabled, so the current slot can still reuse common prompt prefixes.
+  cmd += L" --cache-ram 0";
   cmd += L" --host 127.0.0.1 --port ";
-  cmd += std::to_wstring(options.port);
+  cmd += std::to_wstring(port);
   // The API key is defense-in-depth for accidental or stale localhost servers.
   // It is passed to llama-server via command line because llama-server exposes
   // --api-key.  Do not treat it as a strong same-user secret.
@@ -1339,8 +1671,8 @@ bool LaunchLlamaServer(const Options& options, std::wstring* error) {
     cmd += Utf8ToWide(options.backend_device);
   }
 
-  Debug(L"launch llama-server port=random api_key_bytes=" +
-        std::to_wstring(options.api_key.size()));
+  Debug(L"launch llama-server port=" + std::to_wstring(port) +
+        L" api_key_bytes=" + std::to_wstring(options.api_key.size()));
 
   std::vector<wchar_t> cmd_buffer(cmd.begin(), cmd.end());
   cmd_buffer.push_back(L'\0');
@@ -1381,11 +1713,20 @@ bool LaunchLlamaServer(const Options& options, std::wstring* error) {
     return false;
   }
 
+  if (process_id != nullptr) {
+    *process_id = process.dwProcessId;
+  }
+
   ::CloseHandle(process.hThread);
-  RememberLlamaProcess(&process);
+  const bool remembered = RememberLlamaProcess(&process, owner_generation);
 
   if (process.hProcess != nullptr) {
     ::CloseHandle(process.hProcess);
+  }
+
+  if (!remembered) {
+    *error = L"llama_runtime_superseded";
+    return false;
   }
 
   return true;
@@ -1393,6 +1734,7 @@ bool LaunchLlamaServer(const Options& options, std::wstring* error) {
 
 bool HttpPostCompletion(
     const Options& options,
+    int port,
     const std::string& prompt,
     uint32_t timeout_msec,
     uint32_t max_output_chars,
@@ -1421,7 +1763,7 @@ bool HttpPostCompletion(
   HINTERNET connect = WinHttpConnect(
       session,
       options.host.c_str(),
-      static_cast<INTERNET_PORT>(options.port),
+      static_cast<INTERNET_PORT>(port),
       0);
 
   if (!connect) {
@@ -1493,7 +1835,7 @@ bool HttpPostCompletion(
       options.flash_attention,
       WideToUtf8(options.llama_server_path),
       WideToUtf8(options.model_path),
-      WideToUtf8(options.host) + ":" + std::to_string(options.port), value,
+      WideToUtf8(options.host) + ":" + std::to_string(port), value,
       debug);
 
   std::wstring headers = L"Content-Type: application/json; charset=utf-8\r\n";
@@ -1597,51 +1939,138 @@ bool HttpPostCompletion(
   return true;
 }
 
-void StartLlamaReadyProbeInBackground(const Options& options);
+void LogLlamaProcessExit(const wchar_t* prefix,
+                         int attempt,
+                         int port,
+                         const LlamaProcessSnapshot& snapshot,
+                         DWORD elapsed_msec) {
+  std::wstring message(prefix);
+  message += L" attempt=" + std::to_wstring(attempt);
+  message += L" port=" + std::to_wstring(port);
+  message += L" pid=" + std::to_wstring(snapshot.process_id);
+  message += L" elapsed_msec=" + std::to_wstring(elapsed_msec);
 
-void StartLlamaServerInBackground(const Options& options) {
-  bool expected = false;
-  if (!g_llama_launch_started.compare_exchange_strong(expected, true)) {
-    StartLlamaReadyProbeInBackground(options);
-    return;
+  if (!snapshot.has_process) {
+    message += L" state=no_process";
+  } else if (snapshot.wait_error != ERROR_SUCCESS) {
+    message += L" wait_error=" + std::to_wstring(snapshot.wait_error);
+  } else {
+    message += L" exit_code=" + std::to_wstring(snapshot.exit_code);
   }
 
-  std::wstring launch_error;
-  if (!LaunchLlamaServer(options, &launch_error)) {
-    Debug(L"background launch failed: " + launch_error);
-    g_llama_launch_started = false;
-    g_llama_ready_probe_started = false;
-    g_llama_server_ready = false;
-    return;
-  }
-
-  Debug(L"background launch requested");
-  StartLlamaReadyProbeInBackground(options);
+  Debug(message);
 }
 
-void StartLlamaReadyProbeInBackground(const Options& options) {
-  bool expected = false;
-  if (!g_llama_ready_probe_started.compare_exchange_strong(expected, true)) {
-    return;
-  }
+// Launch/readiness supervisor for one llama-server runtime.
+//
+// |options| is a private copy so an unavailable accelerator device can fall
+// back to CPU-only inference without touching the caller's options.
+// |runtime_generation| identifies the runtime this supervisor owns.  Once
+// StopLlamaServer() bumps g_llama_runtime_generation (shutdown, or a Mozkey
+// IbG backend device change), a newer supervisor owns the global
+// llama-server state and this one must exit without modifying it.
+void RunLlamaServerSupervisor(Options options, uint64_t runtime_generation) {
+  const auto superseded = [runtime_generation]() {
+    return runtime_generation != g_llama_runtime_generation.load();
+  };
 
-  const uint64_t runtime_generation = g_llama_runtime_generation.load();
-  std::thread([options, runtime_generation]() {
-    Debug(L"ready probe started");
+  int attempts_used = 0;
 
-    // Model loading + warmup may take several seconds on cold start.
-    // This probe is intentionally outside Mozc's request path.
-    for (int i = 0; i < 120; ++i) {
-      if (runtime_generation != g_llama_runtime_generation.load()) {
+  for (int attempt = 1;
+       attempt <= kMaxLlamaLaunchAttempts &&
+       !g_shutdown_requested.load();
+       ++attempt) {
+    attempts_used = attempt;
+    if (!CleanupLlamaProcess(/*terminate_running_process=*/true,
+                             &runtime_generation) ||
+        !UpdateLlamaStateIfOwner(runtime_generation, [] {
+          g_llama_server_ready = false;
+          g_llama_port = 0;
+        })) {
+      return;
+    }
+
+    int socket_error = 0;
+    const int port = FindAvailableLoopbackPort(&socket_error);
+    if (port == 0) {
+      Debug(L"loopback port allocation failed attempt=" +
+            std::to_wstring(attempt) +
+            L" socket_error=" + std::to_wstring(socket_error));
+      continue;
+    }
+
+    std::wstring launch_error;
+    DWORD process_id = 0;
+    if (!LaunchLlamaServer(
+            options, port, runtime_generation, &process_id, &launch_error)) {
+      if (superseded()) {
         return;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      Debug(L"background launch failed attempt=" +
+            std::to_wstring(attempt) +
+            L" port=" + std::to_wstring(port) +
+            L" error=" + launch_error);
+      continue;
+    }
+
+    if (!UpdateLlamaStateIfOwner(runtime_generation,
+                                 [port] { g_llama_port = port; })) {
+      return;
+    }
+
+    Debug(L"background launch requested attempt=" +
+          std::to_wstring(attempt) +
+          L" port=" + std::to_wstring(port) +
+          L" pid=" + std::to_wstring(process_id));
+    Debug(L"ready probe started attempt=" +
+          std::to_wstring(attempt) +
+          L" port=" + std::to_wstring(port) +
+          L" pid=" + std::to_wstring(process_id));
+
+    const DWORD launch_start = ::GetTickCount();
+    bool process_exited = false;
+
+    // Model loading + warmup may take several seconds on cold start.
+    // This supervisor is intentionally outside Mozc's request path.
+    for (int probe = 0;
+         probe < kLlamaReadyProbeAttempts &&
+         !g_shutdown_requested.load();
+         ++probe) {
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(kLlamaReadyProbeIntervalMsec));
+      if (superseded()) {
+        return;
+      }
+
+      const LlamaProcessSnapshot snapshot = GetLlamaProcessSnapshot();
+      if (!snapshot.has_process || !snapshot.running) {
+        if (superseded()) {
+          return;
+        }
+        LogLlamaProcessExit(
+            L"llama-server exited",
+            attempt,
+            port,
+            snapshot,
+            ::GetTickCount() - launch_start);
+        if (!CleanupLlamaProcess(
+                /*terminate_running_process=*/
+                snapshot.wait_error != ERROR_SUCCESS,
+                &runtime_generation) ||
+            !UpdateLlamaStateIfOwner(runtime_generation,
+                                     [] { g_llama_port = 0; })) {
+          return;
+        }
+        process_exited = true;
+        break;
+      }
 
       std::string value;
       std::string local_debug;
 
       if (HttpPostCompletion(
               options,
+              port,
               "\xEE\xB8\x82\xEE\xB8\x80テスト\xEE\xB8\x81",
               kLlamaReadyProbeTimeoutMsec,
               8,
@@ -1649,60 +2078,145 @@ void StartLlamaReadyProbeInBackground(const Options& options) {
               "ready_probe",
               &value,
               &local_debug)) {
-        if (runtime_generation != g_llama_runtime_generation.load()) {
+        if (superseded()) {
           return;
         }
-        g_llama_server_ready = true;
-        g_llama_ready_probe_started = false;
-        Debug(L"ready probe succeeded");
-        return;
-      }
-
-      if (runtime_generation != g_llama_runtime_generation.load()) {
-        return;
-      }
-      if (LlamaServerExited()) {
-        if (!options.backend_device.empty() &&
-            options.backend_device != "none") {
-          std::lock_guard<std::mutex> lock(g_backend_device_mutex);
-          if (!g_requested_backend_device.has_value() ||
-              *g_requested_backend_device != options.backend_device) {
+        const LlamaProcessSnapshot ready_snapshot =
+            GetLlamaProcessSnapshot();
+        if (ready_snapshot.has_process &&
+            ready_snapshot.running &&
+            !g_shutdown_requested.load()) {
+          if (!UpdateLlamaStateIfOwner(runtime_generation, [] {
+                g_llama_server_ready = true;
+              })) {
             return;
           }
-          g_effective_backend_device = "none";
-          Debug(L"requested backend device unavailable; falling back to CPU");
-          Options fallback_options = options;
-          fallback_options.backend_device = "none";
-          StopLlamaServer();
-          StartLlamaServerInBackground(fallback_options);
-        } else {
-          StopLlamaServer();
+          Debug(L"ready probe succeeded attempt=" +
+                std::to_wstring(attempt) +
+                L" port=" + std::to_wstring(port) +
+                L" pid=" + std::to_wstring(process_id) +
+                L" waited_msec=" +
+                std::to_wstring(::GetTickCount() - launch_start));
+          return;
         }
+      }
+
+      if (superseded()) {
         return;
       }
-
-      if (i % 10 == 0) {
-        Debug(L"ready probe waiting");
+      if (probe % 10 == 0) {
+        Debug(L"ready probe waiting attempt=" +
+              std::to_wstring(attempt) +
+              L" port=" + std::to_wstring(port) +
+              L" pid=" + std::to_wstring(process_id) +
+              L" reason=" + Utf8ToWide(local_debug));
       }
     }
 
-    if (runtime_generation == g_llama_runtime_generation.load()) {
-      Debug(L"ready probe timeout");
-      StopLlamaServer();
+    if (superseded()) {
+      return;
     }
+
+    if (g_shutdown_requested.load()) {
+      if (!CleanupLlamaProcess(/*terminate_running_process=*/true,
+                               &runtime_generation)) {
+        return;
+      }
+      break;
+    }
+
+    if (!process_exited) {
+      Debug(L"ready probe timeout attempt=" +
+            std::to_wstring(attempt) +
+            L" port=" + std::to_wstring(port) +
+            L" pid=" + std::to_wstring(process_id));
+      if (!CleanupLlamaProcess(/*terminate_running_process=*/true,
+                               &runtime_generation)) {
+        return;
+      }
+      break;
+    }
+
+    // llama-server exited while starting.  When a specific accelerator device
+    // was requested, treat it as unavailable and fall back to CPU-only
+    // inference with a fresh launch budget (Mozkey IbG device selection).
+    if (!options.backend_device.empty() && options.backend_device != "none") {
+      std::lock_guard<std::mutex> lock(g_backend_device_mutex);
+      if (superseded() ||
+          !g_requested_backend_device.has_value() ||
+          *g_requested_backend_device != options.backend_device) {
+        return;
+      }
+      g_effective_backend_device = "none";
+      Debug(L"requested backend device unavailable; falling back to CPU");
+      options.backend_device = "none";
+      attempt = 0;
+    }
+  }
+
+  // Releasing the launch latch lets the next request start a new supervisor,
+  // so it must only happen while this supervisor still owns the runtime.
+  if (!UpdateLlamaStateIfOwner(runtime_generation,
+                               [] { ResetLlamaReadyState(); })) {
+    return;
+  }
+
+  if (!g_shutdown_requested.load()) {
+    Debug(L"llama-server unavailable attempts=" +
+          std::to_wstring(attempts_used));
+  }
+}
+
+void StartLlamaServerInBackground(const Options& options) {
+  uint64_t runtime_generation = 0;
+  {
+    // Claim the launch latch and read the generation atomically with respect
+    // to StopLlamaServer(), so exactly one supervisor owns each runtime.
+    std::lock_guard<std::mutex> lock(g_llama_process_mutex);
+    bool expected = false;
+    if (!g_llama_launch_started.compare_exchange_strong(expected, true)) {
+      return;
+    }
+    g_llama_server_ready = false;
+    runtime_generation = g_llama_runtime_generation.load();
+  }
+
+  std::thread([options, runtime_generation]() {
+    RunLlamaServerSupervisor(options, runtime_generation);
   }).detach();
 }
 
 bool EnsureLlamaServerReadyWithinTimeout(const Options& options,
                                          uint32_t timeout_msec,
+                                         int* port,
                                          std::string* debug) {
+  *port = 0;
+
   if (g_llama_server_ready.load()) {
-    *debug = "server_ready";
-    return true;
+    const LlamaProcessSnapshot snapshot = GetLlamaProcessSnapshot();
+    const int active_port = g_llama_port.load();
+
+    if (snapshot.has_process &&
+        snapshot.running &&
+        active_port > 0) {
+      *port = active_port;
+      *debug = "server_ready";
+      return true;
+    }
+
+    LogLlamaProcessExit(
+        L"ready llama-server no longer running",
+        /*attempt=*/0,
+        active_port,
+        snapshot,
+        /*elapsed_msec=*/0);
+    CleanupLlamaProcess(
+        /*terminate_running_process=*/
+        snapshot.wait_error != ERROR_SUCCESS);
+    ResetLlamaReadyState();
   }
 
   StartLlamaServerInBackground(options);
-  StartLlamaReadyProbeInBackground(options);
 
   const uint32_t wait_budget_msec =
       std::max<uint32_t>(
@@ -1713,13 +2227,24 @@ bool EnsureLlamaServerReadyWithinTimeout(const Options& options,
 
   const DWORD start = GetTickCount();
 
-  while (GetTickCount() - start < wait_budget_msec) {
+  while (::GetTickCount() - start < wait_budget_msec) {
     if (g_llama_server_ready.load()) {
-      const DWORD waited = GetTickCount() - start;
-      *debug = "server_ready_after_wait";
-      Debug(L"server ready wait succeeded waited_msec=" +
-            std::to_wstring(waited));
-      return true;
+      const int active_port = g_llama_port.load();
+      if (active_port > 0) {
+        const DWORD waited = ::GetTickCount() - start;
+        *port = active_port;
+        *debug = "server_ready_after_wait";
+        Debug(L"server ready wait succeeded waited_msec=" +
+              std::to_wstring(waited) +
+              L" port=" + std::to_wstring(active_port));
+        return true;
+      }
+    }
+
+    if (!g_llama_launch_started.load()) {
+      *debug = "server_start_failed";
+      Debug(L"server ready wait stopped because launch failed");
+      return false;
     }
 
     std::this_thread::sleep_for(
@@ -1758,7 +2283,8 @@ void SendResponse(
     uint32_t status,
     uint32_t latency_msec,
     const std::string& value,
-    const std::string& debug) {
+    const std::string& debug,
+    PipeDeadline deadline) {
   ZenzWireResponseHeader header = {};
   header.magic = kZenzWireMagic;
   header.version = kZenzWireVersion;
@@ -1769,48 +2295,48 @@ void SendResponse(
   header.value_size = static_cast<uint32_t>(value.size());
   header.debug_size = static_cast<uint32_t>(debug.size());
 
-  WriteAll(pipe, &header, sizeof(header));
+  WriteAll(pipe, &header, sizeof(header), deadline);
 
   if (!value.empty()) {
-    WriteAll(pipe, value.data(), static_cast<uint32_t>(value.size()));
+    WriteAll(pipe, value.data(), static_cast<uint32_t>(value.size()), deadline);
   }
 
   if (!debug.empty()) {
-    WriteAll(pipe, debug.data(), static_cast<uint32_t>(debug.size()));
+    WriteAll(pipe, debug.data(), static_cast<uint32_t>(debug.size()), deadline);
   }
 }
 
-void HandleClient(HANDLE pipe, const Options& options) {
+void HandleClient(HANDLE pipe, const Options& options, PipeDeadline deadline) {
   const DWORD start = GetTickCount();
 
   ZenzWireRequestHeader request_header = {};
-  if (!ReadAll(pipe, &request_header, sizeof(request_header))) {
+  if (!ReadAll(pipe, &request_header, sizeof(request_header), deadline)) {
     return;
   }
 
   if (request_header.magic != kZenzWireMagic ||
       request_header.version != kZenzWireVersion ||
       request_header.kind != kZenzWireKindRequest) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
-                 "bad_request_header");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
+                 "bad_request_header", deadline);
     return;
   }
 
   if (request_header.prompt_size == 0) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
-                 "empty_prompt");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
+                 "empty_prompt", deadline);
     return;
   }
 
   if (request_header.prompt_size > kMaxPromptBytes) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
-                 "prompt_too_large");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
+                 "prompt_too_large", deadline);
     return;
   }
 
   if (request_header.backend_device_size > kMaxBackendDeviceBytes) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
-                 "backend_device_too_large");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
+                 "backend_device_too_large", deadline);
     return;
   }
 
@@ -1829,22 +2355,23 @@ void HandleClient(HANDLE pipe, const Options& options) {
       kMaxOutputChars);
 
   std::string prompt(request_header.prompt_size, '\0');
-  if (!ReadAll(pipe, prompt.data(), request_header.prompt_size)) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
-                 "failed_to_read_prompt");
+  if (!ReadAll(pipe, prompt.data(), request_header.prompt_size, deadline)) {
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
+                 "failed_to_read_prompt", deadline);
     return;
   }
 
   std::string backend_device(request_header.backend_device_size, '\0');
   if (!backend_device.empty() &&
-      !ReadAll(pipe, backend_device.data(), request_header.backend_device_size)) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
-                 "failed_to_read_backend_device");
+      !ReadAll(pipe, backend_device.data(), request_header.backend_device_size,
+               deadline)) {
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
+                 "failed_to_read_backend_device", deadline);
     return;
   }
   if (!IsValidBackendDeviceName(backend_device)) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
-                 "invalid_backend_device");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
+                 "invalid_backend_device", deadline);
     return;
   }
 
@@ -1855,17 +2382,19 @@ void HandleClient(HANDLE pipe, const Options& options) {
         L" " + RedactedUtf8Bytes(L"prompt", prompt));
 
   std::string debug;
+  int port = 0;
   if (!EnsureLlamaServerReadyWithinTimeout(
-          request_options, timeout_msec, &debug)) {
+          request_options, timeout_msec, &port, &debug)) {
     const DWORD latency = GetTickCount() - start;
-    SendResponse(pipe, request_header.generation, kStatusTimeout, latency, "",
-                 debug);
+    SendResponse(pipe, request_header.generation, kZenzWireStatusTimeout,
+                 latency, "", debug, deadline);
     return;
   }
 
   std::string value;
   if (!HttpPostCompletion(
           request_options,
+          port,
           prompt,
           timeout_msec,
           max_output_chars,
@@ -1873,9 +2402,25 @@ void HandleClient(HANDLE pipe, const Options& options) {
           "client_request",
           &value,
           &debug)) {
+    const LlamaProcessSnapshot snapshot = GetLlamaProcessSnapshot();
+    if (!snapshot.has_process || !snapshot.running) {
+      LogLlamaProcessExit(
+          L"llama-server exited during completion",
+          /*attempt=*/0,
+          port,
+          snapshot,
+          ::GetTickCount() - start);
+      CleanupLlamaProcess(
+          /*terminate_running_process=*/
+          snapshot.wait_error != ERROR_SUCCESS);
+      ResetLlamaReadyState();
+      StartLlamaServerInBackground(request_options);
+      debug = "server_exited";
+    }
+
     const DWORD latency = GetTickCount() - start;
-    SendResponse(pipe, request_header.generation, kStatusError, latency, "",
-                 debug);
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, latency,
+                 "", debug, deadline);
     return;
   }
 
@@ -1885,8 +2430,8 @@ void HandleClient(HANDLE pipe, const Options& options) {
         L" latency=" + std::to_wstring(latency) +
         L" " + RedactedUtf8Bytes(L"value", value));
 
-  SendResponse(pipe, request_header.generation, kStatusOk, latency, value,
-               debug);
+  SendResponse(pipe, request_header.generation, kZenzWireStatusOk, latency,
+               value, debug, deadline);
 }
 
 int RunServer(const Options& options) {
@@ -1897,7 +2442,7 @@ int RunServer(const Options& options) {
         L" " +
         RedactedWideChars(L"model_path", options.model_path));
 
-  if (!options.random_ok) {
+  if (!options.api_key_ok) {
     Debug(L"secure random initialization failed");
     return 1;
   }
@@ -1907,7 +2452,7 @@ int RunServer(const Options& options) {
     return 1;
   }
 
-  Debug(L"http_port_mode=random");
+  Debug(L"http_port_mode=os_assigned_loopback");
   Debug(L"api_key_bytes=" + std::to_wstring(options.api_key.size()));
   Debug(L"n_predict=" + std::to_wstring(options.n_predict));
   Debug(L"flash_attention=" + Utf8ToWide(options.flash_attention));
@@ -1924,8 +2469,10 @@ int RunServer(const Options& options) {
 
     HANDLE pipe = ::CreateNamedPipeW(
         options.pipe_name.c_str(),
-        PIPE_ACCESS_DUPLEX,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+            FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
+            PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_UNLIMITED_INSTANCES,
         65536,
         65536,
@@ -1944,19 +2491,41 @@ int RunServer(const Options& options) {
       continue;
     }
 
-    BOOL connected = ::ConnectNamedPipe(pipe, nullptr);
-    if (!connected) {
-      const DWORD err = ::GetLastError();
-      if (err != ERROR_PIPE_CONNECTED) {
-        Debug(L"ConnectNamedPipe failed error=" + std::to_wstring(err));
-        ::CloseHandle(pipe);
-        continue;
+    const PipeDeadline connection_deadline =
+        Clock::now() +
+        std::chrono::milliseconds(kPipeConnectSafetyTimeoutMsec);
+    const PipeIoResult connection_result =
+        ConnectPipeUntil(pipe, connection_deadline);
+    if (connection_result != PipeIoResult::kOk) {
+      // A timed-out accept is normal idle polling.  It exists only so the
+      // server periodically observes g_shutdown_requested; do not emit an
+      // error every second while no Mozkey client is connected.
+      if (connection_result == PipeIoResult::kError) {
+        const DWORD err = ::GetLastError();
+        Debug(L"ConnectPipeUntil failed error=" + std::to_wstring(err));
       }
+      ::CloseHandle(pipe);
+      continue;
     }
 
-    HandleClient(pipe, options);
+    // Connect/read/write are overlapped and use an absolute deadline.  Keep the
+    // watchdog only around FlushFileBuffers, the remaining synchronous pipe
+    // operation, so it cannot accidentally cancel unrelated backend I/O.
+    const PipeDeadline io_deadline =
+        Clock::now() +
+        std::chrono::milliseconds(kPipeIoSafetyTimeoutMsec);
+    HandleClient(pipe, options, io_deadline);
 
-    ::FlushFileBuffers(pipe);
+    {
+      mozc::zenz::SynchronousIoDeadline flush_deadline(
+          pipe,
+          std::chrono::milliseconds(kPipeFlushSafetyTimeoutMsec));
+      if (flush_deadline.valid()) {
+        ::FlushFileBuffers(pipe);
+      } else {
+        Debug(L"failed to arm pipe flush deadline");
+      }
+    }
     ::DisconnectNamedPipe(pipe);
     ::CloseHandle(pipe);
   }
@@ -2100,6 +2669,13 @@ bool LaunchLlamaServer(const Options& options, std::string* error) {
       std::to_string(options.ctx),
       "-t",
       std::to_string(options.threads),
+      // Same llama-server execution contract as the Windows launch above: one
+      // server slot and no global RAM prompt cache (request-level cache_prompt
+      // stays enabled), which otherwise grows during continuous IME use.
+      "--parallel",
+      "1",
+      "--cache-ram",
+      "0",
       "--host",
       "127.0.0.1",
       "--port",
@@ -2535,22 +3111,22 @@ void HandleClient(ZenzSocketHandle pipe, const Options& options) {
   if (request_header.magic != kZenzWireMagic ||
       request_header.version != kZenzWireVersion ||
       request_header.kind != kZenzWireKindRequest) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "", "bad_request_header");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "", "bad_request_header");
     return;
   }
 
   if (request_header.prompt_size == 0) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "", "empty_prompt");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "", "empty_prompt");
     return;
   }
 
   if (request_header.prompt_size > kMaxPromptBytes) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "", "prompt_too_large");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "", "prompt_too_large");
     return;
   }
 
   if (request_header.backend_device_size > kMaxBackendDeviceBytes) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
                  "backend_device_too_large");
     return;
   }
@@ -2565,19 +3141,19 @@ void HandleClient(ZenzSocketHandle pipe, const Options& options) {
 
   std::string prompt(request_header.prompt_size, '\0');
   if (!ReadAll(pipe, prompt.data(), request_header.prompt_size)) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "", "failed_to_read_prompt");
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "", "failed_to_read_prompt");
     return;
   }
 
   std::string backend_device(request_header.backend_device_size, '\0');
   if (!backend_device.empty() &&
       !ReadAll(pipe, backend_device.data(), request_header.backend_device_size)) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
                  "failed_to_read_backend_device");
     return;
   }
   if (!IsValidBackendDeviceName(backend_device)) {
-    SendResponse(pipe, request_header.generation, kStatusError, 0, "",
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, 0, "",
                  "invalid_backend_device");
     return;
   }
@@ -2592,7 +3168,7 @@ void HandleClient(ZenzSocketHandle pipe, const Options& options) {
   if (!EnsureLlamaServerReadyWithinTimeout(request_options, timeout_msec,
                                            &debug)) {
     const uint64_t latency = GetTickCountMsec() - start;
-    SendResponse(pipe, request_header.generation, kStatusTimeout, latency, "", debug);
+    SendResponse(pipe, request_header.generation, kZenzWireStatusTimeout, latency, "", debug);
     return;
   }
 
@@ -2601,7 +3177,7 @@ void HandleClient(ZenzSocketHandle pipe, const Options& options) {
                           max_output_chars, request_header.generation,
                           "client_request", &value, &debug)) {
     const uint64_t latency = GetTickCountMsec() - start;
-    SendResponse(pipe, request_header.generation, kStatusError, latency, "", debug);
+    SendResponse(pipe, request_header.generation, kZenzWireStatusError, latency, "", debug);
     return;
   }
 
@@ -2610,7 +3186,7 @@ void HandleClient(ZenzSocketHandle pipe, const Options& options) {
         " latency=" + std::to_string(latency) +
         " " + RedactedUtf8Bytes("value", value));
 
-  SendResponse(pipe, request_header.generation, kStatusOk, latency, value, debug);
+  SendResponse(pipe, request_header.generation, kZenzWireStatusOk, latency, value, debug);
 }
 
 bool RemoveOwnedSocketIfPresent(const std::string& socket_path) {
@@ -2751,6 +3327,15 @@ int RunServer(const Options& options) {
 int wmain() {
   ::SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
+  WSADATA winsock_data = {};
+  const int winsock_result =
+      ::WSAStartup(MAKEWORD(2, 2), &winsock_data);
+  if (winsock_result != 0) {
+    Debug(L"WSAStartup failed error=" +
+          std::to_wstring(winsock_result));
+    return 1;
+  }
+
   HANDLE single_instance_mutex =
       ::CreateMutexW(nullptr, TRUE, kSingleInstanceMutexName);
 
@@ -2758,6 +3343,7 @@ int wmain() {
       ::GetLastError() == ERROR_ALREADY_EXISTS) {
     Debug(L"another scorer instance already exists");
     ::CloseHandle(single_instance_mutex);
+    ::WSACleanup();
     return 0;
   }
 
@@ -2771,6 +3357,7 @@ int wmain() {
     ::CloseHandle(single_instance_mutex);
   }
 
+  ::WSACleanup();
   return result;
 }
 #else

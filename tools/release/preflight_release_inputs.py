@@ -190,6 +190,31 @@ def load_pinned_inputs(repository: Path) -> tuple[list[PinnedInput], Path, str, 
         raise InputPreflightError("source Zenz repository commit is invalid")
     if not isinstance(source_filename, str) or not source_filename:
         raise InputPreflightError("source Zenz filename is invalid")
+    # macOS packages upstream Mozkey's Universal runtime, which loads the
+    # unmodified source model pinned by src/zenz_runtime/llama_runtime.lock.json.
+    # Keep that pin identical to the source side of the normalization lock so
+    # every platform starts from the same model bytes.
+    runtime_lock_path = repository / "src/zenz_runtime/llama_runtime.lock.json"
+    try:
+        runtime_lock = json.loads(runtime_lock_path.read_text(encoding="utf-8"))
+        runtime_model = runtime_lock["model"]
+        runtime_model_digest = runtime_model["sha256"]
+        runtime_model_revision = runtime_model["revision"]
+        runtime_model_file = runtime_model["windows_file"]
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise InputPreflightError(
+            f"could not parse {runtime_lock_path}: {error}"
+        ) from error
+    except (KeyError, TypeError) as error:
+        raise InputPreflightError("Zenz runtime lock is incomplete") from error
+    if (
+        not isinstance(runtime_model_digest, str)
+        or runtime_model_digest.lower() != model_digest
+        or runtime_model_revision != repository_commit
+        or runtime_model_file != model_path_value
+    ):
+        raise InputPreflightError("Zenz runtime lock/normalization lock model drift")
+
     model_url = (
         f"{repository_url}/resolve/"
         f"{urllib.parse.quote(repository_commit, safe='')}/"

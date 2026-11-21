@@ -38,13 +38,18 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "absl/log/check.h"
 #include "base/const.h"
 #include "base/win32/wide_char.h"
+#include "config/config_handler.h"
 #include "protocol/commands.pb.h"
+#include "protocol/config.pb.h"
 #include "protocol/renderer_command.pb.h"
+#include "renderer/renderer_color_theme.h"
+#include "renderer/window_util.h"
 #include "renderer/win32/win32_font_util.h"
 #include "renderer/win32/win32_image_util.h"
 #include "renderer/win32/win32_renderer_util.h"
@@ -78,6 +83,7 @@ typedef CWinTraits<WS_POPUP | WS_DISABLED, WS_EX_LAYERED | WS_EX_TOOLWINDOW |
 struct Sprite {
   wil::unique_hbitmap bitmap;
   CPoint offset;
+  int body_height = 0;
 };
 
 // Timer event IDs
@@ -87,6 +93,8 @@ const UINT_PTR kTimerEventFading = 1;
 constexpr DWORD kStartFadingOutDelay = 850;  // msec
 constexpr DWORD kFadingOutInterval = 16;     // msec
 constexpr int kFadingOutAlphaDelta = 24;
+constexpr int kFadingOutSlideDivisor = 32;
+constexpr int kMaxFadingOutOffset = 255 / kFadingOutSlideDivisor;
 
 double GetDPIScaling() {
   wil::unique_hdc desktop_dc(::GetDC(nullptr));
@@ -94,42 +102,30 @@ double GetDPIScaling() {
   return static_cast<double>(dpi_x) / kDefaultDPI;
 }
 
-enum class ColorScheme {
-  kLight,
-  kDark,
-};
-
-ColorScheme GetWindowsAppColorScheme() {
-  // Windows Settings:
-  // Personalization -> Colors -> Choose your default app mode
-  //
-  // AppsUseLightTheme:
-  //   0 = Dark
-  //   1 = Light
-  //
-  // If this registry value does not exist, use Light as a safe default.
-  DWORD apps_use_light_theme = 1;
-  DWORD size = sizeof(apps_use_light_theme);
-
-  const LONG result = ::RegGetValueW(
-      HKEY_CURRENT_USER,
-      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-      L"AppsUseLightTheme",
-      RRF_RT_REG_DWORD,
-      nullptr,
-      &apps_use_light_theme,
-      &size);
-
-  if (result != ERROR_SUCCESS) {
-    return ColorScheme::kLight;
-  }
-
-  return apps_use_light_theme == 0 ? ColorScheme::kDark : ColorScheme::kLight;
-}
-
 bool IsImmersiveColorSetChange(LPCTSTR section) {
   return section != nullptr &&
          ::lstrcmpi(section, TEXT("ImmersiveColorSet")) == 0;
+}
+
+using ModeIndicatorTheme = config::Config::WindowsModeIndicatorTheme;
+
+ModeIndicatorTheme GetModeIndicatorThemePreference() {
+  return config::ConfigHandler::GetSharedConfig()
+      ->windows_mode_indicator_theme();
+}
+
+SystemColorTheme ResolveModeIndicatorColorTheme(ModeIndicatorTheme theme) {
+  const SystemColorTheme system_theme =
+      theme == config::Config::WINDOWS_MODE_INDICATOR_THEME_SYSTEM
+          ? GetSystemColorTheme()
+          : SystemColorTheme::kLight;
+  return ResolveWindowsModeIndicatorTheme(theme, system_theme);
+}
+
+RGBColor RgbColorFromHex(uint32_t rgb) {
+  return RGBColor(static_cast<uint8_t>((rgb >> 16) & 0xff),
+                  static_cast<uint8_t>((rgb >> 8) & 0xff),
+                  static_cast<uint8_t>(rgb & 0xff));
 }
 
 constexpr int kIndicatorModes[] = {
@@ -148,8 +144,8 @@ struct IndicatorColors {
   RGBColor label;
 };
 
-IndicatorColors GetAsciiIndicatorColors(ColorScheme color_scheme) {
-  if (color_scheme == ColorScheme::kDark) {
+IndicatorColors GetAsciiIndicatorColors(SystemColorTheme color_scheme) {
+  if (color_scheme == SystemColorTheme::kDark) {
     return {
         RGBColor(30, 38, 52),
         RGBColor(96, 130, 170),
@@ -166,8 +162,8 @@ IndicatorColors GetAsciiIndicatorColors(ColorScheme color_scheme) {
   };
 }
 
-IndicatorColors GetHiraganaIndicatorColors(ColorScheme color_scheme) {
-  if (color_scheme == ColorScheme::kDark) {
+IndicatorColors GetHiraganaIndicatorColors(SystemColorTheme color_scheme) {
+  if (color_scheme == SystemColorTheme::kDark) {
     return {
         RGBColor(20, 64, 61),
         RGBColor(70, 190, 180),
@@ -184,8 +180,8 @@ IndicatorColors GetHiraganaIndicatorColors(ColorScheme color_scheme) {
   };
 }
 
-IndicatorColors GetKatakanaIndicatorColors(ColorScheme color_scheme) {
-  if (color_scheme == ColorScheme::kDark) {
+IndicatorColors GetKatakanaIndicatorColors(SystemColorTheme color_scheme) {
+  if (color_scheme == SystemColorTheme::kDark) {
     return {
         RGBColor(42, 44, 70),
         RGBColor(126, 135, 245),
@@ -202,7 +198,7 @@ IndicatorColors GetKatakanaIndicatorColors(ColorScheme color_scheme) {
   };
 }
 
-IndicatorColors GetIndicatorColors(int mode, ColorScheme color_scheme) {
+IndicatorColors GetIndicatorColors(int mode, SystemColorTheme color_scheme) {
   switch (mode) {
     case commands::HIRAGANA:
       return GetHiraganaIndicatorColors(color_scheme);
@@ -216,6 +212,39 @@ IndicatorColors GetIndicatorColors(int mode, ColorScheme color_scheme) {
     case commands::FULL_ASCII:
     default:
       return GetAsciiIndicatorColors(color_scheme);
+  }
+}
+
+IndicatorColors GetCustomIndicatorColors(
+    int mode, const WindowsModeIndicatorStyle& style) {
+  switch (mode) {
+    case commands::HIRAGANA:
+      return {
+          RgbColorFromHex(style.hiragana_background_color),
+          RgbColorFromHex(style.hiragana_border_color),
+          RgbColorFromHex(style.hiragana_shadow_color),
+          RgbColorFromHex(style.hiragana_text_color),
+      };
+
+    case commands::FULL_KATAKANA:
+    case commands::HALF_KATAKANA:
+      return {
+          RgbColorFromHex(style.katakana_background_color),
+          RgbColorFromHex(style.katakana_border_color),
+          RgbColorFromHex(style.katakana_shadow_color),
+          RgbColorFromHex(style.katakana_text_color),
+      };
+
+    case commands::DIRECT:
+    case commands::HALF_ASCII:
+    case commands::FULL_ASCII:
+    default:
+      return {
+          RgbColorFromHex(style.ascii_background_color),
+          RgbColorFromHex(style.ascii_border_color),
+          RgbColorFromHex(style.ascii_shadow_color),
+          RgbColorFromHex(style.ascii_text_color),
+      };
   }
 }
 
@@ -238,6 +267,162 @@ const char* GetIndicatorLabel(int mode) {
   }
 }
 
+struct PrivacyShieldPoint {
+  double x;
+  double y;
+};
+
+bool IsInsidePrivacyShield(double x, double y,
+                           const PrivacyShieldPoint* points,
+                           size_t point_count) {
+  bool inside = false;
+  for (size_t i = 0, j = point_count - 1; i < point_count; j = i++) {
+    const PrivacyShieldPoint& a = points[i];
+    const PrivacyShieldPoint& b = points[j];
+    const bool crosses = (a.y > y) != (b.y > y);
+    if (!crosses) {
+      continue;
+    }
+    const double intersect_x =
+        (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x;
+    if (x < intersect_x) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+void DrawPrivacyShieldOnIndicator(HBITMAP bitmap, const CPoint& tail_offset,
+                                  double body_width, double body_height,
+                                  const RGBColor& color,
+                                  double label_point_size,
+                                  double dpi_scaling) {
+  if (bitmap == nullptr || body_width <= 0.0 || body_height <= 0.0) {
+    return;
+  }
+
+  BITMAP bitmap_info = {};
+  if (::GetObject(bitmap, sizeof(bitmap_info), &bitmap_info) == 0 ||
+      bitmap_info.bmBits == nullptr || bitmap_info.bmBitsPixel != 32 ||
+      bitmap_info.bmWidth <= 0 || bitmap_info.bmHeight == 0) {
+    return;
+  }
+
+  const int bitmap_width = bitmap_info.bmWidth;
+  const int bitmap_height = std::abs(bitmap_info.bmHeight);
+  const int stride = bitmap_info.bmWidthBytes;
+  if (stride < bitmap_width * 4) {
+    return;
+  }
+
+  // Indicator sprites use a top-side balloon with zero tail. Therefore the
+  // tail offset is the top-center of the indicator body.
+  const double body_left = tail_offset.x - body_width / 2.0;
+  const double body_top = tail_offset.y;
+
+  const double scale = std::max(dpi_scaling, 0.5);
+  // Keep the badge subordinate to the mode glyph. The previous badge was
+  // visually too dominant at normal Windows scaling, so reduce it to about
+  // two-thirds of the previous linear size while preserving DPI scaling.
+  const double shield_width =
+      std::clamp(body_width * 0.12, 3.5 * scale, 5.0 * scale);
+  const double shield_height =
+      std::clamp(body_height * 0.19, 4.0 * scale, 5.8 * scale);
+
+  // BalloonImage centers the one-character mode label in the body. Anchor the
+  // privacy badge to that centered label instead of the outer frame so the
+  // badge visually follows the glyph. 12 pt at 96 DPI is roughly 16 px; the
+  // conservative half-width estimate below intentionally leaves a small gap
+  // rather than touching the glyph.
+  const double label_em =
+      std::max(1.0, label_point_size * scale * kDefaultDPI / 72.0);
+  const double label_center_x = body_left + body_width / 2.0;
+  const double label_center_y = body_top + body_height / 2.0;
+  const double label_half_width =
+      std::min(body_width * 0.28, label_em * 0.46);
+  const double label_half_height =
+      std::min(body_height * 0.34, label_em * 0.50);
+  const double glyph_gap = std::max(0.35 * scale, 0.02 * label_em);
+
+  const double left = label_center_x + label_half_width + glyph_gap;
+  const double right = left + shield_width;
+  const double top =
+      label_center_y - label_half_height - 0.40 * scale;
+  const double bottom = top + shield_height;
+  const double center_x = (left + right) / 2.0;
+  const double middle_y = top + shield_height * 0.48;
+
+  // Keep the same filled-shield silhouette used by the taskbar privacy badge,
+  // but place it immediately at the upper-right of the centered mode glyph.
+  const PrivacyShieldPoint points[] = {
+      {left, top + shield_height * 0.12},
+      {center_x, top},
+      {right, top + shield_height * 0.12},
+      {right, middle_y},
+      {right - shield_width * 0.14, bottom - shield_height * 0.20},
+      {center_x, bottom},
+      {left + shield_width * 0.14, bottom - shield_height * 0.20},
+      {left, middle_y},
+  };
+
+  const int x_begin =
+      std::max(0, static_cast<int>(std::floor(left)) - 1);
+  const int x_end =
+      std::min(bitmap_width, static_cast<int>(std::ceil(right)) + 1);
+  const int y_begin =
+      std::max(0, static_cast<int>(std::floor(top)) - 1);
+  const int y_end =
+      std::min(bitmap_height, static_cast<int>(std::ceil(bottom)) + 1);
+
+  auto* bits = static_cast<uint8_t*>(bitmap_info.bmBits);
+  constexpr int kSamplesPerAxis = 4;
+  constexpr int kSampleCount = kSamplesPerAxis * kSamplesPerAxis;
+
+  for (int y = y_begin; y < y_end; ++y) {
+    for (int x = x_begin; x < x_end; ++x) {
+      int covered = 0;
+      for (int sample_y = 0; sample_y < kSamplesPerAxis; ++sample_y) {
+        for (int sample_x = 0; sample_x < kSamplesPerAxis; ++sample_x) {
+          const double px =
+              x + (sample_x + 0.5) / kSamplesPerAxis;
+          const double py =
+              y + (sample_y + 0.5) / kSamplesPerAxis;
+          if (IsInsidePrivacyShield(px, py, points, std::size(points))) {
+            ++covered;
+          }
+        }
+      }
+      if (covered == 0) {
+        continue;
+      }
+
+      const double src_alpha =
+          static_cast<double>(covered) / kSampleCount;
+      const double inverse_alpha = 1.0 - src_alpha;
+      uint8_t* pixel = bits + y * stride + x * 4;
+
+      const auto blend_channel =
+          [src_alpha, inverse_alpha](uint8_t foreground,
+                                     uint8_t destination) -> uint8_t {
+        const long value = std::lround(
+            foreground * src_alpha + destination * inverse_alpha);
+        return static_cast<uint8_t>(std::clamp(value, 0L, 255L));
+      };
+
+      // DIB pixels are premultiplied BGRA. The indicator body underneath is
+      // already alpha-bearing; source-over keeps the shield anti-aliased.
+      pixel[0] = blend_channel(color.b, pixel[0]);
+      pixel[1] = blend_channel(color.g, pixel[1]);
+      pixel[2] = blend_channel(color.r, pixel[2]);
+
+      const long alpha_value = std::lround(
+          255.0 * src_alpha + pixel[3] * inverse_alpha);
+      pixel[3] =
+          static_cast<uint8_t>(std::clamp(alpha_value, 0L, 255L));
+    }
+  }
+}
+
 }  // namespace
 
 class IndicatorWindow::WindowImpl
@@ -249,8 +434,12 @@ class IndicatorWindow::WindowImpl
       : current_image_(nullptr),
         alpha_(255),
         dpi_scaling_(GetDPIScaling()),
-        color_scheme_(GetWindowsAppColorScheme()) {
+        configured_theme_(GetModeIndicatorThemePreference()),
+        color_scheme_(ResolveModeIndicatorColorTheme(configured_theme_)),
+        custom_style_(GetWindowsModeIndicatorStyle(
+            *config::ConfigHandler::GetSharedConfig())) {
     sprites_.resize(commands::NUM_OF_COMPOSITIONS);
+    private_sprites_.resize(commands::NUM_OF_COMPOSITIONS);
   }
   WindowImpl(const WindowImpl&) = delete;
   WindowImpl& operator=(const WindowImpl&) = delete;
@@ -266,6 +455,7 @@ class IndicatorWindow::WindowImpl
                 LayoutManager* layout_manager) {
     KillTimer(kTimerEventFading);
     KillTimer(kTimerEventFadeStart);
+    ReloadSpritesIfConfiguredAppearanceChanged();
 
     bool visible = false;
     IndicatorWindowLayout indicator_layout;
@@ -284,14 +474,21 @@ class IndicatorWindow::WindowImpl
     DCHECK(command.has_application_info());
     DCHECK(command.application_info().has_indicator_info());
     DCHECK(command.application_info().indicator_info().has_status());
-    const Status& status = command.application_info().indicator_info().status();
+    const auto& indicator_info =
+        command.application_info().indicator_info();
+    const bool is_private_input = indicator_info.is_private_input();
+    const std::vector<Sprite>& active_sprites =
+        is_private_input ? private_sprites_ : sprites_;
+    const Status& status = indicator_info.status();
 
     alpha_ = 255;
-    current_image_ = sprites_[commands::DIRECT].bitmap.get();
-    CPoint offset = sprites_[commands::DIRECT].offset;
+    current_image_ = active_sprites[commands::DIRECT].bitmap.get();
+    CPoint offset = active_sprites[commands::DIRECT].offset;
+    int body_height = active_sprites[commands::DIRECT].body_height;
     if (!status.has_activated() || !status.has_mode() || !status.activated()) {
-      current_image_ = sprites_[commands::DIRECT].bitmap.get();
-      offset = sprites_[commands::DIRECT].offset;
+      current_image_ = active_sprites[commands::DIRECT].bitmap.get();
+      offset = active_sprites[commands::DIRECT].offset;
+      body_height = active_sprites[commands::DIRECT].body_height;
     } else {
       const int mode = status.mode();
       switch (mode) {
@@ -300,8 +497,9 @@ class IndicatorWindow::WindowImpl
         case commands::HALF_ASCII:
         case commands::FULL_ASCII:
         case commands::HALF_KATAKANA:
-          current_image_ = sprites_[mode].bitmap.get();
-          offset = sprites_[mode].offset;
+          current_image_ = active_sprites[mode].bitmap.get();
+          offset = active_sprites[mode].offset;
+          body_height = active_sprites[mode].body_height;
           break;
       }
     }
@@ -309,8 +507,28 @@ class IndicatorWindow::WindowImpl
       HideIndicator();
       return;
     }
-    top_left_ = CPoint(indicator_layout.window_rect.left - offset.x,
-                       indicator_layout.window_rect.bottom - offset.y);
+    BITMAP bm = {};
+    if (::GetObject(current_image_, sizeof(bm), &bm) == 0 ||
+        bm.bmWidth <= 0 || bm.bmHeight <= 0) {
+      HideIndicator();
+      return;
+    }
+
+    const CRect& target = indicator_layout.window_rect;
+    Rect working_area;
+    CRect native_working_area;
+    if (GetWorkingAreaFromPoint(CPoint(target.left, target.bottom),
+                                &native_working_area)) {
+      working_area =
+          Rect(native_working_area.left, native_working_area.top,
+               native_working_area.Width(), native_working_area.Height());
+    }
+
+    const Rect indicator_rect = WindowUtil::GetIndicatorWindowRect(
+        Rect(target.left, target.top, target.Width(), target.Height()),
+        Size(bm.bmWidth, bm.bmHeight), Point(offset.x, offset.y), body_height,
+        kMaxFadingOutOffset, working_area);
+    top_left_ = CPoint(indicator_rect.Left(), indicator_rect.Top());
     UpdateWindow();
 
     // Start fading out.
@@ -333,7 +551,7 @@ class IndicatorWindow::WindowImpl
 
     // Fading out animation.
     CPoint top_left = top_left_;
-    top_left.y += (255 - alpha_) / 32;
+    top_left.y += (255 - alpha_) / kFadingOutSlideDivisor;
 
     CPoint src_left_top(0, 0);
     BLENDFUNCTION func = {AC_SRC_OVER, 0, alpha_, AC_SRC_ALPHA};
@@ -350,18 +568,24 @@ class IndicatorWindow::WindowImpl
   void ReloadSprites() {
     current_image_ = nullptr;
 
-    for (Sprite& sprite : sprites_) {
-      sprite.bitmap.reset();
-      sprite.offset = CPoint(0, 0);
-    }
+    const auto reset_sprites = [](std::vector<Sprite>* sprites) {
+      for (Sprite& sprite : *sprites) {
+        sprite.bitmap.reset();
+        sprite.offset = CPoint(0, 0);
+        sprite.body_height = 0;
+      }
+    };
+    reset_sprites(&sprites_);
+    reset_sprites(&private_sprites_);
 
     for (size_t i = 0; i < std::size(kIndicatorModes); ++i) {
-      LoadSprite(kIndicatorModes[i]);
+      LoadSprite(kIndicatorModes[i], false);
+      LoadSprite(kIndicatorModes[i], true);
     }
   }
 
-  void ReloadSpritesIfColorSchemeChanged() {
-    const ColorScheme new_color_scheme = GetWindowsAppColorScheme();
+  void ReloadSpritesIfColorSchemeChanged(
+      SystemColorTheme new_color_scheme) {
     if (new_color_scheme == color_scheme_) {
       return;
     }
@@ -372,6 +596,48 @@ class IndicatorWindow::WindowImpl
     // Hide the window before destroying and recreating sprite bitmaps.
     HideIndicator();
     ReloadSprites();
+  }
+
+  void ReloadSpritesIfConfiguredAppearanceChanged() {
+    const auto shared_config = config::ConfigHandler::GetSharedConfig();
+    const ModeIndicatorTheme new_configured_theme =
+        shared_config->windows_mode_indicator_theme();
+
+    SystemColorTheme new_color_scheme = color_scheme_;
+    if (new_configured_theme != configured_theme_) {
+      new_color_scheme =
+          ResolveModeIndicatorColorTheme(new_configured_theme);
+    }
+
+    WindowsModeIndicatorStyle new_custom_style = custom_style_;
+    if (new_configured_theme ==
+        config::Config::WINDOWS_MODE_INDICATOR_THEME_CUSTOM) {
+      new_custom_style = GetWindowsModeIndicatorStyle(*shared_config);
+    }
+
+    const bool appearance_changed =
+        new_configured_theme != configured_theme_ ||
+        new_color_scheme != color_scheme_ ||
+        (new_configured_theme ==
+             config::Config::WINDOWS_MODE_INDICATOR_THEME_CUSTOM &&
+         new_custom_style != custom_style_);
+    if (!appearance_changed) {
+      return;
+    }
+
+    configured_theme_ = new_configured_theme;
+    color_scheme_ = new_color_scheme;
+    custom_style_ = new_custom_style;
+    HideIndicator();
+    ReloadSprites();
+  }
+
+  void ReloadSpritesIfSystemColorSchemeChanged() {
+    if (configured_theme_ !=
+        config::Config::WINDOWS_MODE_INDICATOR_THEME_SYSTEM) {
+      return;
+    }
+    ReloadSpritesIfColorSchemeChanged(GetSystemColorTheme());
   }
 
   LRESULT OnCreate(LPCREATESTRUCT create_struct) {
@@ -402,12 +668,12 @@ class IndicatorWindow::WindowImpl
     }
 
     if (IsImmersiveColorSetChange(lpszSection)) {
-      ReloadSpritesIfColorSchemeChanged();
+      ReloadSpritesIfSystemColorSchemeChanged();
     }
   }
 
   void OnThemeChanged() {
-    ReloadSpritesIfColorSchemeChanged();
+    ReloadSpritesIfSystemColorSchemeChanged();
   }
 
   void EnableOrDisableWindowForWorkaround() {
@@ -422,24 +688,51 @@ class IndicatorWindow::WindowImpl
     }
   }
 
-  void LoadSprite(int mode) {
+  void LoadSprite(int mode, bool is_private_input) {
+    std::vector<Sprite>& sprite_set =
+        is_private_input ? private_sprites_ : sprites_;
+    Sprite& sprite = sprite_set[mode];
+
     BalloonImage::BalloonImageInfo info;
     LOGFONT logfont = GetMessageBoxLogFont(::GetDpiForSystem());
     info.label_font = mozc::win32::WideToUtf8(logfont.lfFaceName);
 
-    info.rect_width = ceil(dpi_scaling_ * 36.0);
-    info.rect_height = ceil(dpi_scaling_ * 28.0);
-    info.corner_radius = dpi_scaling_ * 8.0;
+    const bool custom =
+        configured_theme_ ==
+        config::Config::WINDOWS_MODE_INDICATOR_THEME_CUSTOM;
+    if (custom) {
+      info.rect_width = ceil(dpi_scaling_ * custom_style_.width);
+      info.rect_height = ceil(dpi_scaling_ * custom_style_.height);
+      info.corner_radius = dpi_scaling_ * custom_style_.corner_radius;
+      info.blur_sigma = dpi_scaling_ * custom_style_.shadow_blur;
+      info.blur_alpha =
+          static_cast<double>(custom_style_.shadow_opacity_percent) / 100.0;
+      info.frame_thickness =
+          dpi_scaling_ * custom_style_.border_thickness;
+      info.label_size = static_cast<int>(custom_style_.label_size);
+      info.blur_offset_x = static_cast<int>(
+          std::lround(dpi_scaling_ * custom_style_.shadow_offset_x));
+      info.blur_offset_y = static_cast<int>(
+          std::lround(dpi_scaling_ * custom_style_.shadow_offset_y));
+    } else {
+      info.rect_width = ceil(dpi_scaling_ * 36.0);
+      info.rect_height = ceil(dpi_scaling_ * 28.0);
+      info.corner_radius = dpi_scaling_ * 8.0;
+      info.blur_sigma = dpi_scaling_ * 4.0;
+      info.blur_alpha =
+          color_scheme_ == SystemColorTheme::kDark ? 0.25 : 0.22;
+      info.frame_thickness = dpi_scaling_ * 1.0;
+      info.label_size = 12;
+      info.blur_offset_x = 0;
+      info.blur_offset_y =
+          static_cast<int>(ceil(dpi_scaling_ * 1.0));
+    }
     info.tail_height = 0.0;
     info.tail_width = 0.0;
-    info.blur_sigma = dpi_scaling_ * 4.0;
-    info.blur_alpha = color_scheme_ == ColorScheme::kDark ? 0.25 : 0.22;
-    info.frame_thickness = dpi_scaling_ * 1.0;
-    info.label_size = 12.0;
-    info.blur_offset_x = 0;
-    info.blur_offset_y = static_cast<int>(ceil(dpi_scaling_ * 1.0));
 
-    const IndicatorColors colors = GetIndicatorColors(mode, color_scheme_);
+    const IndicatorColors colors =
+        custom ? GetCustomIndicatorColors(mode, custom_style_)
+               : GetIndicatorColors(mode, color_scheme_);
     info.inside_color = colors.inside;
     info.frame_color = colors.frame;
     info.blur_color = colors.blur;
@@ -447,8 +740,15 @@ class IndicatorWindow::WindowImpl
     info.label = GetIndicatorLabel(mode);
 
     if (!info.label.empty()) {
-      sprites_[mode].bitmap.reset(
-          BalloonImage::Create(info, &sprites_[mode].offset));
+      sprite.body_height =
+          static_cast<int>(std::ceil(std::max(info.rect_height, 0.0)));
+      sprite.bitmap.reset(
+          BalloonImage::Create(info, &sprite.offset));
+      if (is_private_input && sprite.bitmap.is_valid()) {
+        DrawPrivacyShieldOnIndicator(
+            sprite.bitmap.get(), sprite.offset, info.rect_width,
+            info.rect_height, colors.label, info.label_size, dpi_scaling_);
+      }
     }
   }
 
@@ -479,16 +779,19 @@ class IndicatorWindow::WindowImpl
   CPoint top_left_;
   BYTE alpha_;
   double dpi_scaling_;
-  ColorScheme color_scheme_;
+  ModeIndicatorTheme configured_theme_;
+  SystemColorTheme color_scheme_;
+  WindowsModeIndicatorStyle custom_style_;
   std::vector<Sprite> sprites_;
+  std::vector<Sprite> private_sprites_;
 };
 
 IndicatorWindow::IndicatorWindow() : impl_(new WindowImpl) {}
 
 IndicatorWindow::~IndicatorWindow() { impl_->DestroyWindow(); }
 
-void IndicatorWindow::Initialize() {
-  impl_->Create(nullptr);
+void IndicatorWindow::Initialize(HWND owner_window) {
+  impl_->Create(owner_window);
   impl_->ShowWindow(SW_HIDE);
 }
 

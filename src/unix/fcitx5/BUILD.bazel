@@ -94,6 +94,69 @@ mozc_cc_test(
     ],
 )
 
+# Fcitx-free policy for the client obligations carried by a Mozc Output
+# (callbacks, context loss, key mode hint, redraw suppression).
+mozc_cc_library(
+    name = "session_callback",
+    srcs = [
+        "session_callback.cc",
+    ],
+    hdrs = [
+        "session_callback.h",
+    ],
+    deps = [
+        "//protocol:commands_cc_proto",
+    ],
+)
+
+mozc_cc_test(
+    name = "session_callback_test",
+    size = "small",
+    srcs = [
+        "session_callback_test.cc",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":session_callback",
+        "//protocol:commands_cc_proto",
+        "//testing:gunit_main",
+    ],
+)
+
+# Fcitx-free helpers for the text of the aux line (reading, conversion
+# status) and for classifying candidate windows.
+mozc_cc_library(
+    name = "display_status",
+    srcs = [
+        "display_status.cc",
+    ],
+    hdrs = [
+        "display_status.h",
+    ],
+    deps = [
+        "//protocol:candidate_window_cc_proto",
+        "//protocol:commands_cc_proto",
+        "//protocol:config_cc_proto",
+        "//renderer:live_conversion_reading",
+    ],
+)
+
+mozc_cc_test(
+    name = "display_status_test",
+    size = "small",
+    srcs = [
+        "display_status_test.cc",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":display_status",
+        "//protocol:candidate_window_cc_proto",
+        "//protocol:commands_cc_proto",
+        "//protocol:config_cc_proto",
+        "//testing:gunit_main",
+    ],
+)
+
 mozc_cc_library(
     name = "grimodex_consumer_registrar",
     srcs = [
@@ -191,6 +254,7 @@ mozc_cc_library(
     deps = [
         ":mozc_client_interface",
         "//base:vlog",
+        "//client:character_renderability",
         "//config:config_handler",
         "//data_manager/oss:oss_data_manager",
         "//engine",
@@ -241,12 +305,14 @@ mozc_cc_library(
         "mozc_state.h",
     ],
     deps = [
+        ":display_status",
         ":fcitx_key_util",
         ":grimodex_consumer_registrar",
         ":grimodex_context",
         ":i18nwrapper",
         ":mozc_client_pool",
         ":raw_reading_recovery",
+        ":session_callback",
         ":surrounding_text_util",
         "//base:environ",
         "//base:init_mozc",
@@ -303,6 +369,22 @@ mozc_cc_library(
         "//protocol:commands_cc_proto",
         "//protocol:config_cc_proto",
         "@com_google_absl//absl/log:check",
+        "@fcitx5",
+    ],
+)
+
+mozc_cc_test(
+    name = "fcitx_key_translator_test",
+    size = "small",
+    srcs = [
+        "fcitx_key_translator_test.cc",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":fcitx_key_util",
+        "//protocol:commands_cc_proto",
+        "//protocol:config_cc_proto",
+        "//testing:gunit_main",
         "@fcitx5",
     ],
 )

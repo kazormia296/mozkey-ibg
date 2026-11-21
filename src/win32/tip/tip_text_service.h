@@ -88,6 +88,10 @@ class TipTextService : public IUnknown {
   virtual bool IsModeCallbackCurrent(TipModeCallbackKind kind,
                                      uint64_t generation) const = 0;
 
+  // Returns true when TSF activated this TIP for an immersive host. The
+  // default keeps existing test/mocking implementations source-compatible.
+  virtual bool IsImmersiveMode() const { return false; }
+
   // Sends UI update message to the renderer.
   virtual void PostUIUpdateMessage() = 0;
 
@@ -101,6 +105,13 @@ class TipTextService : public IUnknown {
   // Returns the GUID atom for the display attributes.
   virtual TfGuidAtom input_attribute() const = 0;
   virtual TfGuidAtom converted_attribute() const = 0;
+  // Defaults keep existing mocks/source users compatible.
+  virtual TfGuidAtom zenz_live_correction_attribute() const {
+    return TF_INVALID_GUIDATOM;
+  }
+  virtual TfGuidAtom pending_roman_attribute() const {
+    return TF_INVALID_GUIDATOM;
+  }
 
   // Returns the window handle of render callback window.
   // Returns nullptr if it is not available.

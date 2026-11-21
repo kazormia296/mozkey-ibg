@@ -90,6 +90,9 @@ FCITX_CONFIGURATION(
         false};
     Option<Key> expand{this, "ExpandKey", _("Hotkey to expand usage"),
                        Key("Control+Alt+H")};
+    Option<bool> showConversionStatus{
+        this, "ShowConversionStatus",
+        _("Show conversion status (Mozc / Zenz) next to the reading"), true};
 
     ExternalOption configTool{this, "ConfigTool", _("Configuration Tool"),
                               toolCommand("--mode=config_dialog")};

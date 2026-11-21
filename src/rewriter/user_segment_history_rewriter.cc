@@ -40,37 +40,34 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/btree_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "base/config_file_stream.h"
 #include "base/file_util.h"
-#include "base/number_util.h"
+#include "base/strings/japanese.h"
 #include "base/util.h"
 #include "base/vlog.h"
-#include "config/character_form_manager.h"
 #include "converter/attribute.h"
 #include "converter/candidate.h"
+#include "converter/inner_segment.h"
 #include "converter/segments.h"
 #include "dictionary/pos_group.h"
 #include "dictionary/pos_matcher.h"
 #include "protocol/config.pb.h"
 #include "request/conversion_request.h"
 #include "rewriter/rewriter_interface.h"
-#include "rewriter/variants_rewriter.h"
 #include "storage/lru_storage.h"
-#include "transliteration/transliteration.h"
 
 namespace mozc {
 namespace {
 
-using ::mozc::config::CharacterFormManager;
 using ::mozc::config::Config;
 using ::mozc::dictionary::PosGroup;
 using ::mozc::dictionary::PosMatcher;
@@ -88,11 +85,6 @@ constexpr size_t kMaxRerankSize = 5;
 constexpr char kFileName[] = "user://segment.db";
 
 constexpr size_t kRevertCacheSize = 16;
-
-bool IsNumberStyleLearningEnabled(const ConversionRequest& request) {
-  // Enabled in mobile (software keyboard & hardware keyboard)
-  return request.request().kana_modifier_insensitive_conversion();
-}
 
 bool UseInnerSegments(const ConversionRequest& request) {
   return request.request().mixed_conversion();
@@ -179,13 +171,15 @@ class FeatureKey {
   std::string RightNumber(absl::string_view base_key,
                           absl::string_view base_value) const;
 
-  static std::string Number(uint16_t type);
-
  private:
   const Segments& segments_;
   const PosMatcher& pos_matcher_;
   const size_t index_;
 };
+
+inline std::string NormalizeValue(absl::string_view value) {
+  return japanese::FullWidthAsciiToHalfWidthAscii(value);
+}
 
 // Feature "Left Right"
 std::string FeatureKey::LeftRight(absl::string_view base_key,
@@ -196,8 +190,10 @@ std::string FeatureKey::LeftRight(absl::string_view base_key,
   const int j1 = GetDefaultCandidateIndex(segments_.segment(index_ - 1));
   const int j2 = GetDefaultCandidateIndex(segments_.segment(index_ + 1));
   return StrJoinWithTabs(
-      "LR", base_key, segments_.segment(index_ - 1).candidate(j1).value,
-      base_value, segments_.segment(index_ + 1).candidate(j2).value);
+      "LR", base_key,
+      NormalizeValue(segments_.segment(index_ - 1).candidate(j1).value),
+      NormalizeValue(base_value),
+      NormalizeValue(segments_.segment(index_ + 1).candidate(j2).value));
 }
 
 // Feature "Left Left"
@@ -209,8 +205,10 @@ std::string FeatureKey::LeftLeft(absl::string_view base_key,
   const int j1 = GetDefaultCandidateIndex(segments_.segment(index_ - 2));
   const int j2 = GetDefaultCandidateIndex(segments_.segment(index_ - 1));
   return StrJoinWithTabs(
-      "LL", base_key, segments_.segment(index_ - 2).candidate(j1).value,
-      segments_.segment(index_ - 1).candidate(j2).value, base_value);
+      "LL", base_key,
+      NormalizeValue(segments_.segment(index_ - 2).candidate(j1).value),
+      NormalizeValue(segments_.segment(index_ - 1).candidate(j2).value),
+      NormalizeValue(base_value));
 }
 
 // Feature "Right Right"
@@ -221,9 +219,10 @@ std::string FeatureKey::RightRight(absl::string_view base_key,
   }
   const int j1 = GetDefaultCandidateIndex(segments_.segment(index_ + 1));
   const int j2 = GetDefaultCandidateIndex(segments_.segment(index_ + 2));
-  return StrJoinWithTabs("RR", base_key, base_value,
-                         segments_.segment(index_ + 1).candidate(j1).value,
-                         segments_.segment(index_ + 2).candidate(j2).value);
+  return StrJoinWithTabs(
+      "RR", base_key, NormalizeValue(base_value),
+      NormalizeValue(segments_.segment(index_ + 1).candidate(j1).value),
+      NormalizeValue(segments_.segment(index_ + 2).candidate(j2).value));
 }
 
 // Feature "Left"
@@ -233,9 +232,10 @@ std::string FeatureKey::Left(absl::string_view base_key,
     return "";
   }
   const int j = GetDefaultCandidateIndex(segments_.segment(index_ - 1));
-  return StrJoinWithTabs("L", base_key,
-                         segments_.segment(index_ - 1).candidate(j).value,
-                         base_value);
+  return StrJoinWithTabs(
+      "L", base_key,
+      NormalizeValue(segments_.segment(index_ - 1).candidate(j).value),
+      NormalizeValue(base_value));
 }
 
 // Feature "Right"
@@ -245,14 +245,15 @@ std::string FeatureKey::Right(absl::string_view base_key,
     return "";
   }
   const int j = GetDefaultCandidateIndex(segments_.segment(index_ + 1));
-  return StrJoinWithTabs("R", base_key, base_value,
-                         segments_.segment(index_ + 1).candidate(j).value);
+  return StrJoinWithTabs(
+      "R", base_key, NormalizeValue(base_value),
+      NormalizeValue(segments_.segment(index_ + 1).candidate(j).value));
 }
 
 // Feature "Current"
 std::string FeatureKey::Current(absl::string_view base_key,
                                 absl::string_view base_value) const {
-  return StrJoinWithTabs("C", base_key, base_value);
+  return StrJoinWithTabs("C", base_key, NormalizeValue(base_value));
 }
 
 // Feature "Single"
@@ -261,7 +262,7 @@ std::string FeatureKey::Single(absl::string_view base_key,
   if (segments_.conversion_segments_size() != 1) {
     return "";
   }
-  return StrJoinWithTabs("S", base_key, base_value);
+  return StrJoinWithTabs("S", base_key, NormalizeValue(base_value));
 }
 
 // Feature "Left Number"
@@ -276,7 +277,7 @@ std::string FeatureKey::LeftNumber(absl::string_view base_key,
   if (pos_matcher_.IsNumber(candidate.rid) ||
       pos_matcher_.IsKanjiNumber(candidate.rid) ||
       Util::GetScriptType(candidate.value) == Util::NUMBER) {
-    return StrJoinWithTabs("LN", base_key, base_value);
+    return StrJoinWithTabs("LN", base_key, NormalizeValue(base_value));
   }
   return "";
 }
@@ -293,15 +294,9 @@ std::string FeatureKey::RightNumber(absl::string_view base_key,
   if (pos_matcher_.IsNumber(candidate.lid) ||
       pos_matcher_.IsKanjiNumber(candidate.lid) ||
       Util::GetScriptType(candidate.value) == Util::NUMBER) {
-    return StrJoinWithTabs("RN", base_key, base_value);
+    return StrJoinWithTabs("RN", base_key, NormalizeValue(base_value));
   }
   return "";
-}
-
-// Feature "Number"
-// used for number rewrite
-std::string FeatureKey::Number(uint16_t type) {
-  return StrJoinWithTabs("N", absl::StrCat(type));
 }
 
 bool IsNumberSegment(const Segment& segment) {
@@ -316,65 +311,6 @@ bool IsNumberSegment(const Segment& segment) {
     }
   }
   return is_number;
-}
-
-void GetValueByType(const Segment* segment,
-                    NumberUtil::NumberString::Style style,
-                    std::string* output) {
-  DCHECK(output);
-  for (const converter::Candidate* candidate : segment->candidates()) {
-    if (candidate->style == style) {
-      *output = candidate->value;
-      return;
-    }
-  }
-}
-
-// NormalizeCandidate using config
-void NormalizeCandidate(const Segment* segment, int n,
-                        std::string* normalized_value) {
-  const converter::Candidate& candidate = segment->candidate(n);
-
-  // use "AS IS"
-  if (candidate.attributes & converter::Attribute::NO_VARIANTS_EXPANSION) {
-    *normalized_value = candidate.value;
-    return;
-  }
-
-  std::string result = candidate.value;
-  switch (candidate.style) {
-    case NumberUtil::NumberString::DEFAULT_STYLE:
-      CharacterFormManager::GetCharacterFormManager()->ConvertConversionString(
-          candidate.value, &result);
-      break;
-    case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH:
-    case NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH:
-      // Convert separated arabic here and don't use character form manager
-      // so that suppressing mixed form of candidates
-      // ("1，234" etc.)
-      // and the forms of separated arabics are learned in converter using
-      // style.
-      {
-        const Config::CharacterForm form =
-            CharacterFormManager::GetCharacterFormManager()
-                ->GetConversionCharacterForm("0");
-        if (form == Config::FULL_WIDTH) {
-          GetValueByType(
-              segment,
-              NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH,
-              &result);
-        } else if (form == Config::HALF_WIDTH) {
-          GetValueByType(
-              segment,
-              NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH,
-              &result);
-        }
-      }
-      break;
-    default:
-      break;
-  }
-  *normalized_value = result;
 }
 
 // Gets the candidate index which has same value as given candidate.
@@ -449,12 +385,12 @@ void UpdateBestCandidateAfterUserSegmentHistoryRewrite(Segment* segment) {
 bool UserSegmentHistoryRewriter::SortCandidates(
     absl::Span<const ScoreCandidate> sorted_scores, Segment* segment) const {
   const uint32_t top_score = sorted_scores[0].score;
-  const size_t size = std::min(sorted_scores.size(), kMaxRerankSize);
   constexpr uint32_t kScoreGap = 20;  // TODO(taku): no justification
   absl::btree_set<std::string> seen;
 
   size_t next_pos = 0;
-  for (size_t n = 0; n < size; ++n) {
+  for (size_t n = 0; n < sorted_scores.size() && next_pos < kMaxRerankSize;
+       ++n) {
     // Move candidates when the score is close to the top score.
     if (kScoreGap < (top_score - sorted_scores[n].score)) {
       break;
@@ -468,58 +404,13 @@ bool UserSegmentHistoryRewriter::SortCandidates(
       return false;
     }
 
-    // We check character form here. If user prefers "half-width",
-    // Mozc always provides half-width even when user input
-    // full-width before.
-    std::string normalized_value;
-    NormalizeCandidate(segment, old_position, &normalized_value);
-
-    if (normalized_value != candidate->value) {
-      const converter::Candidate* normalized_cand = nullptr;
-      int pos = segment->candidates_size();
-      for (size_t l = 0; l < segment->candidates_size(); ++l) {
-        if (segment->candidate(l).value == normalized_value) {
-          normalized_cand = &segment->candidate(l);
-          pos = l;
-          break;
-        }
-      }
-
-      if (normalized_cand != nullptr) {
-        if (seen.find(normalized_value) == seen.end()) {
-          DCHECK(pos != segment->candidates_size());
-          segment->move_candidate(pos, next_pos);
-          ++next_pos;
-          seen.insert(normalized_value);
-        }
-      } else {
-        // If default character form is different and
-        // is not found in the candidates, make a new
-        // candidate and push it to the top.
-        converter::Candidate* new_candidate =
-            segment->insert_candidate(next_pos);
-        DCHECK(new_candidate);
-
-        *new_candidate = *candidate;  // copy candidate
-        new_candidate->value = normalized_value;
-        CharacterFormManager::GetCharacterFormManager()
-            ->ConvertConversionString(candidate->content_value,
-                                      &(new_candidate->content_value));
-        // Update description so it matches candidate's current value.
-        // This fix addresses Bug #3493644.
-        // (Wrong character width annotation after learning alphabet)
-        new_candidate->description.clear();
-        VariantsRewriter::SetDescriptionForCandidate(*pos_matcher_,
-                                                     new_candidate);
-        ++next_pos;
-        seen.insert(normalized_value);
-      }
-    } else {
-      if (seen.find(candidate->value) == seen.end()) {
-        segment->move_candidate(old_position, next_pos);
-        ++next_pos;
-        seen.insert(candidate->value);
-      }
+    const std::string seen_key =
+        (candidate->attributes & converter::Attribute::NO_VARIANTS_EXPANSION)
+            ? candidate->value
+            : NormalizeValue(candidate->value);
+    if (seen.insert(seen_key).second) {
+      segment->move_candidate(old_position, next_pos);
+      ++next_pos;
     }
   }
   return true;
@@ -626,37 +517,11 @@ bool UserSegmentHistoryRewriter::Replaceable(
            IsT13NCandidate(target_candidate)));
 }
 
-void UserSegmentHistoryRewriter::RememberNumberPreference(
-    const Segment& segment, std::vector<RevertEntry>& revert_entries) {
-  const converter::Candidate& candidate = segment.candidate(0);
-
-  if ((candidate.style ==
-       NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH) ||
-      (candidate.style ==
-       NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH)) {
-    // in the case of:
-    // 1. submit "123"
-    // 2. submit "一二三"
-    // 3. submit "１、２３４"
-    // 4. type "123"
-    // We want "１２３", not "一二三"
-    // So learn default before learning separated
-    // However, access time is count by second, so
-    // separated and default is learned at same time
-    // This problem is solved by workaround on lookup.
-    Insert(FeatureKey::Number(NumberUtil::NumberString::DEFAULT_STYLE),
-          candidate.value, 0, candidate.value.size(), true, revert_entries);
-  }
-
-  // Always insert for numbers
-  Insert(FeatureKey::Number(candidate.style), candidate.value, 0,
-        candidate.value.size(), true, revert_entries);
-}
-
 void UserSegmentHistoryRewriter::RememberFirstCandidate(
     const ConversionRequest& request, const Segments& segments,
     size_t segment_index, size_t value_begin, size_t value_end,
-    std::vector<RevertEntry>& revert_entries) {
+    std::vector<RevertEntry>& revert_entries,
+    std::vector<StorageRevertEntry>* external_storage_entries) {
   const Segment& seg = segments.segment(segment_index);
   const converter::Candidate& candidate = seg.candidate(0);
 
@@ -684,65 +549,51 @@ void UserSegmentHistoryRewriter::RememberFirstCandidate(
 
   FeatureKey fkey(segments, *pos_matcher_, segment_index);
 
-  Insert(fkey.LeftRight(all_key, all_value), all_value, value_begin, value_end,
-         force_insert, revert_entries);
-  Insert(fkey.LeftLeft(all_key, all_value), all_value, value_begin, value_end,
-         force_insert, revert_entries);
-  Insert(fkey.RightRight(all_key, all_value), all_value, value_begin, value_end,
-         force_insert, revert_entries);
-  Insert(fkey.Left(all_key, all_value), all_value, value_begin, value_end,
-         force_insert, revert_entries);
-  Insert(fkey.Right(all_key, all_value), all_value, value_begin, value_end,
-         force_insert, revert_entries);
-  Insert(fkey.LeftNumber(all_key, all_value), all_value, value_begin, value_end,
-         force_insert, revert_entries);
-  Insert(fkey.RightNumber(all_key, all_value), all_value, value_begin,
-         value_end, force_insert, revert_entries);
-  Insert(fkey.Single(all_key, all_value), all_value, value_begin, value_end,
-         force_insert, revert_entries);
+  auto insert = [&](absl::string_view key, absl::string_view value,
+                    size_t begin, size_t end) {
+    Insert(key, value, begin, end, force_insert, revert_entries,
+           external_storage_entries);
+  };
+
+  insert(fkey.LeftRight(all_key, all_value), all_value, value_begin, value_end);
+  insert(fkey.LeftLeft(all_key, all_value), all_value, value_begin, value_end);
+  insert(fkey.RightRight(all_key, all_value), all_value, value_begin, value_end);
+  insert(fkey.Left(all_key, all_value), all_value, value_begin, value_end);
+  insert(fkey.Right(all_key, all_value), all_value, value_begin, value_end);
+  insert(fkey.LeftNumber(all_key, all_value), all_value, value_begin, value_end);
+  insert(fkey.RightNumber(all_key, all_value), all_value, value_begin, value_end);
+  insert(fkey.Single(all_key, all_value), all_value, value_begin, value_end);
   if (!context_sensitive && is_replaceable_with_top) {
-    Insert(fkey.Current(all_key, all_value), all_value, value_begin, value_end,
-           force_insert, revert_entries);
+    insert(fkey.Current(all_key, all_value), all_value, value_begin, value_end);
   }
 
-  // Save content value separately.
   if (all_value != content_value && all_key != content_key &&
       is_replaceable_with_top) {
     const size_t content_value_begin = value_begin;
     const size_t content_value_end = value_begin + content_value.size();
 
-    Insert(fkey.LeftRight(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
-    Insert(fkey.LeftLeft(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
-    Insert(fkey.RightRight(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
-    Insert(fkey.Left(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
-    Insert(fkey.Right(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
-    Insert(fkey.LeftNumber(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
-    Insert(fkey.RightNumber(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
-    Insert(fkey.Single(content_key, content_value), content_value,
-           content_value_begin, content_value_end, force_insert,
-           revert_entries);
+    insert(fkey.LeftRight(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
+    insert(fkey.LeftLeft(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
+    insert(fkey.RightRight(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
+    insert(fkey.Left(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
+    insert(fkey.Right(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
+    insert(fkey.LeftNumber(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
+    insert(fkey.RightNumber(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
+    insert(fkey.Single(content_key, content_value), content_value,
+           content_value_begin, content_value_end);
     if (!context_sensitive) {
-      Insert(fkey.Current(content_key, content_value), content_value,
-             content_value_begin, content_value_end, force_insert,
-             revert_entries);
+      insert(fkey.Current(content_key, content_value), content_value,
+             content_value_begin, content_value_end);
     }
   }
 
-  // Learn CloseBracket when OpenBracket is fixed.
   absl::string_view close_bracket_key;
   absl::string_view close_bracket_value;
   if (Util::IsOpenBracket(content_key, &close_bracket_key) &&
@@ -751,13 +602,13 @@ void UserSegmentHistoryRewriter::RememberFirstCandidate(
     const size_t close_bracket_value_end =
         value_begin + close_bracket_value.size();
 
-    Insert(fkey.Single(close_bracket_key, close_bracket_value),
+    insert(fkey.Single(close_bracket_key, close_bracket_value),
            close_bracket_value, close_bracket_value_begin,
-           close_bracket_value_end, force_insert, revert_entries);
+           close_bracket_value_end);
     if (!context_sensitive) {
-      Insert(fkey.Current(close_bracket_key, close_bracket_value),
+      insert(fkey.Current(close_bracket_key, close_bracket_value),
              close_bracket_value, close_bracket_value_begin,
-             close_bracket_value_end, force_insert, revert_entries);
+             close_bracket_value_end);
     }
   }
 }
@@ -788,7 +639,8 @@ bool UserSegmentHistoryRewriter::IsAvailable(const ConversionRequest& request,
   }
 
   if (DisableLaegacyRewriterInMixedConversion(request,
-                                              kDisableUserSegmentHistory)) {
+                                              kDisableUserSegmentHistory) ||
+      DisableLegacyRewriter(request, kDisableUserSegmentHistory)) {
     return false;
   }
 
@@ -836,6 +688,34 @@ Segments UserSegmentHistoryRewriter::MakeLearningSegmentsFromInnerSegments(
   return ret;
 }
 
+void UserSegmentHistoryRewriter::PrepareForSuggestionLearning(
+    const ConversionRequest& request) {
+  // Undo is normally finalized by Rewrite(). A suggestion can instead be
+  // committed immediately, without an intervening ordinary conversion.
+  // Flush *before* the temporary full-reading probe, so its displayed-rank
+  // comparison cannot consult a preference scheduled for deletion.
+  if (request.request_type() == ConversionRequest::CONVERSION &&
+      request.config().history_learning_level() == Config::DEFAULT_HISTORY &&
+      !request.incognito_mode()) {
+    MaybeApplyPendingRevert(request);
+  }
+}
+
+void UserSegmentHistoryRewriter::FinishWithSuggestionLearningSegments(
+    const ConversionRequest& request, const Segments& committed_segments,
+    const Segments* suggestion_learning_segments) {
+  // Share the original commit's revert_id; do not cause a second history
+  // write. Normal conversion and an unverified suggestion use the original.
+  if (suggestion_learning_segments != nullptr &&
+      suggestion_learning_segments->revert_id() ==
+          committed_segments.revert_id() &&
+      suggestion_learning_segments->conversion_segments_size() > 0) {
+    Finish(request, *suggestion_learning_segments);
+    return;
+  }
+  Finish(request, committed_segments);
+}
+
 void UserSegmentHistoryRewriter::Finish(const ConversionRequest& request,
                                         const Segments& segments) {
   if (request.request_type() != ConversionRequest::CONVERSION) {
@@ -850,6 +730,16 @@ void UserSegmentHistoryRewriter::Finish(const ConversionRequest& request,
     MOZC_VLOG(2) << "history_learning_level is not DEFAULT_HISTORY";
     return;
   }
+
+  // A new commit must never be followed by an older Undo's deferred delete.
+  // This also protects paths that do not run the optional suggestion probe.
+  MaybeApplyPendingRevert(request);
+
+  const bool reversible_external =
+      request.options().reversible_external_learning;
+  std::vector<StorageRevertEntry> external_storage_entries;
+  std::vector<StorageRevertEntry>* external_storage_entries_ptr =
+      reversible_external ? &external_storage_entries : nullptr;
 
   const Segments target_segments =
       UseInnerSegments(request)
@@ -872,21 +762,23 @@ void UserSegmentHistoryRewriter::Finish(const ConversionRequest& request,
     }
     const size_t value_end = committed_value.size();
 
-    if (IsNumberSegment(segment) && !IsNumberStyleLearningEnabled(request)) {
-      RememberNumberPreference(segment, revert_entries);
+    if (IsNumberSegment(segment)) {
       continue;
     }
 
-    InsertTriggerKey(segment);
+    InsertTriggerKey(segment, external_storage_entries_ptr);
     RememberFirstCandidate(request, target_segments, i, value_begin, value_end,
-                          revert_entries);
+                          revert_entries, external_storage_entries_ptr);
   }
 
-  if (!revert_entries.empty()) {
+  if (!revert_entries.empty() || !external_storage_entries.empty()) {
     PendingRevert revert_data;
     revert_data.entries = std::move(revert_entries);
     revert_data.committed_value = std::move(committed_value);
-    revert_cache_.Insert(segments.revert_id(), revert_data);
+    revert_data.reversible_external_learning = reversible_external;
+    revert_data.external_storage_entries =
+        std::move(external_storage_entries);
+    revert_cache_.Insert(segments.revert_id(), std::move(revert_data));
   }
 }
 
@@ -942,7 +834,9 @@ bool UserSegmentHistoryRewriter::ShouldRewrite(
   return *max_candidates_size > 0;
 }
 
-void UserSegmentHistoryRewriter::InsertTriggerKey(const Segment& segment) {
+void UserSegmentHistoryRewriter::InsertTriggerKey(
+    const Segment& segment,
+    std::vector<StorageRevertEntry>* external_storage_entries) {
   if (!(segment.candidate(0).attributes & converter::Attribute::RERANKED)) {
     MOZC_VLOG(2) << "InsertTriggerKey is skipped";
     return;
@@ -954,63 +848,31 @@ void UserSegmentHistoryRewriter::InsertTriggerKey(const Segment& segment) {
   static_assert(sizeof(uint32_t) == sizeof(v),
                 "KeyTriggerValue must be 32-bit int size.");
 
-  // TODO(taku): saving segment.candidate_size() might be too heavy and
-  // increases the chance of hash collisions.
   v.set_candidates_size(segment.candidates_size());
 
-  storage_->Insert(segment.key(), reinterpret_cast<const char*>(&v));
+  auto insert = [&](absl::string_view key) {
+    if (!PrepareExternalStorageWrite(key, external_storage_entries)) {
+      return;
+    }
+    storage_->Insert(key, reinterpret_cast<const char*>(&v));
+  };
+
+  insert(segment.key());
   if (segment.key() != segment.candidate(0).content_key) {
-    storage_->Insert(segment.candidate(0).content_key,
-                     reinterpret_cast<const char*>(&v));
+    insert(segment.candidate(0).content_key);
   }
 
   absl::string_view close_bracket_key;
   if (Util::IsOpenBracket(segment.key(), &close_bracket_key)) {
-    const std::string key{close_bracket_key.data(), close_bracket_key.size()};
-    storage_->Insert(key, reinterpret_cast<const char*>(&v));
+    insert(close_bracket_key);
   }
-}
-
-bool UserSegmentHistoryRewriter::RewriteNumber(Segment* segment) const {
-  std::vector<ScoreCandidate> scores;
-  for (size_t l = 0;
-       l < segment->candidates_size() + segment->meta_candidates_size(); ++l) {
-    int j = static_cast<int>(l);
-    if (j >= static_cast<int>(segment->candidates_size())) {
-      j -= static_cast<int>(segment->candidates_size() +
-                            segment->meta_candidates_size());
-    }
-    Score score = Fetch(FeatureKey::Number(segment->candidate(j).style), 10);
-
-    if (score.score) {
-      // Workaround for separated arabic.
-      // Because separated arabic and normal number is learned at the
-      // same time, make the time gap here so that separated arabic
-      // has higher rank by sorting of scores.
-      if (score.last_access_time > 0 &&
-          (segment->candidate(j).style !=
-           NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_FULLWIDTH) &&
-          (segment->candidate(j).style !=
-           NumberUtil::NumberString::NUMBER_SEPARATED_ARABIC_HALFWIDTH)) {
-        score.last_access_time--;
-      }
-      scores.emplace_back(score, &segment->candidate(j));
-    }
-  }
-
-  if (scores.empty()) {
-    return false;
-  }
-
-  std::stable_sort(scores.begin(), scores.end(),
-                   std::greater<ScoreCandidate>());
-  return SortCandidates(scores, segment);
 }
 
 bool UserSegmentHistoryRewriter::Rewrite(const ConversionRequest& request,
                                          Segments* segments) const {
-  if (request.request_type() == ConversionRequest::CONVERSION ||
-      !request.key().empty()) {
+  if (!request.options().skip_pending_revert_for_suggestion_learning &&
+      (request.request_type() == ConversionRequest::CONVERSION ||
+       !request.key().empty())) {
     MaybeApplyPendingRevert(request);
   }
 
@@ -1046,11 +908,6 @@ bool UserSegmentHistoryRewriter::Rewrite(const ConversionRequest& request,
     }
 
     if (IsNumberSegment(*segment)) {
-      // Number candidates will be rewritten in number rewriter
-      // when number style learning is on.
-      if (!IsNumberStyleLearningEnabled(request)) {
-        modified |= RewriteNumber(segment);
-      }
       continue;
     }
 
@@ -1066,15 +923,14 @@ bool UserSegmentHistoryRewriter::Rewrite(const ConversionRequest& request,
 
     // for each all candidates expanded
     std::vector<ScoreCandidate> scores;
-    for (size_t l = 0;
-         l < segment->candidates_size() + segment->meta_candidates_size();
-         ++l) {
-      int j = static_cast<int>(l);
-      if (j >= static_cast<int>(segment->candidates_size())) {
-        j -= static_cast<int>(segment->candidates_size() +
-                              transliteration::NUM_T13N_TYPES);
+    for (size_t l = 0; l < segment->candidates_size(); ++l) {
+      const Score score = GetScore(request, *segments, i, l);
+      if (score.score > 0) {
+        scores.emplace_back(score, &segment->candidate(l));
       }
-
+    }
+    for (size_t k = 0; k < segment->meta_candidates_size(); ++k) {
+      const int j = -static_cast<int>(k) - 1;
       const Score score = GetScore(request, *segments, i, j);
       if (score.score > 0) {
         scores.emplace_back(score, &segment->candidate(j));
@@ -1085,8 +941,7 @@ bool UserSegmentHistoryRewriter::Rewrite(const ConversionRequest& request,
       continue;
     }
 
-    std::stable_sort(scores.begin(), scores.end(),
-                     std::greater<ScoreCandidate>());
+    absl::c_stable_sort(scores, std::greater<ScoreCandidate>());
 
     const std::string old_top_value = segment->candidate(0).value;
     const bool sorted = SortCandidates(scores, segment);
@@ -1118,7 +973,28 @@ void UserSegmentHistoryRewriter::Revert(const Segments& segments) {
     return;
   }
 
+  if (revert_data->reversible_external_learning) {
+    if (storage_ != nullptr) {
+      for (auto it = revert_data->external_storage_entries.rbegin();
+           it != revert_data->external_storage_entries.rend(); ++it) {
+        if (it->previous_value.has_value()) {
+          storage_->Insert(it->key, it->previous_value->data());
+        } else {
+          storage_->Delete(it->key);
+        }
+      }
+    }
+    revert_cache_.Erase(segments.revert_id());
+    return;
+  }
+
   pending_revert_ = *revert_data;
+}
+
+void UserSegmentHistoryRewriter::DiscardRevert(const Segments& segments) {
+  if (segments.revert_id() != 0) {
+    revert_cache_.Erase(segments.revert_id());
+  }
 }
 
 void UserSegmentHistoryRewriter::MaybeApplyPendingRevert(
@@ -1162,7 +1038,8 @@ bool UserSegmentHistoryRewriter::ClearHistoryEntry(const Segments& segments,
   DCHECK_LT(segment_index, segments.segments_size());
   const Segment& segment = segments.segment(segment_index);
   DCHECK(segment.is_valid_index(candidate_index));
-  const converter::Candidate& candidate = segment.candidate(0);
+  const converter::Candidate& candidate =
+      segment.candidate(candidate_index);
   absl::string_view key = candidate.key;
   absl::string_view value = candidate.value;
 
@@ -1203,8 +1080,13 @@ UserSegmentHistoryRewriter::Score UserSegmentHistoryRewriter::Fetch(
 void UserSegmentHistoryRewriter::Insert(
     absl::string_view key, absl::string_view value,
     size_t value_begin, size_t value_end, bool force,
-    std::vector<RevertEntry>& revert_entries) {
+    std::vector<RevertEntry>& revert_entries,
+    std::vector<StorageRevertEntry>* external_storage_entries) {
   if (key.empty()) {
+    return;
+  }
+
+  if (!PrepareExternalStorageWrite(key, external_storage_entries)) {
     return;
   }
 
@@ -1242,6 +1124,41 @@ void UserSegmentHistoryRewriter::MaybeInsertRevertEntry(
   entry.value_begin = value_begin;
   entry.value_end = value_end;
   revert_entries.emplace_back(std::move(entry));
+}
+
+bool UserSegmentHistoryRewriter::PrepareExternalStorageWrite(
+    absl::string_view key,
+    std::vector<StorageRevertEntry>* external_storage_entries) {
+  if (external_storage_entries == nullptr) {
+    return true;
+  }
+  if (key.empty() || storage_ == nullptr) {
+    return false;
+  }
+
+  const auto already_recorded =
+      std::find_if(external_storage_entries->begin(),
+                   external_storage_entries->end(),
+                   [key](const StorageRevertEntry& entry) {
+                     return entry.key == key;
+                   });
+  if (already_recorded != external_storage_entries->end()) {
+    return true;
+  }
+
+  const absl::string_view previous_value = storage_->LookupAsString(key);
+  if (previous_value.empty() &&
+      storage_->used_size() >= storage_->size()) {
+    return false;
+  }
+
+  StorageRevertEntry entry;
+  entry.key = std::string(key);
+  if (!previous_value.empty()) {
+    entry.previous_value = std::string(previous_value);
+  }
+  external_storage_entries->push_back(std::move(entry));
+  return true;
 }
 
 bool UserSegmentHistoryRewriter::DeleteEntry(absl::string_view key) {

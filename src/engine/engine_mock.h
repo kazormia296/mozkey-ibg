@@ -54,6 +54,8 @@ class MockEngine : public EngineInterface {
   MOCK_METHOD(bool, ClearUserHistory, (), (override));
   MOCK_METHOD(bool, ClearUserPrediction, (), (override));
   MOCK_METHOD(bool, ClearUnusedUserPrediction, (), (override));
+  MOCK_METHOD(bool, AddUserHistory,
+              (absl::string_view key, absl::string_view value), (override));
   MOCK_METHOD(bool, ReloadAndWait, (), (override));
   MOCK_METHOD(std::vector<std::string>, GetPosList, (), (const, override));
 };

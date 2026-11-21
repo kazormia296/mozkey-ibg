@@ -88,10 +88,12 @@ records.
 Zenz capability publication is fail closed. It is enabled only when the
 packaged scorer, model, and local llama.cpp runtime are all present. Windows
 packages use the bundled named-pipe scorer path. The macOS arm64 application
-package stages an arm64-only scorer and CPU/Accelerate `llama-server`, normalized
-model, and licenses inside `MozkeyIbGConverter.app/Contents/Resources`. CI proves
-usability by checking package layout, code signatures, the exact arm64
-architecture and deployment target, and real inference in the shipped package.
+package stages upstream Mozkey's Universal runtime (`mozc_zenz_scorer`,
+`mozc_zenz_guard`, the patched `llama-server`, the unmodified model,
+`BUILD-CONTRACT.txt`, and licenses) inside
+`MozkeyIbG.app/Contents/Resources/ZenzRuntime`. CI proves usability by checking
+the embedded build contract, package layout, code signatures, architectures and
+deployment target, and real inference in the shipped package.
 
 ## Release gates
 

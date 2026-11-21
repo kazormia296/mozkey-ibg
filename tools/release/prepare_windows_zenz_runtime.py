@@ -57,9 +57,9 @@ NINJA_VERSION = "1.13.2"
 NINJA_WIN_ARCHIVE_SHA256 = (
     "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65"
 )
-LLVM_WIN_VERSION = "20.1.1"
+LLVM_WIN_VERSION = "22.1.8"
 LLVM_WIN_ARCHIVE_SHA256 = (
-    "f8114cb674317e8a303731b1f9d22bf37b8c571b64f600abe528e92275ed4ace"
+    "d96c2cc1736f4eb7fa43cb9bbdf56d93551a9ae0a9aadb9c99c3c3b2b712a234"
 )
 NINJA_RELATIVE_PATH = Path("src/third_party/ninja/ninja.exe")
 LLVM_BIN_RELATIVE_PATH = Path("src/third_party/llvm/bin")
@@ -98,6 +98,9 @@ REQUIRED_CLI_FLAGS = (
     b"--model",
     b"--ctx-size",
     b"--threads",
+    # src/zenz_scorer always launches with `--parallel 1 --cache-ram 0`.
+    b"--parallel",
+    b"--cache-ram",
 )
 REQUIRED_CMAKE_BOOL_OPTIONS = {
     "BUILD_SHARED_LIBS": "OFF",

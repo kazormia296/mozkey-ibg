@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include "dictionary/dictionary_token.h"
 
@@ -51,7 +52,7 @@ struct Node {
     SYSTEM_DICTIONARY = 1 << 0,      // System dictionary (not used now)
     USER_DICTIONARY = 1 << 1,        // User dictionary
     NO_VARIANTS_EXPANSION = 1 << 2,  // No need to expand full/half
-    PROJECT_DICTIONARY = 1 << 3,     // Session-scoped project dictionary
+    EMOTICON = 1 << 3,               // Explicit semantic emoticon
     STARTS_WITH_PARTICLE = 1 << 4,   // User input starts with particle
     SPELLING_CORRECTION = 1 << 5,    // "Did you mean"
     // Equal to that of Candidate.
@@ -66,6 +67,9 @@ struct Node {
     PARTIALLY_KEY_CONSUMED = 1 << 7,
     SUFFIX_DICTIONARY = 1 << 8,  // Suffix dictionary
     KEY_EXPANDED = 1 << 9,       // Keys are expanded.
+    // Mozkey IbG: session-scoped project (Grimodex) dictionary.  Kept on a
+    // high bit so that it does not collide with attributes added upstream.
+    PROJECT_DICTIONARY = 1 << 15,
   };
 
   // prev and next are linking pointers to connect minimum cost path
@@ -122,7 +126,7 @@ struct Node {
     value.clear();
   }
 
-  inline void InitFromToken(const dictionary::Token& token) {
+  void InitFromToken(dictionary::Token token) {
     prev = nullptr;
     next = nullptr;
     constrained_prev = nullptr;
@@ -144,12 +148,15 @@ struct Node {
       attributes |= USER_DICTIONARY;
       attributes |= NO_VARIANTS_EXPANSION;
     }
+    if (token.attributes & dictionary::Token::EMOTICON) {
+      attributes |= EMOTICON;
+    }
     if (token.attributes & dictionary::Token::PROJECT_DICTIONARY) {
       attributes |= PROJECT_DICTIONARY;
       attributes |= NO_VARIANTS_EXPANSION;
     }
-    key = token.key;
-    value = token.value;
+    key = std::move(token.key);
+    value = std::move(token.value);
   }
 };
 

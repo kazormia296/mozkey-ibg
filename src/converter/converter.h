@@ -112,18 +112,48 @@ class Converter final : public ConverterInterface {
       absl::string_view value) const override;
 
   [[nodiscard]]
+  bool LearnExternalConversionResultReversibly(
+      const ConversionRequest& request,
+      absl::string_view key,
+      absl::string_view value,
+      Segments* revert_segments) const override;
+
+  [[nodiscard]]
   bool LearnExternalConversionSegments(
       const ConversionRequest& request,
       absl::Span<const ExternalConversionSegment> segments) const override;
 
+  [[nodiscard]]
+  bool LearnExternalConversionSegmentsReversibly(
+      const ConversionRequest& request,
+      absl::Span<const ExternalConversionSegment> segments,
+      Segments* revert_segments) const override;
+
+  [[nodiscard]]
+  bool ResolveExternalConversionSegments(
+      const ConversionRequest& request, absl::string_view key,
+      absl::string_view value,
+      std::vector<ExternalConversionSegment>* segments) const override;
+
+  [[nodiscard]]
+  bool EvaluateExternalConversionSegments(
+      const ConversionRequest& request,
+      absl::Span<const ExternalConversionSegment> segments,
+      std::vector<ExternalConversionSegment>* evaluated_segments) const override;
+
   void CancelConversion(Segments* segments) const override;
   void ResetConversion(Segments* segments) const override;
   void RevertConversion(Segments* segments) const override;
+  void DiscardConversionRevertState(Segments* segments) const override;
 
   [[nodiscard]]
   bool DeleteCandidateFromHistory(const Segments& segments,
                                   size_t segment_index,
                                   int candidate_index) const override;
+
+  [[nodiscard]]
+  bool AddSuppressionEntry(absl::string_view key,
+                           absl::string_view value) const override;
 
   [[nodiscard]]
   bool ReconstructHistory(Segments* segments,
@@ -193,13 +223,6 @@ class Converter final : public ConverterInterface {
     return *modules_;
   }
 
-  // Utility method to make committed results for Predictor::Finish().
-  static std::vector<prediction::Result> MakeLearningResults(
-      const Segments& segments);
-
-  // Utility method to make history result passed to ConversionRequest.
-  static prediction::Result MakeHistoryResult(const Segments& segments);
-
   void LookupUserDictionaryPrefixEntries(
       absl::string_view key,
       std::vector<UserDictionaryLookupResult>* results) const override;
@@ -253,8 +276,43 @@ class Converter final : public ConverterInterface {
   bool PredictForRequestWithSegments(const ConversionRequest& request,
                                      Segments* segments) const;
 
-  // Post processing after conversion.
-  // Rewriter, SuppressionDictionary, etc.
+  // Resizes conversion segments to match inner segment boundaries of result
+  // and re-runs conversion if needed. Returns false if resizing/conversion
+  // fails.
+  bool ResizeSegmentsByResult(const ConversionRequest& request,
+                              const prediction::Result& result,
+                              Segments* segments) const;
+
+  // Applies each inner segment of `result` to the corresponding conversion
+  // segment at `target_pos`.
+  void ApplyResultToSegments(const prediction::Result& result,
+                             size_t target_pos, uint32_t additional_attributes,
+                             Segments* segments) const;
+
+  // Generates prediction results from UserHistoryPredictor and
+  // SupplementalModel (PostCorrection) for conversion.
+  std::vector<prediction::Result> PredictForConversion(
+      const ConversionRequest& request, const Segments& segments,
+      const prediction::Result& default_result) const;
+
+  // Populates prediction results into conversion segments.
+  void PopulatePredictionResultsToSegments(
+      const ConversionRequest& request,
+      const prediction::Result& default_result,
+      absl::Span<const prediction::Result> results, Segments* segments) const;
+
+  // Applies prediction-layer outputs (e.g., user history prediction and
+  // supplemental model post-correction) to conversion segments to minimize the
+  // behavioral discrepancy between prediction and conversion pipelines and
+  // allow conversion to benefit from improvements introduced in prediction.
+  //
+  // NOTE: This method is a short-term workaround. Because conversion currently
+  // requires tricky conversions and segment resizing between `Segments` and
+  // `prediction::Result`, the long-term goal is to eliminate dependency on
+  // `Segments` entirely in favor of a unified `Result`-based pipeline.
+  void MaybeApplyPredictionToConversion(const ConversionRequest& request,
+                                        Segments* segments) const;
+
   void ApplyPostProcessing(const ConversionRequest& request,
                            Segments* segments) const;
 
@@ -264,7 +322,7 @@ class Converter final : public ConverterInterface {
   std::unique_ptr<RewriterInterface> rewriter_;
 
   const dictionary::PosMatcher& pos_matcher_;
-  const dictionary::UserDictionaryInterface& user_dictionary_;
+  dictionary::UserDictionaryInterface& user_dictionary_;
   const HistoryReconstructor history_reconstructor_;
   const ReverseConverter reverse_converter_;
   const uint16_t general_noun_id_ = std::numeric_limits<uint16_t>::max();

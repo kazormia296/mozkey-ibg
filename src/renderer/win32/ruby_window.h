@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include <atlbase.h>
@@ -11,6 +12,7 @@
 #include <atlwin.h>
 
 #include "protocol/renderer_command.pb.h"
+#include "renderer/win32/text_renderer.h"
 #include "renderer/win32/win32_renderer_util.h"
 
 namespace mozc {
@@ -18,7 +20,8 @@ namespace renderer {
 namespace win32 {
 
 typedef ATL::CWinTraits<WS_POPUP,
-                        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE>
+                        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
+                            WS_EX_NOACTIVATE>
     RubyWindowTraits;
 
 class RubyWindow
@@ -37,10 +40,15 @@ class RubyWindow
     MESSAGE_HANDLER(WM_PAINT, OnPaint)
   END_MSG_MAP()
 
-  void Initialize();
+  void Initialize(HWND owner_window = nullptr);
   void Destroy();
   void Hide();
+  // Reassert the ruby body at the top of the topmost band without moving or
+  // activating it. WindowManager calls this after candidate-family bodies are
+  // positioned so all renderer bodies remain above their custom shadows.
+  void RaiseToTopmostWithoutActivation();
   void OnUpdate(const commands::RendererCommand& command,
+                const LayoutManager& layout_manager,
                 const RECT* avoid_rect = nullptr);
 
  private:
@@ -51,9 +59,11 @@ class RubyWindow
   LRESULT OnPaint(UINT msg_id, WPARAM wparam, LPARAM lparam, BOOL& handled);
 
   void DoPaint(HDC dc);
+  bool RenderAndPresent();
   void ResetFont();
-  void UpdateFont(HDC dc);
-  SIZE MeasureText() const;
+  void UpdateDpi(uint32_t dpi);
+  void UpdateFont();
+  SIZE MeasureText(bool vertical_writing) const;
   struct TargetIdentity {
     uint32_t process_id = 0;
     uint32_t thread_id = 0;
@@ -73,17 +83,28 @@ class RubyWindow
                                      const RECT& work_area,
                                      bool from_preedit_rectangle,
                                      bool target_changed) const;
-  bool GetBasePosition(const commands::RendererCommand& command, POINT* point,
-                       int* line_height,
+  bool GetBasePosition(const commands::RendererCommand& command,
+                       const LayoutManager& layout_manager,
+                       bool vertical_writing, POINT* point, int* line_height,
                        bool* from_preedit_rectangle) const;
 
   HFONT font_ = nullptr;
   std::wstring font_face_name_;
   int font_height_ = 0;
   int font_weight_ = 0;
-  int font_dpi_y_ = 0;
+  uint32_t ruby_text_color_ = 0xffffffff;
+  uint32_t dpi_ = USER_DEFAULT_SCREEN_DPI;
+  std::unique_ptr<TextRenderer> text_renderer_;
 
   std::wstring text_;
+  bool vertical_writing_ = false;
+  // Physical horizontal extent of composition columns that have been accepted
+  // and rendered during the current vertical live-conversion composition.
+  // Japanese vertical text advances into new columns toward the left, so ruby
+  // stays outside [left, right] instead of following only the active column.
+  bool has_vertical_composition_span_ = false;
+  int vertical_composition_left_ = 0;
+  int vertical_composition_right_ = 0;
   SIZE window_size_ = {};
   RendererShadowWindow shadow_window_;
 

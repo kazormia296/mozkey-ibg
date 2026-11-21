@@ -30,7 +30,9 @@
 #ifndef MOZC_RENDERER_MAC_CANDIDATE_CONTROLLER_H_
 #define MOZC_RENDERER_MAC_CANDIDATE_CONTROLLER_H_
 
+#include "base/coordinates.h"
 #include "protocol/renderer_command.pb.h"
+#include "renderer/mac/mac_writing_direction.h"
 #include "renderer/renderer_interface.h"
 
 namespace mozc {
@@ -41,6 +43,7 @@ class SendCommandInterface;
 namespace renderer {
 namespace mac {
 class CandidateWindow;
+class ConversionStatusWindow;
 class InfolistWindow;
 class RubyWindow;
 
@@ -62,7 +65,8 @@ class CandidateController : public RendererInterface {
  private:
   // Relocate windows to prevent overlaps.
   void AlignWindows();
-  void AlignRubyWindow();
+  bool AlignRubyWindow(const mozc::Rect *avoid_rect);
+  void UpdateConversionStatus();
 
   // We don't use std::unique_ptr<> for those two pointers because we don't
   // want to include CandidateWindow.h when the user of this class
@@ -73,6 +77,10 @@ class CandidateController : public RendererInterface {
   CandidateWindow *cascading_window_;
   InfolistWindow *infolist_window_;
   RubyWindow *ruby_window_;
+  ConversionStatusWindow *conversion_status_window_;
+  mozc::Rect candidate_rect_;
+  bool has_candidate_rect_ = false;
+  WritingDirection writing_direction_ = WritingDirection::kHorizontal;
   mozc::commands::RendererCommand command_;
 };
 

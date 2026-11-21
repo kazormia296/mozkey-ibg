@@ -133,6 +133,59 @@ mozc_win32_cc_prod_binary(
     ],
 )
 
+mozc_win32_cc_prod_binary(
+    name = "tip_client_smoke_x64",
+    srcs = ["tip_client_smoke.cc"],
+    executable_name_map = {
+        "Mozc": "tip_client_smoke_x64.exe",
+        "GoogleJapaneseInput": "tip_client_smoke_x64.exe",
+    },
+    platform = "//:windows-x86_64",
+    static_crt = True,
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        "//base/win32:scoped_com",
+        "//win32/base:tsf_profile",
+    ],
+)
+
+mozc_win32_cc_prod_binary(
+    name = "tsf_application_host_smoke_arm64",
+    srcs = ["tsf_application_host_smoke.cc"],
+    executable_name_map = {
+        "Mozc": "tsf_application_host_smoke_arm64.exe",
+        "GoogleJapaneseInput": "tsf_application_host_smoke_arm64.exe",
+    },
+    platform = "//:windows-arm64",
+    static_crt = True,
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        ":tip_status",
+        "//base/win32:scoped_com",
+        "//win32/base:msctf_dll",
+        "//win32/base:tsf_profile",
+    ],
+)
+
+mozc_win32_cc_prod_binary(
+    name = "tip_client_smoke_arm64",
+    srcs = ["tip_client_smoke.cc"],
+    executable_name_map = {
+        "Mozc": "tip_client_smoke_arm64.exe",
+        "GoogleJapaneseInput": "tip_client_smoke_arm64.exe",
+    },
+    platform = "//:windows-arm64",
+    static_crt = True,
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        "//base/win32:scoped_com",
+        "//win32/base:tsf_profile",
+    ],
+)
+
 genrule(
     name = "mozc_tip64x",
     srcs = [
@@ -378,6 +431,19 @@ mozc_cc_library(
 )
 
 mozc_cc_library(
+    name = "tip_mode_indicator_key",
+    hdrs = ["tip_mode_indicator_key.h"],
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        "//protocol:commands_cc_proto",
+        "//win32/base:input_state",
+        "//win32/base:keyboard",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+mozc_cc_library(
     name = "tip_keyevent_handler",
     srcs = ["tip_keyevent_handler.cc"],
     hdrs = ["tip_keyevent_handler.h"],
@@ -387,11 +453,17 @@ mozc_cc_library(
         ":tip_edit_session",
         ":tip_grimodex_context_util",
         ":tip_input_mode_manager",
+        ":tip_mode_indicator_key",
         ":tip_private_context_h",
         ":tip_status",
+        ":tip_surrounding_text",
         ":tip_text_service",
         ":tip_thread_context",
+        ":tip_writing_direction",
+        ":tip_zenz_context_request",
+        "//base/win32:wide_char",
         "//client:client_interface",
+        "//grimodex:client_context",
         "//protocol:commands_cc_proto",
         "//win32/base:conversion_mode_util",
         "//win32/base:deleter",
@@ -454,6 +526,23 @@ mozc_cc_library(
 )
 
 mozc_cc_library(
+    name = "tip_inprocess_renderer",
+    srcs = ["tip_inprocess_renderer.cc"],
+    hdrs = ["tip_inprocess_renderer.h"],
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        "//base:const",
+        "//client:client_interface",
+        "//protocol:commands_cc_proto",
+        "//protocol:renderer_callback_provenance",
+        "//protocol:renderer_cc_proto",
+        "//renderer:renderer_style_config",
+        "//renderer/win32:window_manager",
+    ],
+)
+
+mozc_cc_library(
     name = "tip_ui_element_manager",
     srcs = ["tip_ui_element_manager.cc"],
     hdrs = ["tip_ui_element_manager.h"],
@@ -508,12 +597,33 @@ mozc_cc_library(
 )
 
 mozc_cc_library(
+    name = "tip_writing_direction",
+    srcs = ["tip_writing_direction.cc"],
+    hdrs = ["tip_writing_direction.h"],
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+)
+
+mozc_cc_test(
+    name = "tip_writing_direction_test",
+    size = "small",
+    srcs = ["tip_writing_direction_test.cc"],
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        ":tip_writing_direction",
+        "//testing:gunit_main",
+    ],
+)
+
+mozc_cc_library(
     name = "tip_range_util",
     srcs = ["tip_range_util.cc"],
     hdrs = ["tip_range_util.h"],
     tags = MOZC_TAGS.WIN_ONLY,
     target_compatible_with = ["@platforms//os:windows"],
     deps = [
+        ":tip_writing_direction",
         "//base/win32:com",
         "@com_microsoft_wil//:wil",
     ],
@@ -621,6 +731,8 @@ mozc_cc_library(
     tags = MOZC_TAGS.WIN_ONLY,
     target_compatible_with = ["@platforms//os:windows"],
     deps = [
+        ":tip_writing_direction",
+        ":tip_zenz_context_request",
         "//client:client_interface",
         "//protocol:commands_cc_proto",
         "//win32/base:config_snapshot",
@@ -714,6 +826,7 @@ mozc_cc_library(
         ":tip_composition_util",
         ":tip_dll_module",
         ":tip_grimodex_context_util",
+        ":tip_inprocess_renderer",
         ":tip_input_mode_manager",
         ":tip_private_context_h",
         ":tip_range_util",
@@ -722,11 +835,14 @@ mozc_cc_library(
         ":tip_thread_context",
         ":tip_ui_element_manager",
         ":tip_ui_handler",
+        ":tip_writing_direction",
         "//base:system_util",
         "//base/win32:com",
         "//base/win32:wide_char",
+        "//config:config_handler",
         "//protocol:candidate_window_cc_proto",
         "//protocol:commands_cc_proto",
+        "//protocol:config_cc_proto",
         "//protocol:renderer_cc_proto",
         "//renderer/win32:win32_renderer_client",
         "//win32/base:input_state",
@@ -770,6 +886,7 @@ mozc_cc_library(
     target_compatible_with = ["@platforms//os:windows"],
     deps = [
         ":tip_composition_util",
+        ":tip_display_attributes",
         ":tip_dll_module",
         ":tip_grimodex_context_util",
         ":tip_input_mode_manager",
@@ -780,10 +897,12 @@ mozc_cc_library(
         ":tip_text_service",
         ":tip_thread_context",
         ":tip_ui_handler",
+        ":tip_writing_direction",
         "//base:util",
         "//base/win32:com",
         "//base/win32:wide_char",
         "//client:client_interface",
+        "//config:config_handler",
         "//protocol:candidate_window_cc_proto",
         "//protocol:commands_cc_proto",
         "//protocol:renderer_callback_provenance",
@@ -895,7 +1014,9 @@ mozc_cc_test(
     target_compatible_with = ["@platforms//os:windows"],
     deps = [
         ":tip_display_attributes",
+        "//config:config_handler",
         "//testing:gunit_main",
+        "//testing:mozctest",
         "@com_microsoft_wil//:wil",
     ],
 )
@@ -969,6 +1090,18 @@ mozc_cc_test(
     ],
 )
 
+mozc_cc_test(
+    name = "tip_mode_indicator_key_test",
+    size = "small",
+    srcs = ["tip_mode_indicator_key_test.cc"],
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        ":tip_mode_indicator_key",
+        "//testing:gunit_main",
+    ],
+)
+
 mozc_cc_library(
     name = "gmock_matchers",
     testonly = True,
@@ -980,5 +1113,30 @@ mozc_cc_library(
         "//base/win32:wide_char",
         "//testing:gunit",
         "@com_microsoft_wil//:wil",
+    ],
+)
+
+mozc_cc_library(
+    name = "tip_zenz_context_request",
+    srcs = ["tip_zenz_context_request.cc"],
+    hdrs = ["tip_zenz_context_request.h"],
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        "//base:util",
+        "//protocol:commands_cc_proto",
+    ],
+)
+
+mozc_cc_test(
+    name = "tip_zenz_context_request_test",
+    size = "small",
+    srcs = ["tip_zenz_context_request_test.cc"],
+    tags = MOZC_TAGS.WIN_ONLY,
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        ":tip_zenz_context_request",
+        "//protocol:commands_cc_proto",
+        "//testing:gunit_main",
     ],
 )

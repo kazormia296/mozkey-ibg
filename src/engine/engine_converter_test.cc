@@ -232,6 +232,11 @@ class EngineConverterTest : public testing::TestWithTempUserProfile {
     return converter.segment_index_;
   }
 
+  static size_t GetExternalLearningRevertHandleCount(
+      const EngineConverter& converter) {
+    return converter.external_learning_revert_segments_.size();
+  }
+
   static bool IsCandidateListVisible(const EngineConverter& converter) {
     return converter.candidate_list_visible_;
   }
@@ -249,6 +254,17 @@ class EngineConverterTest : public testing::TestWithTempUserProfile {
                             size_t size, std::string* conversion) {
     converter.GetConversion(index, size, conversion);
   }
+
+  static size_t GetSegmentSpan(const EngineConverter& converter,
+                               size_t segment_index) {
+    return converter.GetSegmentSpan(segment_index);
+  }
+
+  static bool IsFullSentenceCandidateSelected(
+      const EngineConverter& converter) {
+    return converter.IsFullSentenceCandidateSelected();
+  }
+
 
   static void AppendCandidateList(ConversionRequest::RequestType request_type,
                                   EngineConverter* converter) {
@@ -489,6 +505,163 @@ class EngineConverterTest : public testing::TestWithTempUserProfile {
 #define EXPECT_SELECTED_CANDIDATE_INDICES_EQ(converter, indices) \
   EXPECT_PRED_FORMAT2(ExpectSelectedCandidateIndices, converter, indices);
 
+TEST_F(EngineConverterTest,
+       ConfirmExternalLearningDiscardsRollbackStateAndCloneDoesNotOwnHandle) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  EXPECT_CALL(*mock_converter,
+              LearnExternalConversionResultReversibly(_, "あめ", "雨", _))
+      .WillOnce([](const ConversionRequest&, absl::string_view,
+                   absl::string_view, Segments* revert_segments) {
+        revert_segments->set_revert_id(12345);
+        return true;
+      });
+
+  const uint64_t revert_id =
+      converter.LearnExternalConversionResultReversibly(
+          "あめ", "雨", Context::default_instance());
+  ASSERT_EQ(revert_id, 12345);
+  EXPECT_EQ(GetExternalLearningRevertHandleCount(converter), 1);
+
+  std::unique_ptr<EngineConverter> cloned(converter.Clone());
+  EXPECT_EQ(GetExternalLearningRevertHandleCount(*cloned), 0);
+  EXPECT_FALSE(cloned->ConfirmExternalConversionLearning(revert_id));
+
+  EXPECT_CALL(*mock_converter, DiscardConversionRevertState(_))
+      .WillOnce([](Segments* segments) {
+        ASSERT_NE(segments, nullptr);
+        EXPECT_EQ(segments->revert_id(), 12345);
+        segments->set_revert_id(0);
+      });
+
+  EXPECT_TRUE(converter.ConfirmExternalConversionLearning(revert_id));
+  EXPECT_EQ(GetExternalLearningRevertHandleCount(converter), 0);
+  EXPECT_FALSE(converter.ConfirmExternalConversionLearning(revert_id));
+}
+
+TEST_F(EngineConverterTest, DeleteOrSuppressCandidateKeepsMeaningsSeparate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* segment = segments.add_segment();
+  segment->set_key("こうしょう");
+
+  converter::Candidate* history_candidate = segment->add_candidate();
+  history_candidate->key = "こうしょう";
+  history_candidate->content_key = "こうしょう";
+  history_candidate->value = "交渉";
+  history_candidate->content_value = "交渉";
+  history_candidate->attributes |=
+      converter::Attribute::USER_SEGMENT_HISTORY_REWRITER;
+
+  converter::Candidate* system_candidate = segment->add_candidate();
+  system_candidate->key = "こうしょう";
+  system_candidate->content_key = "こうしょう";
+  system_candidate->value = "公称";
+  system_candidate->content_value = "公称";
+
+  converter::Candidate* user_dictionary_candidate = segment->add_candidate();
+  user_dictionary_candidate->key = "こうしょう";
+  user_dictionary_candidate->content_key = "こうしょう";
+  user_dictionary_candidate->value = "ユーザー辞書";
+  user_dictionary_candidate->content_value = "ユーザー辞書";
+  user_dictionary_candidate->attributes |= converter::Attribute::USER_DICTIONARY;
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+  composer_->InsertCharacterPreedit("こうしょう");
+  ASSERT_TRUE(converter.Convert(*composer_));
+
+  EXPECT_CALL(*mock_converter, DeleteCandidateFromHistory(_, 0, 0))
+      .WillOnce(Return(true));
+  EXPECT_CALL(*mock_converter, AddSuppressionEntry(_, _)).Times(0);
+  EXPECT_TRUE(converter.DeleteOrSuppressCandidate(0));
+  Mock::VerifyAndClearExpectations(&mock_converter);
+
+  EXPECT_CALL(*mock_converter, DeleteCandidateFromHistory(_, 0, 1))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*mock_converter, AddSuppressionEntry("こうしょう", "公称"))
+      .WillOnce(Return(true));
+  EXPECT_TRUE(converter.DeleteOrSuppressCandidate(1));
+  Mock::VerifyAndClearExpectations(&mock_converter);
+
+  EXPECT_CALL(*mock_converter, DeleteCandidateFromHistory(_, 0, 2))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*mock_converter,
+              AddSuppressionEntry("こうしょう", "ユーザー辞書"))
+      .WillOnce(Return(true));
+  EXPECT_TRUE(converter.DeleteOrSuppressCandidate(2));
+}
+
+TEST_F(EngineConverterTest,
+       DeleteOrSuppressCandidateRefusesLastRegularCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* segment = segments.add_segment();
+  segment->set_key("ただひとつ");
+  converter::Candidate* candidate = segment->add_candidate();
+  candidate->key = "ただひとつ";
+  candidate->content_key = "ただひとつ";
+  candidate->value = "唯一";
+  candidate->content_value = "唯一";
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+  composer_->InsertCharacterPreedit("ただひとつ");
+  ASSERT_TRUE(converter.Convert(*composer_));
+
+  EXPECT_CALL(*mock_converter, DeleteCandidateFromHistory(_, 0, 0))
+      .WillOnce(Return(false));
+  EXPECT_CALL(*mock_converter, AddSuppressionEntry(_, _)).Times(0);
+  EXPECT_FALSE(converter.DeleteOrSuppressCandidate(0));
+}
+
+TEST_F(EngineConverterTest, SelectedProperNounSpansUseAbsoluteOffsets) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+  Segments segments;
+  AddSegmentWithSingleCandidate(&segments, "きのう", "昨日");
+  AddSegmentWithSingleCandidate(&segments, "とうきょうに", "東京に");
+  converter::Candidate* candidate =
+      segments.mutable_conversion_segment(1)->mutable_candidate(0);
+  candidate->proper_noun_spans.push_back(
+      {0, 0, "とうきょう", "東京", {"とうきょう"}});
+
+  SetSegments(segments, &converter);
+  SetState(EngineConverterInterface::CONVERSION, &converter);
+  std::vector<converter::ProperNounSpan> spans;
+  ASSERT_TRUE(converter.GetSelectedProperNounSpans(&spans));
+  ASSERT_EQ(spans.size(), 1);
+  EXPECT_EQ(spans[0].key, "とうきょう");
+  EXPECT_EQ(spans[0].value, "東京");
+  EXPECT_EQ(spans[0].key_offset, std::string("きのう").size());
+  EXPECT_EQ(spans[0].value_offset, std::string("昨日").size());
+}
+
+TEST_F(EngineConverterTest, SelectedProperNounSpansRejectStaleCandidateText) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+  Segments segments;
+  AddSegmentWithSingleCandidate(&segments, "とうきょうに", "東京に");
+  converter::Candidate* candidate =
+      segments.mutable_conversion_segment(0)->mutable_candidate(0);
+  candidate->proper_noun_spans.push_back(
+      {0, 0, "とうきょう", "東京", {"とうきょう"}});
+  // A rewriter may change the candidate without updating lexical metadata.
+  candidate->value = "大阪に";
+  candidate->content_value = candidate->value;
+
+  SetSegments(segments, &converter);
+  SetState(EngineConverterInterface::CONVERSION, &converter);
+  std::vector<converter::ProperNounSpan> spans;
+  EXPECT_FALSE(converter.GetSelectedProperNounSpans(&spans));
+  EXPECT_TRUE(spans.empty());
+}
+
 TEST_F(EngineConverterTest, Convert) {
   auto mock_converter = std::make_shared<MockConverter>();
   EngineConverter converter(mock_converter, request_, config_);
@@ -544,6 +717,168 @@ TEST_F(EngineConverterTest, Convert) {
   // Converter should be inactive after submission
   EXPECT_FALSE(converter.IsActive());
   EXPECT_FALSE(IsCandidateListVisible(converter));
+}
+
+TEST_F(EngineConverterTest, ExplicitZipcodeLiteralPriority) {
+  for (const char* key : {"1000001", "100-0001"}) {
+    for (const bool prefer_literal : {false, true}) {
+      auto mock_converter = std::make_shared<MockConverter>();
+      EngineConverter converter(mock_converter, request_, config_);
+      // SetPreeditTextForTestOnly appends to the current composition.
+      composer_->Reset();
+      composer_->SetPreeditTextForTestOnly(key);
+      Segments segments;
+      segments.InitForConvert(key);
+      Segment* segment = segments.mutable_conversion_segment(0);
+      converter::Candidate* address = segment->add_candidate();
+      address->key = key;
+      address->content_key = key;
+      address->value = "東京都千代田区千代田";
+      address->content_value = address->value;
+      converter::Candidate* literal = segment->add_candidate();
+      literal->key = key;
+      literal->content_key = key;
+      literal->value = key;
+      literal->content_value = literal->value;
+      EXPECT_CALL(*mock_converter, StartConversion(_, _))
+          .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+      ConversionPreferences preferences = converter.conversion_preferences();
+      preferences.prefer_zipcode_literal_top = prefer_literal;
+      ASSERT_TRUE(converter.Convert(*composer_, Context::default_instance(),
+                                    preferences));
+      const Segments& output_segments = GetSegments(converter);
+      ASSERT_EQ(output_segments.conversion_segments_size(), 1);
+      EXPECT_EQ(output_segments.conversion_segment(0).candidate(0).value,
+                prefer_literal ? key : "東京都千代田区千代田");
+    }
+  }
+}
+
+TEST_F(EngineConverterTest, ExplicitZipcodeLiteralPriorityInSentence) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+  composer_->SetPreeditTextForTestOnly("きょうは1000001です");
+  Segments segments;
+  AddSegmentWithSingleCandidate(&segments, "きょうは", "今日は");
+  Segment* zipcode = segments.add_segment();
+  zipcode->set_key("1000001");
+  converter::Candidate* address = zipcode->add_candidate();
+  address->key = "1000001";
+  address->content_key = address->key;
+  address->value = "東京都千代田区千代田";
+  address->content_value = address->value;
+  converter::Candidate* literal = zipcode->add_candidate();
+  literal->key = "1000001";
+  literal->content_key = literal->key;
+  literal->value = "1000001";
+  literal->content_value = literal->value;
+  AddSegmentWithSingleCandidate(&segments, "です", "です");
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+  ConversionPreferences preferences = converter.conversion_preferences();
+  preferences.prefer_zipcode_literal_top = true;
+  ASSERT_TRUE(converter.Convert(*composer_, Context::default_instance(),
+                                preferences));
+  const Segments& output = GetSegments(converter);
+  ASSERT_EQ(output.conversion_segments_size(), 3);
+  EXPECT_EQ(output.conversion_segment(0).candidate(0).value, "今日は");
+  EXPECT_EQ(output.conversion_segment(1).candidate(0).value, "1000001");
+  EXPECT_EQ(output.conversion_segment(1).candidate(1).value,
+            "東京都千代田区千代田");
+}
+
+TEST_F(EngineConverterTest, ExplicitZipcodeLiteralFromMetaCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+  composer_->SetPreeditTextForTestOnly("1000001");
+  Segments segments;
+  segments.InitForConvert("1000001");
+  Segment* segment = segments.mutable_conversion_segment(0);
+  converter::Candidate* address = segment->add_candidate();
+  address->key = "1000001";
+  address->value = "東京都千代田区千代田";
+  converter::Candidate* literal = segment->add_meta_candidate();
+  literal->key = "1000001";
+  literal->value = "1000001";
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+  ConversionPreferences preferences = converter.conversion_preferences();
+  preferences.prefer_zipcode_literal_top = true;
+  ASSERT_TRUE(converter.Convert(*composer_, Context::default_instance(),
+                                preferences));
+  const Segments& output_segments = GetSegments(converter);
+  ASSERT_EQ(output_segments.conversion_segments_size(), 1);
+  EXPECT_EQ(output_segments.conversion_segment(0).candidate(0).value,
+            "1000001");
+}
+
+TEST_F(EngineConverterTest, LiveZipcodeEnablesAliasAndPromotesLiteral) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+  config_->set_use_zip_code_conversion(true);
+  composer_->Reset();
+  composer_->SetPreeditTextForTestOnly("1000001");
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce([](const ConversionRequest& request, Segments* segments) {
+        EXPECT_TRUE(request.options().use_zip_code_conversion);
+        EXPECT_TRUE(request.options().enable_hyphenless_zipcode_alias);
+        segments->InitForConvert(request.key());
+        Segment* segment = segments->mutable_conversion_segment(0);
+        converter::Candidate* address = segment->add_candidate();
+        address->key = request.key();
+        address->content_key = address->key;
+        address->value = "東京都千代田区千代田";
+        address->content_value = address->value;
+        converter::Candidate* literal = segment->add_candidate();
+        literal->key = request.key();
+        literal->content_key = literal->key;
+        literal->value = "1000001";
+        literal->content_value = literal->value;
+        return true;
+      });
+  ConversionPreferences preferences = converter.conversion_preferences();
+  preferences.prefer_zipcode_literal_top = true;
+  ASSERT_TRUE(converter.Convert(*composer_, Context::default_instance(),
+                                preferences));
+  const Segments& result = GetSegments(converter);
+  ASSERT_EQ(result.conversion_segments_size(), 1);
+  EXPECT_EQ(result.conversion_segment(0).candidate(0).value, "1000001");
+  EXPECT_EQ(result.conversion_segment(0).candidate(1).value,
+            "東京都千代田区千代田");
+  EXPECT_TRUE(config_->use_zip_code_conversion());
+}
+
+TEST_F(EngineConverterTest, ZipcodeDisabledDoesNotPromoteLiveLiteral) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+  config_->set_use_zip_code_conversion(false);
+  composer_->Reset();
+  composer_->SetPreeditTextForTestOnly("1000001");
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce([](const ConversionRequest& request, Segments* segments) {
+        EXPECT_FALSE(request.options().use_zip_code_conversion);
+        EXPECT_FALSE(request.options().enable_hyphenless_zipcode_alias);
+        segments->InitForConvert(request.key());
+        Segment* segment = segments->mutable_conversion_segment(0);
+        converter::Candidate* first = segment->add_candidate();
+        first->key = request.key();
+        first->value = "東京都千代田区千代田";
+        converter::Candidate* literal = segment->add_candidate();
+        literal->key = request.key();
+        literal->value = "1000001";
+        return true;
+      });
+  ConversionPreferences preferences = converter.conversion_preferences();
+  // Live conversion still sends this preference. With ZIP disabled it must
+  // have no effect on the engine converter's candidate order.
+  preferences.prefer_zipcode_literal_top = true;
+  ASSERT_TRUE(converter.Convert(*composer_, Context::default_instance(),
+                                preferences));
+  const Segments& result = GetSegments(converter);
+  ASSERT_EQ(result.conversion_segments_size(), 1);
+  EXPECT_EQ(result.conversion_segment(0).candidate(0).value,
+            "東京都千代田区千代田");
+  EXPECT_EQ(result.conversion_segment(0).candidate(1).value, "1000001");
 }
 
 TEST_F(EngineConverterTest, ConvertWithSpellingCorrection) {
@@ -2268,7 +2603,7 @@ TEST_F(EngineConverterTest, SuggestAndPredict) {
     EXPECT_TRUE(output.has_candidate_window());
     EXPECT_FALSE(output.candidate_window().footer().has_label());
     EXPECT_TRUE(output.candidate_window().footer().index_visible());
-    EXPECT_TRUE(output.candidate_window().footer().logo_visible());
+    EXPECT_FALSE(output.candidate_window().footer().logo_visible());
 
     // Check the conversion
     const commands::Preedit& conversion = output.preedit();
@@ -2489,6 +2824,47 @@ TEST_F(EngineConverterTest, SuggestFillIncognitoCandidateWords) {
   }
 }
 
+TEST_F(EngineConverterTest, SuggestFillIncognitoCandidateWordsEmptySegments) {
+  Segments segments;
+  {  // Initialize mock segments for suggestion
+    Segment* segment = segments.add_segment();
+    converter::Candidate* candidate;
+    segment->set_key(kChars_Mo);
+    candidate = segment->add_candidate();
+    candidate->value = kChars_Mozukusu;
+    candidate->content_key = kChars_Mozukusu;
+    candidate = segment->add_candidate();
+    candidate->value = kChars_Momonga;
+    candidate->content_key = kChars_Momonga;
+  }
+  composer_->InsertCharacterPreedit(kChars_Mo);
+
+  // A matcher to test if the given conversion request sets incognito_mode().
+  constexpr auto IsIncognitoConversionRequest = [](bool is_incognito) {
+    return Property(&ConversionRequest::incognito_mode, Eq(is_incognito));
+  };
+  request_->set_fill_incognito_candidate_words(true);
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  // Normal suggestion succeeds, but the incognito suggestion fails to produce
+  // any candidates.  In this case |incognito_segments_| is left empty even
+  // though the request asks to fill incognito candidate words.
+  // FillOutput must not access out-of-bounds segments, and must not materialize
+  // the field either, so has_incognito_candidate_words() stays false.
+  EXPECT_CALL(*mock_converter,
+              StartPrediction(IsIncognitoConversionRequest(false), _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+  EXPECT_CALL(*mock_converter,
+              StartPrediction(IsIncognitoConversionRequest(true), _))
+      .WillOnce(Return(false));
+
+  EXPECT_TRUE(converter.Suggest(*composer_, Context::default_instance()));
+  commands::Output output;
+  converter.FillOutput(*composer_, &output);
+  EXPECT_FALSE(output.has_incognito_candidate_words());
+}
+
 TEST_F(EngineConverterTest, OnePhaseSuggestion) {
   auto mock_converter = std::make_shared<MockConverter>();
   EngineConverter converter(mock_converter, request_, config_);
@@ -2548,8 +2924,8 @@ TEST_F(EngineConverterTest, SuppressSuggestionWhenNotRequested) {
   ConversionPreferences conversion_preferences =
       converter.conversion_preferences();
   conversion_preferences.request_suggestion = false;
-  EXPECT_FALSE(converter.SuggestWithPreferences(
-      *composer_, Context::default_instance(), conversion_preferences));
+  EXPECT_FALSE(converter.Suggest(*composer_, Context::default_instance(),
+                                 conversion_preferences));
   EXPECT_FALSE(IsCandidateListVisible(converter));
   EXPECT_FALSE(converter.IsActive());
 }
@@ -4953,6 +5329,1005 @@ TEST_F(EngineConverterTest, TypingCorrectionIsAvailableInSuggestionCommit) {
   ASSERT_TRUE(output.has_result());
   EXPECT_EQ(output.result().key(), "ください");
   EXPECT_EQ(output.result().value(), "ください");
+}
+
+TEST_F(EngineConverterTest, FullSentenceCandidateInConversion) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  {
+    Segment* seg0 = segments.add_segment();
+    seg0->set_key("わたしは");
+    converter::Candidate* cand0 = seg0->add_candidate();
+    cand0->value = "私";
+    cand0->key = "わたし";
+    cand0->content_key = "わたし";
+
+    converter::Candidate* cand1 = seg0->add_candidate();
+    cand1->value = "私は";
+    cand1->key = "わたしは";
+    cand1->content_key = "わたしは";
+    cand1->converted_segment_count = 2;
+    cand1->lid = 10;
+    cand1->rid = 20;
+
+    Segment* seg1 = segments.add_segment();
+    seg1->set_key("は");
+    converter::Candidate* cand2 = seg1->add_candidate();
+    cand2->value = "は";
+    cand2->key = "は";
+    cand2->content_key = "は";
+  }
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("わたしは");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  ASSERT_TRUE(converter.IsActive());
+
+  // Default: candidate 0 is focused -> 2 segments rendered
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 2);
+    EXPECT_EQ(output.preedit().segment(0).value(), "私");
+    EXPECT_EQ(output.preedit().segment(1).value(), "は");
+  }
+
+  // Move candidate to candidate 1 (FULL_SENTENCE)
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Now candidate 1 is focused -> 1 segment rendered for the full sentence
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 1);
+    EXPECT_EQ(output.preedit().segment(0).value(), "私は");
+  }
+
+  // Commit the conversion with candidate 1 (FULL_SENTENCE)
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  EXPECT_CALL(*mock_converter, FinishConversion(_, _)).WillOnce(Return());
+
+  commands::Output output;
+  converter.Commit(*composer_, Context::default_instance());
+  converter.FillOutput(*composer_, &output);
+
+  EXPECT_TRUE(output.has_result());
+  EXPECT_EQ(output.result().value(), "私は");
+  EXPECT_EQ(output.result().key(), "わたしは");
+}
+
+TEST_F(EngineConverterTest, MultiSegmentCandidateAtNonZeroIndex) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  {
+    Segment* seg0 = segments.add_segment();
+    seg0->set_key("きょう");
+    converter::Candidate* cand0 = seg0->add_candidate();
+    cand0->value = "今日";
+    cand0->key = "きょう";
+    cand0->content_key = "きょう";
+
+    Segment* seg1 = segments.add_segment();
+    seg1->set_key("はいい");
+    converter::Candidate* cand1_0 = seg1->add_candidate();
+    cand1_0->value = "は";
+    cand1_0->key = "は";
+    cand1_0->content_key = "は";
+
+    converter::Candidate* cand1_1 = seg1->add_candidate();
+    cand1_1->value = "は良い";
+    cand1_1->key = "はいい";
+    cand1_1->content_key = "はいい";
+    cand1_1->converted_segment_count = 2;
+
+    Segment* seg2 = segments.add_segment();
+    seg2->set_key("いい");
+    converter::Candidate* cand2_0 = seg2->add_candidate();
+    cand2_0->value = "良い";
+    cand2_0->key = "いい";
+    cand2_0->content_key = "いい";
+  }
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("きょうはいい");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  ASSERT_TRUE(converter.IsActive());
+
+  // Focus segment 1
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 0))
+      .WillOnce(Return(true));
+  converter.SegmentFocusRight();
+
+  // Select candidate 1 on segment 1 (converted_segment_count = 2)
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 1, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Preedit should show 2 segments: seg 0 ("今日", unfocused) and seg 1
+  // ("は良い", focused)
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 2);
+    EXPECT_EQ(output.preedit().segment(0).value(), "今日");
+    EXPECT_EQ(output.preedit().segment(1).value(), "は良い");
+  }
+}
+
+TEST_F(EngineConverterTest, ResizeMultiSegmentCandidateWidth) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  {
+    Segment* seg0 = segments.add_segment();
+    seg0->set_key("わたしの");
+    converter::Candidate* cand0_0 = seg0->add_candidate();
+    cand0_0->value = "私の";
+    cand0_0->key = "わたしの";
+    cand0_0->content_key = "わたしの";
+
+    converter::Candidate* cand0_1 = seg0->add_candidate();
+    cand0_1->value = "私の名前は";
+    cand0_1->key = "わたしのなまえは";
+    cand0_1->content_key = "わたしのなまえは";
+    cand0_1->converted_segment_count = 2;
+
+    Segment* seg1 = segments.add_segment();
+    seg1->set_key("なまえは");
+    converter::Candidate* cand1_0 = seg1->add_candidate();
+    cand1_0->value = "名前は";
+    cand1_0->key = "なまえは";
+    cand1_0->content_key = "なまえは";
+
+    Segment* seg2 = segments.add_segment();
+    seg2->set_key("なかのです");
+    converter::Candidate* cand2_0 = seg2->add_candidate();
+    cand2_0->value = "中野です";
+    cand2_0->key = "なかのです";
+    cand2_0->content_key = "なかのです";
+  }
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("わたしのなまえはなかのです");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  ASSERT_TRUE(converter.IsActive());
+
+  // Select candidate 1 on segment 0 ("私の名前は", key length = 8)
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Shrink segment width by 1.
+  // Original segment 0 has key_len = 4, but selected candidate has key_len = 8.
+  // Target key length is 8 - 1 = 7, so offset_length should be 7 - 4 = 3.
+  EXPECT_CALL(*mock_converter, ResizeSegment(_, _, 0, 3))
+      .WillOnce(Return(true));
+  converter.SegmentWidthShrink(*composer_);
+}
+
+TEST_F(EngineConverterTest, FocusRightAfterMultiSegmentCandidateSelection) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  {
+    Segment* seg0 = segments.add_segment();
+    seg0->set_key("わたしの");
+    converter::Candidate* cand0_0 = seg0->add_candidate();
+    cand0_0->value = "私の";
+    cand0_0->key = "わたしの";
+    cand0_0->content_key = "わたしの";
+
+    converter::Candidate* cand0_1 = seg0->add_candidate();
+    cand0_1->value = "私の名前は";
+    cand0_1->key = "わたしのなまえは";
+    cand0_1->content_key = "わたしのなまえは";
+    cand0_1->converted_segment_count = 2;
+
+    Segment* seg1 = segments.add_segment();
+    seg1->set_key("なまえは");
+    converter::Candidate* cand1_0 = seg1->add_candidate();
+    cand1_0->value = "名前は";
+    cand1_0->key = "なまえは";
+    cand1_0->content_key = "なまえは";
+
+    Segment* seg2 = segments.add_segment();
+    seg2->set_key("なかのです");
+    converter::Candidate* cand2_0 = seg2->add_candidate();
+    cand2_0->value = "中野です";
+    cand2_0->key = "なかのです";
+    cand2_0->content_key = "なかのです";
+  }
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("わたしのなまえはなかのです");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  ASSERT_TRUE(converter.IsActive());
+
+  // Select candidate 1 on segment 0 ("私の名前は", converted_segment_count = 2)
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Focus right. SegmentFix commits segment 0 candidate 1.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.SegmentFocusRight();
+
+  // The focused segment should now be "なかのです" (index 2 in the 3-segment
+  // list when converter mock does not resize segments). Shrinking this segment
+  // should invoke ResizeSegment on index 2 with offset -1.
+  EXPECT_CALL(*mock_converter, ResizeSegment(_, _, 2, -1))
+      .WillOnce(Return(true));
+  converter.SegmentWidthShrink(*composer_);
+}
+
+TEST_F(EngineConverterTest, FocusLeftAfterMultiSegmentCandidateSelection) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  {
+    Segment* seg0 = segments.add_segment();
+    seg0->set_key("わたしの");
+    converter::Candidate* cand0_0 = seg0->add_candidate();
+    cand0_0->value = "私の";
+    cand0_0->key = "わたしの";
+    cand0_0->content_key = "わたしの";
+    converter::Candidate* cand0_1 = seg0->add_candidate();
+    cand0_1->value = "私の名前は";
+    cand0_1->key = "わたしのなまえは";
+    cand0_1->content_key = "わたしのなまえは";
+    cand0_1->converted_segment_count = 2;
+
+    Segment* seg1 = segments.add_segment();
+    seg1->set_key("なまえは");
+    converter::Candidate* cand1_0 = seg1->add_candidate();
+    cand1_0->value = "名前は";
+    cand1_0->key = "なまえは";
+    cand1_0->content_key = "なまえは";
+
+    Segment* seg2 = segments.add_segment();
+    seg2->set_key("なかのです");
+    converter::Candidate* cand2_0 = seg2->add_candidate();
+    cand2_0->value = "中野です";
+    cand2_0->key = "なかのです";
+    cand2_0->content_key = "なかのです";
+  }
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("わたしのなまえはなかのです");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  ASSERT_TRUE(converter.IsActive());
+
+  // Select candidate 1 on segment 0 ("私の名前は", converted_segment_count = 2)
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Focus right -> moves to "中野です" (index 2).
+  // CommitSegmentValue moves candidate to position 0 without erasing segments.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 1))
+      .WillOnce([](Segments* segs, size_t seg_idx, int cand_idx) {
+        segs->mutable_conversion_segment(0)->set_segment_type(
+            Segment::FIXED_VALUE);
+        segs->mutable_conversion_segment(0)->move_candidate(cand_idx, 0);
+        return true;
+      });
+  converter.SegmentFocusRight();
+  EXPECT_EQ(GetSegmentIndex(converter), 2);
+
+  // Focus left -> moves back to "私の名前は" (index 0) because
+  // GetSegmentSpan(0) == 2.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 2, 0))
+      .WillOnce(Return(true));
+  converter.SegmentFocusLeft();
+  EXPECT_EQ(GetSegmentIndex(converter), 0);
+
+  // Check preedit with "私の名前は" selected: [私の名前は] 中野です
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 2);
+    EXPECT_EQ(output.preedit().segment(0).value(), "私の名前は");
+    EXPECT_EQ(output.preedit().segment(1).value(), "中野です");
+  }
+
+  // Change candidate on segment 0 back to single-segment candidate "私の"
+  // (index 1 after move).
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Preedit should now restore "名前は": [私の] 名前は 中野です
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 3);
+    EXPECT_EQ(output.preedit().segment(0).value(), "私の");
+    EXPECT_EQ(output.preedit().segment(1).value(), "名前は");
+    EXPECT_EQ(output.preedit().segment(2).value(), "中野です");
+  }
+}
+
+TEST_F(EngineConverterTest, FocusNavigationWithSpan3Candidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  {
+    Segment* seg0 = segments.add_segment();
+    seg0->set_key("とうきょう");
+    converter::Candidate* cand0_0 = seg0->add_candidate();
+    cand0_0->value = "東京";
+    cand0_0->key = "とうきょう";
+    converter::Candidate* cand0_1 = seg0->add_candidate();
+    cand0_1->value = "東京都渋谷区";
+    cand0_1->key = "とうきょうとしぶやく";
+    cand0_1->converted_segment_count = 3;
+
+    Segment* seg1 = segments.add_segment();
+    seg1->set_key("と");
+    converter::Candidate* cand1_0 = seg1->add_candidate();
+    cand1_0->value = "都";
+    cand1_0->key = "と";
+
+    Segment* seg2 = segments.add_segment();
+    seg2->set_key("しぶやく");
+    converter::Candidate* cand2_0 = seg2->add_candidate();
+    cand2_0->value = "渋谷区";
+    cand2_0->key = "しぶやく";
+
+    Segment* seg3 = segments.add_segment();
+    seg3->set_key("に");
+    converter::Candidate* cand3_0 = seg3->add_candidate();
+    cand3_0->value = "に";
+    cand3_0->key = "に";
+  }
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("とうきょうとしぶやくに");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  ASSERT_TRUE(converter.IsActive());
+
+  // Select candidate 1 on segment 0 ("東京都渋谷区", converted_segment_count =
+  // 3)
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Focus right -> moves to "に" (index 3).
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 1))
+      .WillOnce([](Segments* segs, size_t seg_idx, int cand_idx) {
+        segs->mutable_conversion_segment(0)->set_segment_type(
+            Segment::FIXED_VALUE);
+        segs->mutable_conversion_segment(0)->move_candidate(cand_idx, 0);
+        return true;
+      });
+  converter.SegmentFocusRight();
+  EXPECT_EQ(GetSegmentIndex(converter), 3);
+
+  // Focus left -> moves back to "東京都渋谷区" (index 0) because
+  // GetSegmentSpan(0) == 3.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 3, 0))
+      .WillOnce(Return(true));
+  converter.SegmentFocusLeft();
+  EXPECT_EQ(GetSegmentIndex(converter), 0);
+
+  // Check preedit: [東京都渋谷区] に
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 2);
+    EXPECT_EQ(output.preedit().segment(0).value(), "東京都渋谷区");
+    EXPECT_EQ(output.preedit().segment(1).value(), "に");
+  }
+
+  // Change back to single-segment candidate "東京" (index 1 after move).
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Preedit should restore all segments: [東京] 都 渋谷区 に
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 4);
+    EXPECT_EQ(output.preedit().segment(0).value(), "東京");
+    EXPECT_EQ(output.preedit().segment(1).value(), "都");
+    EXPECT_EQ(output.preedit().segment(2).value(), "渋谷区");
+    EXPECT_EQ(output.preedit().segment(3).value(), "に");
+  }
+}
+
+TEST_F(EngineConverterTest,
+       FocusNavigationWithMiddleSegmentMultiSegmentCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  {
+    Segment* seg0 = segments.add_segment();
+    seg0->set_key("きょうは");
+    converter::Candidate* cand0_0 = seg0->add_candidate();
+    cand0_0->value = "今日は";
+    cand0_0->key = "きょうは";
+
+    Segment* seg1 = segments.add_segment();
+    seg1->set_key("いい");
+    converter::Candidate* cand1_0 = seg1->add_candidate();
+    cand1_0->value = "良い";
+    cand1_0->key = "いい";
+    converter::Candidate* cand1_1 = seg1->add_candidate();
+    cand1_1->value = "いい天気";
+    cand1_1->key = "いいてんき";
+    cand1_1->converted_segment_count = 2;
+
+    Segment* seg2 = segments.add_segment();
+    seg2->set_key("てんき");
+    converter::Candidate* cand2_0 = seg2->add_candidate();
+    cand2_0->value = "天気";
+    cand2_0->key = "てんき";
+
+    Segment* seg3 = segments.add_segment();
+    seg3->set_key("ですね");
+    converter::Candidate* cand3_0 = seg3->add_candidate();
+    cand3_0->value = "ですね";
+    cand3_0->key = "ですね";
+  }
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("きょうはいいてんきですね");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  ASSERT_TRUE(converter.IsActive());
+
+  // Focus right from seg 0 to seg 1.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 0))
+      .WillOnce(Return(true));
+  converter.SegmentFocusRight();
+  EXPECT_EQ(GetSegmentIndex(converter), 1);
+
+  // Select candidate 1 on segment 1 ("いい天気", converted_segment_count = 2)
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 1, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Focus right -> moves to "ですね" (index 3).
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 1, 1))
+      .WillOnce([](Segments* segs, size_t seg_idx, int cand_idx) {
+        segs->mutable_conversion_segment(1)->set_segment_type(
+            Segment::FIXED_VALUE);
+        segs->mutable_conversion_segment(1)->move_candidate(cand_idx, 0);
+        return true;
+      });
+  converter.SegmentFocusRight();
+  EXPECT_EQ(GetSegmentIndex(converter), 3);
+
+  // Focus left -> moves back to "いい天気" (index 1) because GetSegmentSpan(1)
+  // == 2.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 3, 0))
+      .WillOnce(Return(true));
+  converter.SegmentFocusLeft();
+  EXPECT_EQ(GetSegmentIndex(converter), 1);
+
+  // Check preedit: 今日は [いい天気] ですね
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 3);
+    EXPECT_EQ(output.preedit().segment(0).value(), "今日は");
+    EXPECT_EQ(output.preedit().segment(1).value(), "いい天気");
+    EXPECT_EQ(output.preedit().segment(2).value(), "ですね");
+  }
+
+  // Change back to single-segment candidate "良い" (index 1 after move).
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 1, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+
+  // Preedit should restore segment 2: 今日は [良い] 天気 ですね
+  {
+    commands::Output output;
+    converter.FillOutput(*composer_, &output);
+    EXPECT_TRUE(output.has_preedit());
+    EXPECT_EQ(output.preedit().segment_size(), 4);
+    EXPECT_EQ(output.preedit().segment(0).value(), "今日は");
+    EXPECT_EQ(output.preedit().segment(1).value(), "良い");
+    EXPECT_EQ(output.preedit().segment(2).value(), "天気");
+    EXPECT_EQ(output.preedit().segment(3).value(), "ですね");
+  }
+}
+
+TEST_F(EngineConverterTest, Commit_FullSentenceCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("わたしは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "私は中野です";
+  cand0->key = "わたしはなかのです";
+  cand0->converted_segment_count = 2;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("なかのです");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "中野です";
+  cand1->key = "なかのです";
+
+  composer_->InsertCharacterPreedit("わたしはなかのです");
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  // Commit with full-sentence candidate selected on segment 0 (L1441).
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 0))
+      .WillOnce(Return(true));
+  EXPECT_CALL(*mock_converter, FinishConversion(_, _));
+  converter.Commit(*composer_, commands::Context::default_instance());
+  commands::Output output;
+  converter.FillOutput(*composer_, &output);
+  EXPECT_TRUE(output.has_result());
+  EXPECT_EQ(output.result().value(), "私は中野です");
+}
+
+TEST_F(EngineConverterTest, GetSegmentSpan_TruncatedWhenFocusIsInsideSpan) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("きょうは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "今日は";
+  cand0->key = "きょうは";
+  cand0->converted_segment_count = 1;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("いいてんき");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "いい天気";
+  cand1->key = "いいてんき";
+  cand1->converted_segment_count = 2;
+
+  Segment* seg2 = segments.add_segment();
+  seg2->set_key("ですね");
+  converter::Candidate* cand2 = seg2->push_back_candidate();
+  cand2->value = "ですね";
+  cand2->key = "ですね";
+  cand2->converted_segment_count = 1;
+
+  composer_->InsertCharacterPreedit("きょうはいいてんきですね");
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  // Initially focus is at seg0.
+  EXPECT_EQ(GetSegmentIndex(converter), 0);
+  EXPECT_EQ(GetSegmentSpan(converter, 0), 1);
+  EXPECT_EQ(GetSegmentSpan(converter, 1), 2);
+  EXPECT_EQ(GetSegmentSpan(converter, 2), 1);
+
+  // Focus right from seg0 to seg1, modifying seg0's candidate count to 2.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 0))
+      .WillOnce([](Segments* segs, size_t seg_idx, int cand_idx) {
+        segs->mutable_conversion_segment(0)
+            ->mutable_candidate(0)
+            ->converted_segment_count = 2;
+        return true;
+      });
+  converter.SegmentFocusRight();
+  EXPECT_EQ(GetSegmentIndex(converter), 1);
+
+  // When segment_index_ is 1, GetSegmentSpan(0) has current_index(0) <
+  // focused_index(1) and 0 + 2 > 1, so span is truncated to 1 - 0 = 1 (L1633).
+  EXPECT_EQ(GetSegmentSpan(converter, 0), 1);
+  // GetSegmentSpan for current and later segments should return their normal
+  // counts.
+  EXPECT_EQ(GetSegmentSpan(converter, 1), 2);
+  EXPECT_EQ(GetSegmentSpan(converter, 2), 1);
+
+  commands::Output output;
+  converter.FillOutput(*composer_, &output);
+  EXPECT_TRUE(output.has_preedit());
+  ASSERT_EQ(output.preedit().segment_size(), 2);
+  EXPECT_EQ(output.preedit().segment(0).value(), "今日は");
+  EXPECT_EQ(output.preedit().segment(1).value(), "いい天気");
+  EXPECT_EQ(output.preedit().segment(1).annotation(),
+            commands::Preedit::Segment::HIGHLIGHT);
+}
+
+TEST_F(EngineConverterTest, GetPreeditWithMultiSegmentCandidateKey) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("わたし");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "私の名前は";
+  cand0->key = "わたしのなまえは";
+  cand0->converted_segment_count = 2;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("のなまえは");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "の名前は";
+  cand1->key = "のなまえは";
+
+  Segment* seg2 = segments.add_segment();
+  seg2->set_key("なかのです");
+  converter::Candidate* cand2 = seg2->push_back_candidate();
+  cand2->value = "中野です";
+  cand2->key = "なかのです";
+  cand2->converted_segment_count = 1;
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("わたしのなまえはなかのです");
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  // Multi-segment candidate on segment 0 (span = 2) + single segment 2:
+  std::string preedit;
+  GetPreedit(converter, 0, 3, &preedit);
+  EXPECT_EQ(preedit, "わたしのなまえはなかのです");
+
+  // Partial ranges:
+  preedit.clear();
+  GetPreedit(converter, 0, 2, &preedit);
+  EXPECT_EQ(preedit, "わたしのなまえは");
+
+  preedit.clear();
+  GetPreedit(converter, 2, 1, &preedit);
+  EXPECT_EQ(preedit, "なかのです");
+}
+
+TEST_F(EngineConverterTest, GetPreedit_FallbackWhenCandidateKeyIsEmpty) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("わたしは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "私は";
+  cand0->key = "";  // Empty candidate key with converted_segment_count = 2.
+  cand0->converted_segment_count = 2;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("なかのです");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "中野です";
+  cand1->key = "なかのです";
+  cand1->converted_segment_count = 1;
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("わたしはなかのです");
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  // When cand0->key is empty on a 2-span candidate, it falls back to
+  // segment(0).key() ("わたしは") and advances span (2), so only "わたしは"
+  // is returned for range [0, 2).
+  std::string preedit;
+  GetPreedit(converter, 0, 2, &preedit);
+  EXPECT_EQ(preedit, "わたしは");
+}
+
+TEST_F(EngineConverterTest, IsFullSentenceCandidateSelected) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("わたしは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "私は中野です";
+  cand0->key = "わたしはなかのです";
+  cand0->converted_segment_count = 3;
+
+  converter::Candidate* cand1 = seg0->push_back_candidate();
+  cand1->value = "私の名前は";
+  cand1->key = "わたしのなまえは";
+  cand1->converted_segment_count = 2;
+
+  converter::Candidate* cand2 = seg0->push_back_candidate();
+  cand2->value = "私は";
+  cand2->key = "わたしは";
+  cand2->converted_segment_count = 1;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("なか");
+  converter::Candidate* cand1_0 = seg1->push_back_candidate();
+  cand1_0->value = "中";
+  cand1_0->key = "なか";
+
+  Segment* seg2 = segments.add_segment();
+  seg2->set_key("のです");
+  converter::Candidate* cand2_0 = seg2->push_back_candidate();
+  cand2_0->value = "野です";
+  cand2_0->key = "のです";
+
+  composer_->InsertCharacterPreedit("わたしはなかのです");
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  // 1. Full-sentence candidate covering all 3 segments (cand0, count = 3 >= 3).
+  EXPECT_TRUE(IsFullSentenceCandidateSelected(converter));
+
+  // 2. Partial multi-segment candidate (cand1, count = 2 < 3): returns false.
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 1))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+  EXPECT_FALSE(IsFullSentenceCandidateSelected(converter));
+
+  // 3. Single-segment candidate (cand2, count = 1 < 3): returns false.
+  EXPECT_CALL(*mock_converter, FocusSegmentValue(_, 0, 2))
+      .WillOnce(Return(true));
+  converter.CandidateNext(*composer_);
+  EXPECT_FALSE(IsFullSentenceCandidateSelected(converter));
+
+  // 4. Focus right to segment 1. Now segment_index_ != 0, so returns false.
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 2))
+      .WillOnce(Return(true));
+  converter.SegmentFocusRight();
+  EXPECT_EQ(GetSegmentIndex(converter), 1);
+  EXPECT_FALSE(IsFullSentenceCandidateSelected(converter));
+}
+
+TEST_F(EngineConverterTest, CommitFirstSegmentFullSentenceCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("きょうは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "今日は良い天気ですね";
+  cand0->key = "きょうはいいてんきですね";
+  cand0->converted_segment_count = 2;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("いいてんきですね");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "良い天気ですね";
+  cand1->key = "いいてんきですね";
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("きょうはいいてんきですね");
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  // When full-sentence candidate is selected at segment 0, CommitFirstSegment
+  // should commit all segments at once via Commit().
+  EXPECT_CALL(*mock_converter, CommitSegmentValue(_, 0, 0))
+      .WillOnce(Return(true));
+  EXPECT_CALL(*mock_converter, FinishConversion(_, _));
+
+  commands::Context context;
+  size_t consumed_key_size = 12345;
+  converter.CommitFirstSegment(*composer_, context, &consumed_key_size);
+  EXPECT_FALSE(converter.IsActive());
+  EXPECT_EQ(consumed_key_size, 0);
+}
+
+TEST_F(EngineConverterTest, CommitFirstSegmentSingleSegmentCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("きょうは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "今日は";
+  cand0->key = "きょうは";
+  cand0->converted_segment_count = 1;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("いいてんきですね");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "良い天気ですね";
+  cand1->key = "いいてんきですね";
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("きょうはいいてんきですね");
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  // Single-segment candidate at segment 0 commits only the first segment.
+  EXPECT_CALL(*mock_converter, CommitSegments(_, _)).WillOnce(Return(true));
+
+  commands::Context context;
+  size_t consumed_key_size = 0;
+  converter.CommitFirstSegment(*composer_, context, &consumed_key_size);
+  EXPECT_TRUE(converter.IsActive());
+  EXPECT_EQ(consumed_key_size, Util::CharsLen("きょうは"));
+}
+
+
+TEST_F(EngineConverterTest, CommitFirstSegmentPartialMultiSegmentCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("ここでは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "ここで履物を";
+  cand0->key = "ここではきものを";
+  cand0->converted_segment_count = 2;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("きものを");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "着物を";
+  cand1->key = "きものを";
+
+  Segment* seg2 = segments.add_segment();
+  seg2->set_key("ぬぐ");
+  converter::Candidate* cand2 = seg2->push_back_candidate();
+  cand2->value = "脱ぐ";
+  cand2->key = "ぬぐ";
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("ここではきものをぬぐ");
+  EXPECT_TRUE(converter.Convert(*composer_));
+
+  EXPECT_CALL(*mock_converter, CommitSegments(_, ::testing::ElementsAre(0)))
+      .WillOnce([](Segments* segs, absl::Span<const size_t> ids) {
+        segs->mutable_conversion_segment(0)->set_segment_type(
+            Segment::SUBMITTED);
+        segs->erase_segments(segs->history_segments_size(), 1);
+        return true;
+      });
+
+  commands::Context context;
+  size_t consumed_key_size = 0;
+  converter.CommitFirstSegment(*composer_, context, &consumed_key_size);
+  EXPECT_TRUE(converter.IsActive());
+  EXPECT_EQ(consumed_key_size, Util::CharsLen("ここではきものを"));
+
+  commands::Output output;
+  converter.FillOutput(*composer_, &output);
+  EXPECT_EQ(output.result().value(), "ここで履物を");
+  EXPECT_EQ(output.result().key(), "ここではきものを");
+}
+
+TEST_F(EngineConverterTest, CommitHeadToFocusedSegmentsMultiSegmentCandidate) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  Segments segments;
+  Segment* seg0 = segments.add_segment();
+  seg0->set_key("ここでは");
+  converter::Candidate* cand0 = seg0->push_back_candidate();
+  cand0->value = "ここでは";
+  cand0->key = "ここでは";
+  converter::Candidate* cand0_multi = seg0->push_back_candidate();
+  cand0_multi->value = "ここで履物を";
+  cand0_multi->key = "ここではきものを";
+  cand0_multi->converted_segment_count = 2;
+
+  Segment* seg1 = segments.add_segment();
+  seg1->set_key("きものを");
+  converter::Candidate* cand1 = seg1->push_back_candidate();
+  cand1->value = "着物を";
+  cand1->key = "きものを";
+
+  Segment* seg2 = segments.add_segment();
+  seg2->set_key("ぬぐ");
+  converter::Candidate* cand2 = seg2->push_back_candidate();
+  cand2->value = "脱ぐ";
+  cand2->key = "ぬぐ";
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce(DoAll(SetArgPointee<1>(segments), Return(true)));
+
+  composer_->InsertCharacterPreedit("ここではきものをぬぐ");
+  EXPECT_TRUE(converter.Convert(*composer_));
+  converter.CandidateMoveToId(1, *composer_);
+
+  EXPECT_CALL(*mock_converter, CommitSegments(_, ::testing::ElementsAre(1)))
+      .WillOnce([](Segments* segs, absl::Span<const size_t> ids) {
+        segs->mutable_conversion_segment(0)->set_segment_type(
+            Segment::SUBMITTED);
+        segs->erase_segments(segs->history_segments_size(), 1);
+        return true;
+      });
+
+  commands::Context context;
+  size_t consumed_key_size = 0;
+  converter.CommitHeadToFocusedSegments(*composer_, context,
+                                        &consumed_key_size);
+  EXPECT_TRUE(converter.IsActive());
+  EXPECT_EQ(consumed_key_size, Util::CharsLen("ここではきものを"));
+
+  commands::Output output;
+  converter.FillOutput(*composer_, &output);
+  EXPECT_EQ(output.result().value(), "ここで履物を");
+  EXPECT_EQ(output.result().key(), "ここではきものを");
+}
+
+TEST_F(EngineConverterTest, ConvertWithContext) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  commands::Context context;
+  context.set_preceding_text("left_context");
+  context.set_following_text("right_context");
+
+  EXPECT_CALL(*mock_converter, StartConversion(_, _))
+      .WillOnce([&](const ConversionRequest& req, Segments* segments) {
+        EXPECT_EQ(req.context().preceding_text(), "left_context");
+        EXPECT_EQ(req.context().following_text(), "right_context");
+        SetAiueo(segments);
+        return true;
+      });
+
+  composer_->InsertCharacterPreedit(kChars_Aiueo);
+  EXPECT_TRUE(converter.Convert(*composer_, context));
+}
+
+TEST_F(EngineConverterTest, PredictWithContext) {
+  auto mock_converter = std::make_shared<MockConverter>();
+  EngineConverter converter(mock_converter, request_, config_);
+
+  commands::Context context;
+  context.set_preceding_text("left_context");
+  context.set_following_text("right_context");
+
+  EXPECT_CALL(*mock_converter, StartPredictionWithPreviousSuggestion(_, _, _))
+      .WillOnce([&](const ConversionRequest& req,
+                    const Segment& previous_suggestions, Segments* segments) {
+        EXPECT_EQ(req.context().preceding_text(), "left_context");
+        EXPECT_EQ(req.context().following_text(), "right_context");
+        SetAiueo(segments);
+        return true;
+      });
+
+  composer_->InsertCharacterPreedit(kChars_Aiueo);
+  EXPECT_TRUE(converter.Predict(*composer_, context));
 }
 
 }  // namespace engine

@@ -72,6 +72,46 @@ mozc_cc_library(
     ],
 )
 
+mozc_cc_library(
+    name = "converter_util",
+    srcs = ["converter_util.cc"],
+    hdrs = ["converter_util.h"],
+    visibility = [
+        "//converter:__pkg__",
+        "//engine:__pkg__",
+        "//prediction:__pkg__",
+        "//rewriter:__pkg__",
+        "//session:__pkg__",
+    ],
+    deps = [
+        ":attribute",
+        ":inner_segment",
+        ":segments",
+        "//base/strings:assign",
+        "//prediction:result",
+        "//request:conversion_request",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+mozc_cc_test(
+    name = "converter_util_test",
+    size = "small",
+    srcs = ["converter_util_test.cc"],
+    deps = [
+        ":attribute",
+        ":converter_util",
+        ":inner_segment",
+        ":segments",
+        "//prediction:result",
+        "//request:conversion_request",
+        "//testing:gunit_main",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 mozc_cc_test(
     name = "segments_test",
     size = "small",
@@ -235,10 +275,37 @@ mozc_cc_library(
     ],
     deps = [
         "//base:bits",
-        "//storage/louds:simple_succinct_bit_vector_index",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+mozc_cc_library(
+    name = "caching_connector",
+    hdrs = ["caching_connector.h"],
+    visibility = [
+        "//:__subpackages__",
+    ],
+    deps = [
+        ":connector",
+        "//dictionary:pos_matcher",
+        "@com_google_absl//absl/log:check",
+    ],
+)
+
+mozc_cc_test(
+    name = "caching_connector_test",
+    srcs = ["caching_connector_test.cc"],
+    deps = [
+        ":caching_connector",
+        ":connector",
+        "//data_manager/testing:mock_data_manager",
+        "//dictionary:pos_matcher",
+        "//engine:modules",
+        "//testing:gunit_main",
     ],
 )
 
@@ -273,6 +340,7 @@ mozc_cc_library(
     hdrs = ["nbest_generator.h"],
     deps = [
         ":attribute",
+        ":caching_connector",
         ":candidate_filter",
         ":connector",
         ":inner_segment",
@@ -285,7 +353,7 @@ mozc_cc_library(
         "//dictionary:dictionary_interface",
         "//dictionary:pos_matcher",
         "//prediction:suggestion_filter",
-        "//request:conversion_request",
+        "//request:options",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
@@ -301,6 +369,7 @@ mozc_cc_test(
     ],
     deps = [
         ":attribute",
+        ":caching_connector",
         ":immutable_converter",
         ":lattice",
         ":nbest_generator",
@@ -336,7 +405,7 @@ mozc_cc_library(
         "//dictionary:pos_matcher",
         "//prediction:suggestion_filter",
         "//protocol:commands_cc_proto",
-        "//request:conversion_request",
+        "//request:options",
         "//request:request_util",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/hash",
@@ -421,8 +490,7 @@ mozc_cc_library(
     ],
     deps = [
         ":segments",
-        "//request:conversion_request",
-        "@com_google_absl//absl/base:core_headers",
+        "//request:options",
     ],
 )
 
@@ -437,6 +505,7 @@ mozc_cc_library(
     ],
     deps = [
         ":attribute",
+        ":caching_connector",
         ":connector",
         ":immutable_converter_interface",
         ":key_corrector",
@@ -460,7 +529,7 @@ mozc_cc_library(
         "//prediction:suggestion_filter",
         "//protocol:commands_cc_proto",
         "//protocol:config_cc_proto",
-        "//request:conversion_request",
+        "//request:options",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -492,6 +561,7 @@ mozc_cc_test(
         "//engine:modules",
         "//protocol:commands_cc_proto",
         "//request:conversion_request",
+        "//request:options",
         "//request:request_test_util",
         "//testing:gunit_main",
         "//testing:test_peer",
@@ -533,6 +603,7 @@ mozc_cc_library(
     deps = [
         ":attribute",
         ":converter_interface",
+        ":converter_util",
         ":history_reconstructor",
         ":immutable_converter_interface",
         ":inner_segment",
@@ -544,11 +615,13 @@ mozc_cc_library(
         "//composer",
         "//dictionary:dictionary_interface",
         "//dictionary:pos_matcher",
+        "//engine:contextual_candidate_reranker",
         "//engine:modules",
         "//prediction:predictor_interface",
         "//prediction:result",
         "//protocol:commands_cc_proto",
         "//request:conversion_request",
+        "//request:request_util",
         "//rewriter:rewriter_interface",
         "//transliteration",
         "@com_google_absl//absl/base:core_headers",
@@ -569,6 +642,7 @@ mozc_cc_test(
         ":attribute",
         ":converter",
         ":converter_interface",
+        ":converter_util",
         ":immutable_converter",
         ":immutable_converter_interface",
         ":inner_segment",
@@ -590,6 +664,7 @@ mozc_cc_test(
         "//engine",
         "//engine:mock_data_engine_factory",
         "//engine:modules",
+        "//engine:supplemental_model_mock",
         "//prediction:predictor",
         "//prediction:predictor_interface",
         "//prediction:result",
@@ -626,6 +701,7 @@ mozc_cc_test(
         "//engine",
         "//engine:engine_factory",
         "//protocol:commands_cc_proto",
+        "//protocol:config_cc_proto",
         "//request:conversion_request",
         "//testing:gunit_main",
         "//testing:mozctest",

@@ -16,7 +16,7 @@ cd mozkey-ibg\src
 python build_tools/update_deps.py
 python ..\tools\release\prepare_windows_zenz_runtime.py --arch x64
 python build_tools/build_qt.py --release --confirm_license
-bazelisk build --config release_build package
+bazelisk build package --config release_build
 
 python build_tools/open.py bazel-bin/win32/installer/Mozc64.msi
 ```
@@ -30,9 +30,6 @@ python build_tools/open.py bazel-bin/win32/installer/Mozc64.msi
 
 64-bit Windows 10 or later.
 
-> [!IMPORTANT] Building Mozc on a Windows ARM64 environment is not yet supported
-> ([#1296](https://github.com/google/mozc/issues/1296)).
-
 ### Software Requirements
 
 Building Mozc on Windows requires the following software.
@@ -41,17 +38,23 @@ Building Mozc on Windows requires the following software.
     with the following components.
     *   Windows 11 SDK
     *   MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)
+    *   MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools (Latest)
     *   C++ ATL for latest v143 build tools (x86 & x64)
+    *   C++ ATL for latest v143 build tools (ARM64/ARM64EC)
 *   Python 3.12 or later.
 *   `.NET 6` or later (for `dotnet` command).
 *   [Bazelisk](https://github.com/bazelbuild/bazelisk)
 
-> [!TIP]
-> Visual Studio 2026 Community Edition is also supported to build Mozc. When
-> both VS 2022 and 2026 are installed, VS 2022 will be used.
+> [!TIP] The following Visual Studio components can be skipped if you do not
+> build Mozc for ARM64.
+>
+>  *   MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools (Latest)
+>  *   C++ ATL for latest v143 build tools (ARM64/ARM64EC)
 
-> [!NOTE]
-> Bazelisk is a wrapper of [Bazel](https://bazel.build) that allows you
+> [!TIP] Visual Studio 2026 Community Edition is also supported to build Mozc.
+> When both VS 2022 and 2026 are installed, VS 2022 will be used.
+
+> [!NOTE] Bazelisk is a wrapper of [Bazel](https://bazel.build) that allows you
 > to use a specific version of Bazel.
 
 ### Download the repository from GitHub
@@ -71,7 +74,7 @@ python build_tools/update_deps.py
 
 In this step, additional build dependencies will be downloaded, including:
 
-*   [LLVM 20.1.1](https://github.com/llvm/llvm-project/releases/tag/llvmorg-20.1.1)
+*   [LLVM 22.1.8](https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.8)
 *   [MSYS2 2025-02-21](https://github.com/msys2/msys2-installer/releases/tag/2025-02-21)
 *   [Ninja 1.13.2](https://github.com/ninja-build/ninja/releases/tag/v1.13.2)
 *   [Qt 6.9.1](https://download.qt.io/archive/qt/6.8/6.8.0/submodules/qtbase-everywhere-src-6.9.1.tar.xz)
@@ -110,7 +113,7 @@ Assuming `bazelisk` is in your `%PATH%`, run the following command to build Mozc
 for Windows.
 
 ```
-bazelisk build --config oss_windows --config release_build package
+bazelisk build package --config release_build
 ```
 
 #### Install Mozc
@@ -124,8 +127,7 @@ python build_tools/open.py bazel-bin/win32/installer/Mozc64.msi
 #### Uninstall Mozc
 
 To Uninstall Mozc, press <kbd>Win</kbd>+<kbd>R</kbd> to open the Run dialog and
-type and type `ms-settings:appsfeatures-app`, run the following command in the
-terminal:
+type `ms-settings:appsfeatures-app`, run the following command in the terminal:
 
 ```
 start ms-settings:appsfeatures-app
@@ -133,38 +135,44 @@ start ms-settings:appsfeatures-app
 
 Then, uninstall `Mozc` from the list of installed applications.
 
-### Build `Mozc64.msi` for ARM64
+### Cross compilation
 
-To compile executables for ARM64, the following Visual Studio components also
-need to be installed:
+By default, `Mozc64.msi` is built for the host CPU architecture. To explicitly
+specify the target CPU architecture, specify build options as follows:
 
-*   MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools (Latest)
-*   C++ ATL for latest v143 build tools (ARM64/ARM64EC)
+#### To build x64 installer
 
-To build `Mozc64.msi` for ARM64, run the following commands:
+```
+python ..\tools\release\prepare_windows_zenz_runtime.py --arch x64
+python ..\tools\release\prepare_windows_zenz_runtime.py --arch x64 --verify-only
+python build_tools/build_qt.py --release --confirm_license --target_arch=x64
+bazelisk build package --config release_build --platforms=//:windows-x86_64
+```
+
+#### To build ARM64 installer
 
 ```
 python ..\tools\release\prepare_windows_zenz_runtime.py --arch arm64
 python ..\tools\release\prepare_windows_zenz_runtime.py --arch arm64 --verify-only
 python build_tools/build_qt.py --release --confirm_license --target_arch=arm64
-bazelisk build --config oss_windows --config release_build package --platforms=//:windows-arm64
+bazelisk build package --config release_build --platforms=//:windows-arm64
 ```
 
 The runtime preparation command discovers `vcvarsall.bat`, imports its
-`amd64_arm64` SDK environment, and then uses the checksum-pinned LLVM 20.1.1
+`amd64_arm64` SDK environment, and then uses the checksum-pinned LLVM 22.1.8
 and Ninja 1.13.2 installed by `update_deps.py`. It configures llama.cpp with the
 pinned `cmake/arm64-windows-llvm.cmake` cross-toolchain; no separate Ninja or
 LLVM installation is used.
 
-### Build `Mozc64.msi` for both X64 and ARM64
+#### To build a universal installer for both X64 and ARM64
 
-To built a X64 installer that is also compatible with ARM64 machines, run the
+To build an X64 installer that is also compatible with ARM64 machines, run the
 following commands:
 
 ```
 python ..\tools\release\prepare_windows_zenz_runtime.py --arch x64
-python build_tools/build_qt.py --release --confirm_license
-bazelisk build --config oss_windows --config release_build --config win_universal_installer package
+python build_tools/build_qt.py --release --confirm_license --target_arch=x64
+bazelisk build package --config release_build --platforms=//:windows-x86_64 --config win_universal_installer
 ```
 
 The universal MSI keeps its Mozc server, scorer, and pinned Zenz runtime x64
@@ -173,11 +181,8 @@ Windows-on-ARM emulation. The native ARM64 MSI instead requires and verifies an
 ARM64 Zenz runtime. Bazel selects between the generated inputs by target
 platform, and the runtime verifier rejects a mismatched PE machine.
 
-To build the above installer, the following Visual Studio components also need
-to be installed:
-
-*   MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools (Latest)
-*   C++ ATL for latest v143 build tools (ARM64/ARM64EC)
+Building the ARM64 and universal installers requires the ARM64/ARM64EC Visual
+Studio components listed in [Software Requirements](#software-requirements).
 
 ## Bazel command examples
 
@@ -190,7 +195,7 @@ to be installed:
 ### Run all tests
 
 ```
-bazelisk test ... --config oss_windows --build_tests_only -c dbg
+bazelisk test ... --build_tests_only -c dbg
 ```
 
 > [!NOTE] `...` means all targets under the current and subdirectories.

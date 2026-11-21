@@ -87,6 +87,26 @@ int CountEmojiCandidates(const Segments& segments) {
   return emoji_size;
 }
 
+// Every candidate created by EmojiRewriter must carry NO_TOP, regardless of
+// the special "えもじ" lookup or normal per-reading lookup.
+bool AllEmojiCandidatesHaveNoTop(const Segments& segments) {
+  bool found_emoji = false;
+  for (const Segment& segment : segments) {
+    for (size_t j = 0; j < segment.candidates_size(); ++j) {
+      const converter::Candidate& candidate = segment.candidate(j);
+      if (!EmojiRewriter::IsEmojiCandidate(candidate)) {
+        continue;
+      }
+      found_emoji = true;
+      if (!(candidate.ranking_constraints &
+            converter::RankingConstraint::NO_TOP)) {
+        return false;
+      }
+    }
+  }
+  return found_emoji;
+}
+
 // Checks if the first segment has a specific candidate.
 bool HasExpectedCandidate(const Segments& segments,
                           const absl::string_view expect_value) {
@@ -249,16 +269,30 @@ TEST_F(EmojiRewriterTest, ConvertedSegmentsHasEmoji) {
   EXPECT_TRUE(rewriter_.Rewrite(convreq, &segments));
   EXPECT_EQ(CountEmojiCandidates(segments), 1);
   EXPECT_TRUE(HasExpectedCandidate(segments, "CAT"));
+  EXPECT_TRUE(AllEmojiCandidatesHaveNoTop(segments));
 
   SetSegment("Nezumi", "test", &segments);
   EXPECT_TRUE(rewriter_.Rewrite(convreq, &segments));
   EXPECT_EQ(CountEmojiCandidates(segments), 2);
   EXPECT_TRUE(HasExpectedCandidate(segments, "MOUSE"));
   EXPECT_TRUE(HasExpectedCandidate(segments, "RAT"));
+  EXPECT_TRUE(AllEmojiCandidatesHaveNoTop(segments));
 
   SetSegment(kEmoji, "test", &segments);
   EXPECT_TRUE(rewriter_.Rewrite(convreq, &segments));
   EXPECT_EQ(CountEmojiCandidates(segments), 9);
+  EXPECT_TRUE(AllEmojiCandidatesHaveNoTop(segments));
+}
+
+TEST_F(EmojiRewriterTest, ExplicitNonEmojiCandidateRemainsUnconstrained) {
+  Segments segments;
+  SetSegment("Neko", "symbol", &segments);
+  const ConversionRequest convreq = ConvReq(config_, request_);
+  ASSERT_TRUE(rewriter_.Rewrite(convreq, &segments));
+  ASSERT_EQ(segments.segment(0).candidate(0).ranking_constraints &
+                converter::RankingConstraint::NO_TOP,
+            0);
+  EXPECT_TRUE(AllEmojiCandidatesHaveNoTop(segments));
 }
 
 TEST_F(EmojiRewriterTest, NoConversionWithDisabledSettings) {
@@ -346,6 +380,9 @@ TEST_F(EmojiRewriterTest, CheckInsertPosition) {
   const converter::Candidate& candidate = segment.candidate(kExpectPosition);
   EXPECT_TRUE(EmojiRewriter::IsEmojiCandidate(candidate));
   EXPECT_EQ(candidate.value, "CAT");
+  EXPECT_NE(candidate.ranking_constraints &
+                converter::RankingConstraint::NO_TOP,
+            0);
 }
 
 TEST_F(EmojiRewriterTest, QueryNormalization) {

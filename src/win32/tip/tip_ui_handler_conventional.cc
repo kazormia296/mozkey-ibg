@@ -46,17 +46,20 @@
 #include "protocol/candidate_window.pb.h"
 #include "protocol/commands.pb.h"
 #include "protocol/renderer_command.pb.h"
+#include "config/config_handler.h"
 #include "renderer/win32/win32_renderer_client.h"
 #include "win32/base/input_state.h"
 #include "win32/tip/tip_composition_util.h"
 #include "win32/tip/tip_dll_module.h"
 #include "win32/tip/tip_grimodex_context_util.h"
 #include "win32/tip/tip_input_mode_manager.h"
+#include "win32/tip/tip_inprocess_renderer.h"
 #include "win32/tip/tip_private_context.h"
 #include "win32/tip/tip_range_util.h"
 #include "win32/tip/tip_text_service.h"
 #include "win32/tip/tip_thread_context.h"
 #include "win32/tip/tip_ui_element_manager.h"
+#include "win32/tip/tip_writing_direction.h"
 
 namespace mozc {
 namespace win32 {
@@ -71,6 +74,139 @@ using Annotation = ::mozc::commands::Preedit_Segment::Annotation;
 using IndicatorInfo = ::mozc::commands::RendererCommand_IndicatorInfo;
 using RendererCommand = ::mozc::commands::RendererCommand;
 using ApplicationInfo = ::mozc::commands::RendererCommand::ApplicationInfo;
+
+HWND GetInProcessRendererHostWindow(const RendererCommand& command) {
+  if (!command.has_application_info() ||
+      !command.application_info().has_target_window_handle() ||
+      command.application_info().target_window_handle() == 0) {
+    return nullptr;
+  }
+
+  HWND target_window = WinUtil::DecodeWindowHandle(
+      command.application_info().target_window_handle());
+  if (target_window == nullptr || !::IsWindow(target_window)) {
+    return nullptr;
+  }
+
+  DWORD target_process_id = 0;
+  if (::GetWindowThreadProcessId(target_window, &target_process_id) == 0 ||
+      target_process_id != ::GetCurrentProcessId()) {
+    return nullptr;
+  }
+
+  HWND root_window = ::GetAncestor(target_window, GA_ROOT);
+  if (root_window != nullptr && ::IsWindow(root_window)) {
+    DWORD root_process_id = 0;
+    if (::GetWindowThreadProcessId(root_window, &root_process_id) != 0 &&
+        root_process_id == ::GetCurrentProcessId()) {
+      return root_window;
+    }
+  }
+  return target_window;
+}
+
+void DispatchRendererUpdate(TipTextService* text_service,
+                            const RendererCommand& command) {
+  if (text_service != nullptr && text_service->IsImmersiveMode()) {
+    TipInProcessRenderer::OnUpdated(command,
+                                    GetInProcessRendererHostWindow(command));
+    return;
+  }
+  Win32RendererClient::OnUpdated(command);
+}
+
+bool FillRubyPreeditRectangleFromGuiCaret(HWND target_window,
+                                          const RECT& text_rect,
+                                          bool vertical_writing,
+                                          RendererCommand* command) {
+  if (target_window == nullptr || !::IsWindow(target_window) ||
+      vertical_writing || command == nullptr) {
+    return false;
+  }
+
+  const int text_height = text_rect.bottom - text_rect.top;
+  if (text_height <= 0) {
+    return false;
+  }
+
+  DWORD target_process_id = 0;
+  const DWORD target_thread_id =
+      ::GetWindowThreadProcessId(target_window, &target_process_id);
+  if (target_thread_id == 0 ||
+      target_process_id != ::GetCurrentProcessId()) {
+    return false;
+  }
+
+  GUITHREADINFO gui_info = {};
+  gui_info.cbSize = sizeof(gui_info);
+  if (!::GetGUIThreadInfo(target_thread_id, &gui_info) ||
+      gui_info.hwndCaret == nullptr || !::IsWindow(gui_info.hwndCaret)) {
+    return false;
+  }
+
+  DWORD caret_process_id = 0;
+  if (::GetWindowThreadProcessId(gui_info.hwndCaret, &caret_process_id) == 0 ||
+      caret_process_id != target_process_id) {
+    return false;
+  }
+
+  POINT caret_top_left = {gui_info.rcCaret.left, gui_info.rcCaret.top};
+  POINT caret_bottom_right = {gui_info.rcCaret.right,
+                              gui_info.rcCaret.bottom};
+  if (!::ClientToScreen(gui_info.hwndCaret, &caret_top_left) ||
+      !::ClientToScreen(gui_info.hwndCaret, &caret_bottom_right)) {
+    return false;
+  }
+
+  const RECT caret_rect = {caret_top_left.x, caret_top_left.y,
+                           caret_bottom_right.x, caret_bottom_right.y};
+  const int caret_height = caret_rect.bottom - caret_rect.top;
+
+  // Some frameworks expose only a one- or two-pixel caret stroke instead of
+  // the input line box. Such a rectangle must not drive ruby placement.
+  constexpr int kMinimumCaretHeight = 8;
+  if (caret_height < kMinimumCaretHeight) {
+    return false;
+  }
+
+  // Accept only a substantial but plausible reduction. This corrects cases
+  // such as Notepad's anomalous 49px first-line TSF rectangle with a 25px GUI
+  // caret, while preserving the existing geometry for Word, Excel, ordinary
+  // editor lines, and thin Qt carets.
+  constexpr int kMinimumCaretHeightPercent = 40;
+  constexpr int kMaximumCaretHeightPercentForCorrection = 75;
+  constexpr int kMinimumHeightReduction = 4;
+  if (static_cast<int64_t>(caret_height) * 100 <
+          static_cast<int64_t>(text_height) *
+              kMinimumCaretHeightPercent ||
+      static_cast<int64_t>(caret_height) * 100 >
+          static_cast<int64_t>(text_height) *
+              kMaximumCaretHeightPercentForCorrection ||
+      text_height - caret_height < kMinimumHeightReduction) {
+    return false;
+  }
+
+  // The target anomaly contains excess space above the actual line while
+  // sharing its lower edge. Reject unrelated or stale caret rectangles.
+  const int bottom_delta =
+      caret_rect.bottom >= text_rect.bottom
+          ? caret_rect.bottom - text_rect.bottom
+          : text_rect.bottom - caret_rect.bottom;
+  const int bottom_tolerance = text_height > 16 ? text_height / 4 : 4;
+  if (bottom_delta > bottom_tolerance ||
+      caret_rect.top < text_rect.top - bottom_tolerance ||
+      caret_rect.top >= text_rect.bottom) {
+    return false;
+  }
+
+  RendererCommand::Rectangle* preedit_rect =
+      command->mutable_preedit_rectangle();
+  preedit_rect->set_left(text_rect.left);
+  preedit_rect->set_top(caret_rect.top);
+  preedit_rect->set_right(text_rect.right);
+  preedit_rect->set_bottom(caret_rect.bottom);
+  return true;
+}
 
 uint64_t NewRendererCallbackToken() {
   uintptr_t token = 0;
@@ -91,7 +227,7 @@ void RevokeRendererAndHide(TipTextService* text_service) {
   RendererCommand command;
   command.set_type(RendererCommand::UPDATE);
   command.set_visible(false);
-  Win32RendererClient::OnUpdated(command);
+  DispatchRendererUpdate(text_service, command);
 }
 
 bool IsRendererOutputGenerationCurrent(TipTextService* text_service,
@@ -156,11 +292,15 @@ bool FillVisibility(ITfUIElementMgr* ui_element_manager,
   bool suggest_window_visible = false;
   bool candidate_window_visible = false;
   bool ruby_window_visible = false;
+  const bool conversion_indicator_visible =
+      config::ConfigHandler::GetSharedConfig()->show_conversion_status_indicator() &&
+      output.has_preedit() && output.preedit().segment_size() > 0;
 
-  // Live conversion uses the renderer for the ruby overlay even when there is
-  // no candidate_window. Pending live conversion intentionally clears
-  // candidate_window, so visibility must not depend only on candidate_window.
-  if (output.live_conversion() && output.has_preedit()) {
+  // The live-conversion reading overlay can be visible before actual live
+  // conversion starts, and pending live conversion may have no candidate
+  // window.  Renderer visibility therefore cannot depend on candidate_window.
+  if ((output.live_conversion() || output.pre_live_conversion_reading()) &&
+      output.has_preedit()) {
     ruby_window_visible = true;
   }
 
@@ -181,7 +321,7 @@ bool FillVisibility(ITfUIElementMgr* ui_element_manager,
   }
 
   if (candidate_window_visible || suggest_window_visible ||
-      ruby_window_visible) {
+      ruby_window_visible || conversion_indicator_visible) {
     command->set_visible(true);
   }
 
@@ -246,16 +386,77 @@ wil::com_ptr_nothrow<ITfRange> GetSelectionRange(ITfContext* context,
   return selection_range;
 }
 
+WritingDirection ProbeExpandedRangeDirection(
+    ITfContextView* context_view, TfEditCookie read_cookie,
+    ITfRange* composition_range, ITfRange* target_range,
+    const RECT& target_rect, bool forward) {
+  if (context_view == nullptr || composition_range == nullptr ||
+      target_range == nullptr) {
+    return WritingDirection::kUnknown;
+  }
+
+  wil::com_ptr_nothrow<ITfRange> probe_range;
+  if (FAILED(target_range->Clone(&probe_range)) || !probe_range) {
+    return WritingDirection::kUnknown;
+  }
+
+  LONG shifted = 0;
+  const HRESULT shift_result =
+      forward ? probe_range->ShiftEnd(read_cookie, 1, &shifted, nullptr)
+              : probe_range->ShiftStart(read_cookie, -1, &shifted, nullptr);
+  const LONG expected_shift = forward ? 1 : -1;
+  if (FAILED(shift_result) || shifted != expected_shift) {
+    return WritingDirection::kUnknown;
+  }
+
+  // Never cross the Mozc composition boundary merely to infer geometry.
+  if (!TipRangeUtil::IsRangeCovered(read_cookie, probe_range.get(),
+                                    composition_range)) {
+    return WritingDirection::kUnknown;
+  }
+
+  RECT expanded_rect = {};
+  bool expanded_clipped = false;
+  if (FAILED(TipRangeUtil::GetTextExt(context_view, read_cookie,
+                                      probe_range.get(), &expanded_rect,
+                                      &expanded_clipped)) ||
+      expanded_clipped) {
+    return WritingDirection::kUnknown;
+  }
+
+  return InferWritingDirectionFromExtentGrowth(
+      target_rect.right - target_rect.left,
+      target_rect.bottom - target_rect.top,
+      expanded_rect.right - expanded_rect.left,
+      expanded_rect.bottom - expanded_rect.top);
+}
+
+WritingDirection InferCompositionWritingDirectionFromGeometry(
+    ITfContextView* context_view, TfEditCookie read_cookie,
+    ITfRange* composition_range, ITfRange* target_range,
+    const RECT& target_rect) {
+  WritingDirection direction = ProbeExpandedRangeDirection(
+      context_view, read_cookie, composition_range, target_range, target_rect,
+      /*forward=*/true);
+  if (direction != WritingDirection::kUnknown) {
+    return direction;
+  }
+  return ProbeExpandedRangeDirection(
+      context_view, read_cookie, composition_range, target_range, target_rect,
+      /*forward=*/false);
+}
+
 // This function updates RendererCommand::CharacterPosition to emulate
 // IMM32-based client. Ideally we'd better to define new field for TSF Mozc
 // into which the result of ITfContextView::GetTextExt is stored.
 // TODO(yukawa): Replace FillCharPosition with new one designed for TSF.
 bool FillCharPosition(TipPrivateContext* private_context, ITfContext* context,
                       TfEditCookie read_cookie, bool has_composition,
-                      ApplicationInfo* app_info, bool* no_layout) {
-  if (private_context == nullptr) {
+                      RendererCommand* command, bool* no_layout) {
+  if (private_context == nullptr || command == nullptr) {
     return false;
   }
+  ApplicationInfo* app_info = command->mutable_application_info();
   bool dummy_no_layout = false;
   if (no_layout == nullptr) {
     no_layout = &dummy_no_layout;
@@ -266,7 +467,8 @@ bool FillCharPosition(TipPrivateContext* private_context, ITfContext* context,
     return false;
   }
 
-  (void)WinUtil::DecodeWindowHandle(app_info->target_window_handle());
+  const HWND target_window =
+      WinUtil::DecodeWindowHandle(app_info->target_window_handle());
 
   wil::com_ptr_nothrow<ITfRange> range =
       has_composition ? GetCompositionRange(context, read_cookie)
@@ -326,9 +528,46 @@ bool FillCharPosition(TipPrivateContext* private_context, ITfContext* context,
       app_info->mutable_composition_target();
   composition_target->set_position(0);
 
-  bool vertical_writing = false;
-  if (SUCCEEDED(TipRangeUtil::IsVerticalWriting(target_range.get(), read_cookie,
-                                                &vertical_writing))) {
+  const WritingDirection snapshot_direction =
+      has_composition ? private_context->composition_writing_direction()
+                      : WritingDirection::kUnknown;
+
+  WritingDirection attribute_direction = WritingDirection::kUnknown;
+  TipRangeUtil::GetWritingDirection(target_range.get(), read_cookie,
+                                    &attribute_direction);
+
+  WritingDirection writing_direction = WritingDirection::kUnknown;
+  if (snapshot_direction == WritingDirection::kVertical) {
+    // Preserve a positive pre-composition vertical signal. Some TSF hosts
+    // replace both VerticalWriting and Orientation with horizontal values on
+    // the range created by StartComposition.
+    writing_direction = WritingDirection::kVertical;
+  } else if (attribute_direction == WritingDirection::kVertical) {
+    // Never let a horizontal pre-composition snapshot suppress a current,
+    // explicit vertical signal.
+    writing_direction = WritingDirection::kVertical;
+  } else if (snapshot_direction == WritingDirection::kHorizontal) {
+    writing_direction = WritingDirection::kHorizontal;
+  } else if (has_composition && !clipped) {
+    // No reliable pre-composition snapshot exists. Strong adjacent-range
+    // growth may then override a composition-local horizontal default. This
+    // deliberately compares growth direction rather than a glyph's aspect
+    // ratio.
+    const WritingDirection geometry_direction =
+        InferCompositionWritingDirectionFromGeometry(
+            context_view.get(), read_cookie, range.get(), target_range.get(),
+            text_rect);
+    writing_direction =
+        geometry_direction != WritingDirection::kUnknown
+            ? geometry_direction
+            : attribute_direction;
+  } else {
+    writing_direction = attribute_direction;
+  }
+
+  const bool vertical_writing =
+      writing_direction == WritingDirection::kVertical;
+  if (writing_direction != WritingDirection::kUnknown) {
     composition_target->set_vertical_writing(vertical_writing);
   }
 
@@ -366,6 +605,12 @@ bool FillCharPosition(TipPrivateContext* private_context, ITfContext* context,
   area->set_top(document_rect.top);
   area->set_right(document_rect.right);
   area->set_bottom(document_rect.bottom);
+
+  if ((output.live_conversion() || output.pre_live_conversion_reading()) &&
+      output.has_preedit()) {
+    FillRubyPreeditRectangleFromGuiCaret(target_window, text_rect,
+                                         vertical_writing, command);
+  }
 
   return true;
 }
@@ -454,7 +699,7 @@ bool UpdateCommand(TipTextService* text_service, ITfContext* context,
     return false;
   }
   FillCharPosition(private_context.get(), context, read_cookie,
-                   command->output().has_preedit(), app_info, no_layout);
+                   command->output().has_preedit(), command, no_layout);
   if (!is_current_output()) {
     return false;
   }
@@ -474,6 +719,7 @@ bool UpdateCommand(TipTextService* text_service, ITfContext* context,
           input_mode_manager->GetEffectiveOpenClose());
       info->mutable_status()->set_mode(static_cast<CompositionMode>(
           input_mode_manager->GetEffectiveConversionMode()));
+      info->set_is_private_input(input_mode_manager->IsPrivateInput());
     }
   }
 
@@ -551,7 +797,7 @@ class UpdateUiEditSessionImpl final : public TipComImplements<ITfEditSession> {
       return S_OK;
     }
     if (!no_layout || !command.visible()) {
-      Win32RendererClient::OnUpdated(command);
+      DispatchRendererUpdate(text_service_.get(), command);
       if (!IsRendererOutputGenerationCurrent(
               text_service_.get(), context_.get(), renderer_domain_,
               output_generation)) {
@@ -626,6 +872,7 @@ void TipUiHandlerConventional::OnDeactivate() {
   command.set_type(RendererCommand::UPDATE);
   command.set_visible(false);
   Win32RendererClient::OnUpdated(command);
+  TipInProcessRenderer::OnUIThreadUninitialized();
   Win32RendererClient::OnUIThreadUninitialized();
 }
 
@@ -650,7 +897,7 @@ void TipUiHandlerConventional::OnFocusChange(
     command.set_type(RendererCommand::UPDATE);
     command.set_visible(false);
     if (is_focus_event_current()) {
-      Win32RendererClient::OnUpdated(command);
+      DispatchRendererUpdate(text_service, command);
       if (!is_focus_event_current()) {
         // The renderer call can pump a newer focus event.  Re-resolve the
         // current document so this stale hide cannot remain the final state.
@@ -691,7 +938,7 @@ bool TipUiHandlerConventional::Update(TipTextService* text_service,
     return false;
   }
   if (!no_layout || !command.visible()) {
-    Win32RendererClient::OnUpdated(command);
+    DispatchRendererUpdate(text_service, command);
     if (!IsRendererOutputGenerationCurrent(
             text_service, context, renderer_domain, output_generation)) {
       RevokeRendererAndHide(text_service);

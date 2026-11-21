@@ -16,6 +16,8 @@
 #include "protocol/config.pb.h"
 #include "request/conversion_request.h"
 #include "session/zenz_feedback_store.h"
+#include "session/zenz_orthography_policy.h"
+#include "session/zenz_output_validator.h"
 
 namespace mozc {
 namespace {
@@ -162,6 +164,8 @@ void FillSyntheticCandidate(const converter::Candidate& base_candidate,
   candidate->content_value = std::string(value);
 
   candidate->inner_segment_boundary = converter::InnerSegmentBoundary();
+  // A synthetic Zenz-feedback surface is not a system-dictionary node path.
+  candidate->proper_noun_spans.clear();
 
   candidate->attributes &= ~converter::Attribute::BEST_CANDIDATE;
   candidate->attributes |=
@@ -173,12 +177,19 @@ void FillSyntheticCandidate(const converter::Candidate& base_candidate,
   candidate->display_value.clear();
 }
 
-session::ZenzFeedbackAutoBlockPolicy GetZenzFeedbackAutoBlockPolicy(
+session::ZenzFeedbackReusePolicy GetZenzFeedbackReusePolicy(
     const config::Config& config) {
-  session::ZenzFeedbackAutoBlockPolicy policy;
-  policy.enabled = config.use_zenz_auto_block_rejected_correction();
-  policy.reject_threshold =
+  session::ZenzFeedbackReusePolicy policy;
+  policy.minimum_key_length_enabled =
+      config.use_zenz_feedback_min_key_length();
+  policy.minimum_key_length =
+      std::clamp<uint32_t>(config.zenz_feedback_min_key_length(), 1, 20);
+  policy.auto_block_policy.enabled =
+      config.use_zenz_auto_block_rejected_correction();
+  policy.auto_block_policy.minimum_reject_count =
       static_cast<int>(config.zenz_auto_block_reject_threshold());
+  policy.auto_block_policy.minimum_reject_percentage = static_cast<int>(
+      config.zenz_auto_block_minimum_reject_percentage());
   return policy;
 }
 
@@ -190,7 +201,14 @@ int ZenzFeedbackCandidateRewriter::capability(
     return RewriterInterface::NOT_AVAILABLE;
   }
 
-  if (!request.config().use_zenz_feedback_learning()) {
+  if (!request.config().use_zenz_feedback_reuse()) {
+    return RewriterInterface::NOT_AVAILABLE;
+  }
+
+  // This rewriter has no EngineConverterInterface for reverse conversion.
+  // In strict mode, do not inject or rerank unvalidated saved Zenz feedback.
+  // Other Mozc rewriters, user dictionary, and ordinary history remain active.
+  if (request.config().use_zenz_strict_reading_preservation()) {
     return RewriterInterface::NOT_AVAILABLE;
   }
 
@@ -199,11 +217,6 @@ int ZenzFeedbackCandidateRewriter::capability(
   }
 
   if (!request.options().enable_user_history_for_conversion) {
-    return RewriterInterface::NOT_AVAILABLE;
-  }
-
-  if (request.config().history_learning_level() !=
-      config::Config::DEFAULT_HISTORY) {
     return RewriterInterface::NOT_AVAILABLE;
   }
 
@@ -245,7 +258,7 @@ bool ZenzFeedbackCandidateRewriter::Rewrite(
   const std::vector<session::ZenzFeedbackCandidate> ranked_candidates =
       store.GetRankedCandidates(
           full_key, kContextClass,
-          GetZenzFeedbackAutoBlockPolicy(request.config()));
+          GetZenzFeedbackReusePolicy(request.config()));
 
   if (ranked_candidates.empty()) {
     return false;
@@ -256,15 +269,40 @@ bool ZenzFeedbackCandidateRewriter::Rewrite(
     return false;
   }
 
+  const session::ZenzOrthographyPolicy orthography_policy;
   for (const session::ZenzFeedbackCandidate& feedback_candidate :
        ranked_candidates) {
-    const absl::string_view zenz_value = feedback_candidate.value;
+    const std::string zenz_value =
+        session::ZenzOutputValidator::RepairUserControlledSymbols(
+            full_key, original_top_value, feedback_candidate.value);
 
     if (!IsSafeCandidateText(full_key, zenz_value)) {
       continue;
     }
 
+    // Persisted Zenz feedback cannot bypass the user's current emoji policy.
+    // The ordinary EmojiRewriter and explicit dictionary selections are not
+    // affected by this check.
+    if (!request.config().allow_zenz_emoji_changes() &&
+        !session::ZenzOutputValidator::PreservesEmojiSequences(
+            original_top_value, zenz_value)) {
+      continue;
+    }
+
     if (zenz_value == original_top_value) {
+      continue;
+    }
+
+    // Learned feedback must not bypass the same obvious-omission guard used
+    // for fresh Zenz responses, even if a synthetic candidate already exists.
+    if (session::ZenzOutputValidator::IsObviousSurfaceTruncation(
+            original_top_value, zenz_value)) {
+      continue;
+    }
+
+    const session::ZenzOrthographyDecision orthography_decision =
+        orthography_policy.Evaluate(original_top_value, zenz_value);
+    if (!orthography_decision.allow) {
       continue;
     }
 

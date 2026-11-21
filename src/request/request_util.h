@@ -33,6 +33,8 @@
 #include "composer/composer.h"
 #include "protocol/commands.pb.h"
 #include "request/conversion_request.h"
+#include "request/options.h"
+#include "transliteration/transliteration.h"
 
 namespace mozc {
 namespace request_util {
@@ -47,9 +49,19 @@ inline bool IsAutoPartialSuggestionEnabled(
   return conversion_request.request().auto_partial_suggestion();
 }
 
+inline bool ShouldFilterNoisyNumberCandidate(const ConversionOptions& options) {
+  return options.create_partial_candidates;
+}
+
 inline bool ShouldFilterNoisyNumberCandidate(
     const ConversionRequest& conversion_request) {
-  return conversion_request.options().create_partial_candidates;
+  return ShouldFilterNoisyNumberCandidate(conversion_request.options());
+}
+
+inline bool IsLatinInputMode(const ConversionRequest& conversion_request) {
+  const auto input_mode = conversion_request.composer().GetInputMode();
+  return input_mode == transliteration::HALF_ASCII ||
+         input_mode == transliteration::FULL_ASCII;
 }
 
 }  // namespace request_util

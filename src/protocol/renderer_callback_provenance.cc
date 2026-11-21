@@ -52,15 +52,20 @@ RendererCallbackKind GetRendererCallbackKind(
       return RendererCallbackKind::kSelect;
     case SessionCommand::HIGHLIGHT_CANDIDATE:
       return RendererCallbackKind::kHighlight;
+    case SessionCommand::SUBMIT_CANDIDATE:
+      return RendererCallbackKind::kSubmit;
     default:
       return RendererCallbackKind::kUnsupported;
   }
 }
 
 RendererCallbackKind GetRendererCallbackKindForMessage(
-    uint32_t message, uint32_t select_message, uint32_t highlight_message) {
+    uint32_t message, uint32_t select_message, uint32_t highlight_message,
+    uint32_t submit_message) {
   if (message == 0 || select_message == 0 || highlight_message == 0 ||
-      select_message == highlight_message) {
+      submit_message == 0 || select_message == highlight_message ||
+      select_message == submit_message ||
+      highlight_message == submit_message) {
     return RendererCallbackKind::kUnsupported;
   }
   if (message == select_message) {
@@ -68,6 +73,9 @@ RendererCallbackKind GetRendererCallbackKindForMessage(
   }
   if (message == highlight_message) {
     return RendererCallbackKind::kHighlight;
+  }
+  if (message == submit_message) {
+    return RendererCallbackKind::kSubmit;
   }
   return RendererCallbackKind::kUnsupported;
 }

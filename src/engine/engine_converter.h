@@ -86,10 +86,11 @@ class EngineConverter : public EngineConverterInterface {
   const ConversionPreferences& conversion_preferences() const override;
 
   // Sends a conversion request to the converter.
-  bool Convert(const composer::Composer& composer) override;
-  bool ConvertWithPreferences(
-      const composer::Composer& composer,
-      const ConversionPreferences& preferences) override;
+  // Brings base class overloads into scope to avoid name hiding.
+  using EngineConverterInterface::Convert;
+  bool Convert(const composer::Composer& composer,
+               const commands::Context& context,
+               const ConversionPreferences& preferences) override;
   bool TryApplyTypingCorrectionForLiveConversion(
       const composer::Composer& composer, std::string* corrected_raw,
       std::string* corrected_reading) override;
@@ -112,17 +113,18 @@ class EngineConverter : public EngineConverterInterface {
   bool SwitchKanaType(const composer::Composer& composer) override;
 
   // Sends a suggestion request to the converter.
+  // Brings base class overloads into scope to avoid name hiding.
+  using EngineConverterInterface::Suggest;
   bool Suggest(const composer::Composer& composer,
-               const commands::Context& context) override;
-  bool SuggestWithPreferences(
-      const composer::Composer& composer, const commands::Context& context,
-      const ConversionPreferences& preferences) override;
+               const commands::Context& context,
+               const ConversionPreferences& preferences) override;
 
   // Sends a prediction request to the converter.
-  bool Predict(const composer::Composer& composer) override;
-  bool PredictWithPreferences(
-      const composer::Composer& composer,
-      const ConversionPreferences& preferences) override;
+  // Brings base class overloads into scope to avoid name hiding.
+  using EngineConverterInterface::Predict;
+  bool Predict(const composer::Composer& composer,
+               const commands::Context& context,
+               const ConversionPreferences& preferences) override;
 
   // Clears conversion segments, but keep the context.
   void Cancel() override;
@@ -148,6 +150,38 @@ class EngineConverter : public EngineConverterInterface {
   bool LearnExternalConversionSegments(
       absl::Span<const ExternalConversionSegment> segments,
       const commands::Context& context) override;
+
+  [[nodiscard]]
+  uint64_t LearnExternalConversionResultReversibly(
+      absl::string_view key,
+      absl::string_view value,
+      const commands::Context& context) override;
+
+  [[nodiscard]]
+  uint64_t LearnExternalConversionSegmentsReversibly(
+      absl::Span<const ExternalConversionSegment> segments,
+      const commands::Context& context) override;
+
+  bool RevertExternalConversionLearning(uint64_t revert_id) override;
+  bool ConfirmExternalConversionLearning(uint64_t revert_id) override;
+
+  bool TransferExternalConversionLearningOwnershipTo(
+      EngineConverterInterface* successor) override;
+  bool ReceiveExternalConversionLearningOwnership(
+      const ConverterInterface* source_backend,
+      std::vector<Segments>* handles) override;
+
+  [[nodiscard]]
+  bool ResolveExternalConversionSegments(
+      absl::string_view key, absl::string_view value,
+      const commands::Context& context,
+      std::vector<ExternalConversionSegment>* segments) override;
+
+  [[nodiscard]]
+  bool EvaluateExternalConversionSegments(
+      absl::Span<const ExternalConversionSegment> segments,
+      const commands::Context& context,
+      std::vector<ExternalConversionSegment>* evaluated_segments) override;
 
   // Fixes the suggestion candidate. Stores the number of characters in the key
   // of the committed candidate to committed_key_size.
@@ -216,6 +250,8 @@ class EngineConverter : public EngineConverterInterface {
                      const std::vector<std::string>& segment_keys) override;
   bool GetConversionSegmentKeys(
       std::vector<std::string>* segment_keys) const override;
+  bool GetSelectedProperNounSpans(
+      std::vector<converter::ProperNounSpan>* spans) const override;
 
   // Commits the specified number of characters at the head of the preedit
   // string represented by Composer.
@@ -233,6 +269,8 @@ class EngineConverter : public EngineConverterInterface {
   // Try to delete the current selected candidate if |id| is not specified.
   // Returns false if the candidate was not found or deletion failed.
   bool DeleteCandidateFromHistory(std::optional<int> id) override;
+
+  bool DeleteOrSuppressCandidate(std::optional<int> id) override;
 
   // Moves the focus of segments.
   void SegmentFocusRight() override;
@@ -253,6 +291,9 @@ class EngineConverter : public EngineConverterInterface {
   void CandidateNextPage() override;
   void CandidatePrev() override;
   void CandidatePrevPage() override;
+
+  bool FocusSuggestionCandidateWithoutPrediction(int id) override;
+
   // Moves the focus to the candidate represented by the id.
   void CandidateMoveToId(int id, const composer::Composer& composer) override;
   // Moves the focus to the index from the beginning of the current page.
@@ -339,6 +380,8 @@ class EngineConverter : public EngineConverterInterface {
   void SegmentFocus();
 
   // Notifies the converter that the current segment is fixed.
+  // Sets the segment type to FIXED_VALUE and moves the selected candidate to
+  // candidate(0).
   void SegmentFix();
 
   // Fixes the conversion of the [0, segments_to_commit -1 ] segments,
@@ -390,6 +433,14 @@ class EngineConverter : public EngineConverterInterface {
   // Returns the candidate to be used by the converter.
   const converter::Candidate& GetSelectedCandidate(size_t segment_index) const;
 
+  // Returns the number of segments covered by candidate at segment_index,
+  // clamped to avoid overlapping the focused segment.
+  size_t GetSegmentSpan(size_t segment_index) const;
+
+  // Returns true if the selected candidate on the first segment covers all
+  // conversion segments.
+  bool IsFullSentenceCandidateSelected() const;
+
   // Returns the length of committed candidate's key in characters.
   // True is returned if the selected candidate is successfully committed.
   bool CommitSuggestionInternal(const composer::Composer& composer,
@@ -438,6 +489,11 @@ class EngineConverter : public EngineConverterInterface {
   std::shared_ptr<const dictionary::ProjectDictionarySnapshot>
   PinnedProjectDictionary() const;
 
+  // Keep exactly one reversible external FinishConversion open per session.
+  // UserSegmentHistoryRewriter intentionally has a single pending-revert slot;
+  // allowing several handles in one user rollback window would overwrite it.
+  static constexpr size_t kMaxExternalLearningRevertEntries = 1;
+
   std::shared_ptr<const ConverterInterface> converter_;
 
   // The provider is process-shared; the mutable registry below is
@@ -448,6 +504,11 @@ class EngineConverter : public EngineConverterInterface {
   // Owned by this EngineConverter, which is itself scoped to one IME session.
   // Clone copies immutable snapshots into a new independent registry state.
   dictionary::ProjectDictionaryRegistry project_dictionary_registry_;
+
+  // Revert snapshots for external learning. These are deliberately separate
+  // from |segments_| so external history learning never changes visible
+  // conversion/session state.
+  std::vector<Segments> external_learning_revert_segments_;
 
   // Conversion stats used by converter_.
   Segments segments_;
@@ -483,6 +544,11 @@ class EngineConverter : public EngineConverterInterface {
   // TODO(team): Check whether we can switch behaviors using state_
   // instead of request_type_.
   ConversionRequest::RequestType request_type_;
+
+  // True only for a candidate focused from the displayed suggestion list.
+  // Do not confuse this with a normally generated prediction candidate.
+  // Reset on new prediction/conversion, cancel, and commit.
+  bool focused_suggestion_for_learning_ = false;
 
   // Default conversion preferences.
   ConversionPreferences conversion_preferences_;

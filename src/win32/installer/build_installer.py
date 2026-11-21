@@ -170,6 +170,9 @@ def run_wix4(args) -> None:
   elif branding == 'Mozc':
     upgrade_code = '422E6070-C76C-4F9B-96BE-FD9569E4B762'
 
+  # Keep the original Mozc build identity separate from the installer version.
+  msi_version = (version.GetMozkeyMsiVersion() if branding == 'Mozc'
+                 else version.GetVersionString())
   omaha_channel_type = 'dev' if version.IsDevChannel() else 'stable'
   vs_configuration_name = 'Debug' if args.debug_build else 'Release'
 
@@ -179,6 +182,7 @@ def run_wix4(args) -> None:
       '-nologo',
       '-arch', arch,
       '-define', f'MozcVersion={version.GetVersionString()}',
+      '-define', f'MsiVersion={msi_version}',
       '-define', f'UpgradeCode={upgrade_code}',
       '-define', f'OmahaGuid={omaha_guid}',
       '-define', f'OmahaClientKey={omaha_client_key}',

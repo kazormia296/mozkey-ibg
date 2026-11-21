@@ -195,13 +195,30 @@ absl::string_view UserPos::GetStringPosType(
 
 // static
 uint16_t UserPos::GetCostFromPosType(
-    user_dictionary::UserDictionary::PosType pos_type) {
+    user_dictionary::UserDictionary::PosType pos_type, int cost_penalty) {
+  if (pos_type == user_dictionary::UserDictionary::ABBREVIATION) {
+    return kPosTypeStringTable[pos_type].second;  // Always 200
+  }
   int cost = 0;
   if (user_dictionary::UserDictionary::PosType_IsValid(pos_type)) {
     cost = kPosTypeStringTable[pos_type].second;
   }
-  static constexpr uint16_t kDefaultCost = 5000;
-  return cost > 0 ? cost : kDefaultCost;
+  static constexpr int kDefaultCost = 5000;
+  if (cost == 0) {
+    // When cost is 0 in user_pos.def (e.g. verbs/adjectives), a large default
+    // cost is used. In this case, no extra entry count penalty needs to be
+    // added.
+    return kDefaultCost;
+  }
+  // Gradually phase out the per-POS discount (kStandardCost - cost) as
+  // cost_penalty approaches kStandardCost (2500), so all POS types smoothly
+  // converge to 5000 without a step jump, and continue to scale as
+  // 2500 + cost_penalty for large dictionaries.
+  static constexpr int kStandardCost = 2500;
+  const int effective_base_cost =
+      cost + (kStandardCost - cost) * std::min(cost_penalty, kStandardCost) /
+                 kStandardCost;
+  return effective_base_cost + cost_penalty;
 }
 
 // static

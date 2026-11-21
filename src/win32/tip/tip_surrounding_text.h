@@ -34,8 +34,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <inputscope.h>
+
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "win32/tip/tip_text_service.h"
 
@@ -51,6 +54,16 @@ struct TipSurroundingTextInfo {
   bool has_selected_text = false;
   bool has_following_text = false;
   bool in_composition = false;  // context has a composition owned by Mozc.
+  // True when the current TSF selection is explicitly marked IS_PASSWORD.
+  // In this case surrounding text is deliberately not retrieved.
+  bool is_password_input_scope = false;
+  // True when the current TSF selection explicitly contains IS_PRIVATE.
+  // Unlike IS_PASSWORD, private input may still expose surrounding text and
+  // use existing personalization; only new persistent learning is suppressed.
+  bool is_private_input_scope = false;
+  // True when surrounding text came from the legacy IMM32 document-feed
+  // fallback rather than a synchronous TSF text-range read.
+  bool used_legacy_imm32_fallback = false;
 };
 
 class TipSurroundingText {
@@ -69,6 +82,15 @@ class TipSurroundingText {
   static bool Get(TipTextService* text_service, ITfContext* context,
                   TipSurroundingTextInfo* info);
 
+  // Retrieves only the TSF surrounding-text directions requested by Zenz.
+  // Unlike Get(), this method does not read selected text and does not fall
+  // back to the legacy IMM32 document-feed path. The two native UTF-16 range
+  // budgets are independent so an unrequested direction is not read.
+  static bool GetForZenzContext(
+      TipTextService* text_service, ITfContext* context,
+      size_t max_preceding_length, size_t max_following_length,
+      TipSurroundingTextInfo* info);
+
   // A variant of TipSurroundingText::Get. One difference is that this method
   // moves the anchor position of the selection at the end of the range.
   // Another difference is that this method uses IMM32 message when fails to
@@ -83,6 +105,13 @@ class TipSurroundingText {
                                             bool* need_async_reconversion,
                                             uint64_t focus_epoch,
                                             int32_t focus_revision);
+
+  // Space reconversion requires a verified TSF selection. Unlike the regular
+  // reconversion path above, never request an IMM32 caret-adjacent target.
+  static bool PrepareForExplicitSelectionReconversionFromIme(
+      TipTextService* text_service, ITfContext* context,
+      TipSurroundingTextInfo* info, uint64_t focus_epoch,
+      int32_t focus_revision);
 
   // Returns true when succeeds to delete preceding text from the beginning of
   // the selected range.
@@ -101,6 +130,29 @@ class TipSurroundingText {
 
 class TipSurroundingTextUtil {
  public:
+  // Returns true when |text| contains a TSF embedded-object marker.
+  static bool ContainsEmbeddedObject(std::wstring_view text);
+
+  // A legacy IMM32 reconversion target is not proof of explicit selection.
+  static bool HasExplicitlySelectedTextForReconversion(
+      const TipSurroundingTextInfo& info);
+
+  // Returns whether reconversion preparation should move the active end of
+  // the current selection to its start.  When selected text was explicitly
+  // retrieved, an empty, unavailable, or embedded-object selection must not
+  // be mutated.
+  static bool ShouldMoveAnchorForReconversion(
+      bool move_anchor, bool retrieve_selected_text,
+      const TipSurroundingTextInfo& info);
+
+  // Returns true when the scope list explicitly contains IS_PASSWORD.
+  static bool ContainsPasswordInputScope(
+      const std::vector<InputScope>& input_scopes);
+
+  // Returns true when the scope list explicitly contains IS_PRIVATE.
+  static bool ContainsPrivateInputScope(
+      const std::vector<InputScope>& input_scopes);
+
   // Returns true if |text| has more than |characters_in_codepoint| characters.
   // When succeeds, the last |*characters_in_utf16| characters in |text|
   // can be measured as |characters_in_codepoint| in the unit of UCS4.

@@ -301,13 +301,14 @@ class MozcVersion(object):
     self._properties = {}
     if not os.path.isfile(path):
       return
-    for line in open(path):
-      matchobj = re.match(r'(\w+)=(.*)', line.strip())
-      if matchobj:
-        var = matchobj.group(1)
-        val = matchobj.group(2)
-        if var not in self._properties:
-          self._properties[var] = val
+    with open(path, encoding='utf-8') as version_file:
+      for line in version_file:
+        matchobj = re.match(r'(\w+)=(.*)', line.strip())
+        if matchobj:
+          var = matchobj.group(1)
+          val = matchobj.group(2)
+          if var not in self._properties:
+            self._properties[var] = val
 
     # Check mandatory properties.
     for key in VERSION_PROPERTIES:
@@ -330,6 +331,23 @@ class MozcVersion(object):
     """
     return self._properties.get('TARGET_PLATFORM', None)
 
+  def GetMozkeyReleaseVersionString(self):
+    """Returns the public Mozkey release version, e.g. 0.7.7."""
+    return self.GetVersionInFormat(
+        '@MOZKEY_RELEASE_VERSION_MAJOR@.@MOZKEY_RELEASE_VERSION_MINOR@.'
+        '@MOZKEY_RELEASE_VERSION_PATCH@'
+    )
+
+  def GetMozkeyInstallerVersion(self):
+    """Returns the monotonically increasing 3-part installer version."""
+    major, minor, patch = map(
+        int, self.GetMozkeyReleaseVersionString().split('.')
+    )
+    if major < 0 or not (0 <= minor <= 99 and 0 <= patch <= 99):
+      raise ValueError('Unsupported Mozkey release version components')
+    # Corresponds to the 100+major mapping in src/version.bzl.
+    return f'{100 + major}.{minor}.{patch}'
+
   def GetVersionString(self):
     """Returns the normal version info string.
 
@@ -337,6 +355,37 @@ class MozcVersion(object):
       a string in format of "MAJOR.MINOR.BUILD.REVISION"
     """
     return self.GetVersionInFormat('@MAJOR@.@MINOR@.@BUILD@.@REVISION@')
+
+  def GetMozkeyReleaseVersionParts(self):
+    """Returns validated product version components (major, minor, patch).
+
+    The Windows technical version reserves major versions 100 through 255
+    to maintain upgrade ordering over publicly shipped 3.33.x MSI packages.
+    """
+    version_text = self.GetVersionInFormat(
+        '@MOZKEY_RELEASE_VERSION_MAJOR@.'
+        '@MOZKEY_RELEASE_VERSION_MINOR@.'
+        '@MOZKEY_RELEASE_VERSION_PATCH@')
+    fields = version_text.split('.')
+    if len(fields) != 3 or any(not re.fullmatch(r'[0-9]+', f) for f in fields):
+      raise ValueError('Invalid Mozkey release version: %r' % version_text)
+    parts = tuple(int(f) for f in fields)
+    if any(str(n) != f for n, f in zip(parts, fields)):
+      raise ValueError('Noncanonical Mozkey release version: %r' % version_text)
+    major, minor, patch = parts
+    if major > 155 or minor > 255 or patch > 65535:
+      raise ValueError('Mozkey release version exceeds Windows MSI limits: %r'
+                       % version_text)
+    return parts
+
+  def GetMozkeyReleaseVersion(self):
+    """Returns the user-facing Mozkey release version (major.minor.patch)."""
+    return '.'.join(str(v) for v in self.GetMozkeyReleaseVersionParts())
+
+  def GetMozkeyMsiVersion(self):
+    """Returns a monotonically increasing MSI version across the 3.x era."""
+    major, minor, patch = self.GetMozkeyReleaseVersionParts()
+    return '%d.%d.%d' % (100 + major, minor, patch)
 
   def GetShortVersionString(self, use_build_oss=False):
     """Returns the short version info string.

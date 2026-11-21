@@ -31,6 +31,8 @@
 
 #include <array>
 #include <cstddef>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -70,20 +72,96 @@ class ConfigHandlerTest : public testing::TestWithTempUserProfile {
   std::string default_config_filename_;
 };
 
-void SetMozkeyInputDefaultsForTesting(Config* config) {
+constexpr uint32_t kExpectedMozkeyDirectCommitKey =
+    Config::DIRECT_COMMIT_KUTEN |
+    Config::DIRECT_COMMIT_TOUTEN |
+    Config::DIRECT_COMMIT_QUESTION_MARK |
+    Config::DIRECT_COMMIT_EXCLAMATION_MARK |
+    Config::DIRECT_COMMIT_OPEN_BRACKET |
+    Config::DIRECT_COMMIT_CLOSE_BRACKET;
+
+void SetMozkeyProductDefaultsForTesting(Config* config) {
+  // Mozkey IbG product defaults.
   config->set_use_typing_correction(true);
   config->set_use_cycle_segmentation_shortcut(true);
+  // Mozkey product defaults.
   config->set_use_live_conversion(true);
-  config->set_use_zenz_live_correction(true);
   config->set_show_candidate_window_on_initial_conversion(true);
   config->set_use_direct_commit(true);
-  config->set_direct_commit_key(
-      Config::DIRECT_COMMIT_KUTEN |
-      Config::DIRECT_COMMIT_TOUTEN |
-      Config::DIRECT_COMMIT_QUESTION_MARK |
-      Config::DIRECT_COMMIT_EXCLAMATION_MARK |
-      Config::DIRECT_COMMIT_OPEN_BRACKET |
-      Config::DIRECT_COMMIT_CLOSE_BRACKET);
+  config->set_direct_commit_key(kExpectedMozkeyDirectCommitKey);
+  config->set_use_zenz_live_correction(true);
+  config->set_use_zenz_feedback_learning(true);
+  config->set_use_zenz_feedback_recording(true);
+  config->set_use_zenz_feedback_reuse(true);
+  config->set_use_zenz_mozc_history_learning(true);
+  config->set_use_zenz_strict_reading_preservation(false);
+  config->set_allow_zenz_emoji_changes(false);
+  config->set_use_zenz_feedback_min_key_length(true);
+  config->set_zenz_feedback_min_key_length(7);
+  config->set_use_zenz_auto_block_rejected_correction(true);
+  config->set_use_zenz_live_correction_right_context(true);
+  config->set_use_realtime_conversion(true);
+#ifdef _WIN32
+  config->set_dim_pending_roman_input(false);
+  config->set_pending_roman_dimness_percent(85);
+  config->set_use_custom_preedit_underline_color(true);
+  config->set_preedit_underline_color(0x30dcc8);
+  config->set_use_custom_preedit_target_underline_color(true);
+  config->set_preedit_target_underline_color(0xc1a5ab);
+#endif  // _WIN32
+}
+
+void ExpectMozkeyProductDefaults(const Config& config) {
+  EXPECT_TRUE(config.use_live_conversion());
+  EXPECT_EQ(config.live_conversion_delay_msec(), 228);
+  EXPECT_EQ(config.live_conversion_min_key_length(), 2);
+  // Mozkey IbG deliberately keeps the ruby window enabled by default.
+  EXPECT_TRUE(config.show_live_conversion_ruby_window());
+  EXPECT_TRUE(config.show_candidate_window_on_initial_conversion());
+  // Mozkey IbG product defaults.
+  EXPECT_TRUE(config.use_typing_correction());
+  EXPECT_TRUE(config.use_cycle_segmentation_shortcut());
+
+  EXPECT_TRUE(config.use_direct_commit());
+  EXPECT_EQ(config.direct_commit_key(), kExpectedMozkeyDirectCommitKey);
+
+  EXPECT_TRUE(config.use_zenz_live_correction());
+  EXPECT_FALSE(config.use_zenz_strict_reading_preservation());
+  EXPECT_FALSE(config.allow_zenz_emoji_changes());
+  EXPECT_FALSE(config.defer_live_conversion_display_until_zenz_result());
+  EXPECT_EQ(config.zenz_live_correction_delay_msec(), 700);
+  EXPECT_EQ(config.zenz_deferred_presentation_timeout_msec(), 250);
+  EXPECT_EQ(config.zenz_live_correction_timeout_msec(), 180);
+  EXPECT_EQ(config.zenz_live_correction_min_key_length(), 2);
+  EXPECT_EQ(config.zenz_live_correction_left_context_length(), 24);
+  EXPECT_TRUE(config.use_zenz_synthetic_candidate());
+  EXPECT_TRUE(config.use_zenz_feedback_learning());
+  EXPECT_TRUE(config.use_zenz_feedback_recording());
+  EXPECT_TRUE(config.use_zenz_feedback_reuse());
+  EXPECT_TRUE(config.use_zenz_mozc_history_learning());
+  EXPECT_TRUE(config.use_zenz_feedback_min_key_length());
+  EXPECT_EQ(config.zenz_feedback_min_key_length(), 7);
+  EXPECT_TRUE(config.use_zenz_auto_block_rejected_correction());
+  EXPECT_EQ(config.zenz_auto_block_reject_threshold(), 1);
+  EXPECT_EQ(config.zenz_auto_block_minimum_reject_percentage(), 50);
+  EXPECT_TRUE(config.use_zenz_live_correction_right_context());
+  EXPECT_EQ(config.zenz_live_correction_right_context_length(), 6);
+
+  EXPECT_EQ(config.history_learning_level(), Config::DEFAULT_HISTORY);
+  EXPECT_TRUE(config.use_history_suggest());
+  EXPECT_TRUE(config.use_dictionary_suggest());
+  EXPECT_TRUE(config.use_realtime_conversion());
+#ifdef _WIN32
+  EXPECT_FALSE(config.dim_pending_roman_input());
+  EXPECT_EQ(config.pending_roman_dimness_percent(), 85);
+  EXPECT_TRUE(config.use_custom_preedit_underline_color());
+  EXPECT_EQ(config.preedit_underline_color(), 0x30dcc8);
+  EXPECT_TRUE(config.use_custom_preedit_target_underline_color());
+  EXPECT_EQ(config.preedit_target_underline_color(), 0xc1a5ab);
+  EXPECT_TRUE(config.use_custom_zenz_live_correction_underline_color());
+  EXPECT_EQ(config.zenz_live_correction_underline_color(), 0xc4dc6c);
+#endif  // _WIN32
+  EXPECT_EQ(config.suggestions_size(), 3);
 }
 
 TEST_F(ConfigHandlerTest, SetConfig) {
@@ -104,7 +182,7 @@ TEST_F(ConfigHandlerTest, SetConfig) {
   input.set_verbose_level(2);
 #endif  // NDEBUG
   Config expected = input;
-  SetMozkeyInputDefaultsForTesting(&expected);
+  SetMozkeyProductDefaultsForTesting(&expected);
 
   ConfigHandler::SetConfig(input);
   output = ConfigHandler::GetCopiedConfig();
@@ -121,7 +199,7 @@ TEST_F(ConfigHandlerTest, SetConfig) {
   input.set_verbose_level(0);
 #endif  // NDEBUG
   expected = input;
-  SetMozkeyInputDefaultsForTesting(&expected);
+  SetMozkeyProductDefaultsForTesting(&expected);
 
   ConfigHandler::SetConfig(input);
   output = ConfigHandler::GetCopiedConfig();
@@ -134,7 +212,575 @@ TEST_F(ConfigHandlerTest, SetConfig) {
   EXPECT_EQ(absl::StrCat(output2), absl::StrCat(expected));
 }
 
-TEST_F(ConfigHandlerTest, NormalizeMozkeyInputDefaults) {
+TEST_F(ConfigHandlerTest, CustomKeymapAddsCandidateHideBindingWhenFree) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "custom_keymap_migration.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config input;
+  input.set_session_keymap(Config::CUSTOM);
+  input.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Prediction\tCtrl Delete\tDeleteSelectedCandidate\n");
+
+  ConfigHandler::SetConfig(input);
+  const Config output = ConfigHandler::GetCopiedConfig();
+  constexpr absl::string_view kMigrationRow =
+      "Conversion\tCtrl Delete\tDeleteSelectedCandidate";
+  const size_t first = output.custom_keymap_table().find(kMigrationRow);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(output.custom_keymap_table().find(kMigrationRow, first + 1),
+            std::string::npos);
+
+  // Applying the already-migrated config again must not duplicate the row.
+  ConfigHandler::SetConfig(output);
+  const Config output2 = ConfigHandler::GetCopiedConfig();
+  const size_t first2 = output2.custom_keymap_table().find(kMigrationRow);
+  ASSERT_NE(first2, std::string::npos);
+  EXPECT_EQ(output2.custom_keymap_table().find(kMigrationRow, first2 + 1),
+            std::string::npos);
+
+  std::ifstream ifs(config_file, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  const std::string stored((std::istreambuf_iterator<char>(ifs)),
+                           std::istreambuf_iterator<char>());
+  EXPECT_NE(stored.find("Conversion\tCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest, CustomKeymapMigrationPersistsOnReload) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "custom_keymap_reload_migration.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config legacy;
+  legacy.set_session_keymap(Config::CUSTOM);
+  legacy.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Prediction\tCtrl Delete\tDeleteSelectedCandidate\n");
+
+  {
+    std::ofstream ofs(config_file, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(ofs);
+    const std::string serialized = legacy.SerializeAsString();
+    ofs.write(serialized.data(), serialized.size());
+    ASSERT_TRUE(ofs);
+  }
+
+  ConfigHandler::Reload();
+  const Config output = ConfigHandler::GetCopiedConfig();
+  EXPECT_NE(output.custom_keymap_table().find(
+                "Conversion\tCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+
+  std::ifstream ifs(config_file, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  Config stored;
+  ASSERT_TRUE(stored.ParseFromIstream(&ifs));
+  EXPECT_NE(stored.custom_keymap_table().find(
+                "Conversion\tCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest,
+       CustomKeymapMigrationPreservesExistingAlternateDeleteBinding) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "custom_keymap_alternate.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config input;
+  input.set_session_keymap(Config::CUSTOM);
+  input.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tAlt Delete\tDeleteSelectedCandidate\n");
+
+  ConfigHandler::SetConfig(input);
+  const Config output = ConfigHandler::GetCopiedConfig();
+  EXPECT_NE(output.custom_keymap_table().find(
+                "Conversion\tAlt Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+  EXPECT_EQ(output.custom_keymap_table().find(
+                "Conversion\tCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+}
+
+TEST_F(
+    ConfigHandlerTest,
+    CustomKeymapMigrationPreservesAlternateDeleteBindingWithLaterRows) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(),
+                         "custom_keymap_alternate_with_later_rows.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config input;
+  input.set_session_keymap(Config::CUSTOM);
+  input.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tRightCtrl Delete\tDeleteSelectedCandidate\n"
+      "Conversion\tCtrl y\tBackspace\n"
+      "Conversion\tON\tIMEOn\n");
+
+  ConfigHandler::SetConfig(input);
+  const Config output = ConfigHandler::GetCopiedConfig();
+  EXPECT_NE(output.custom_keymap_table().find(
+                "Conversion\tRightCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+  EXPECT_EQ(output.custom_keymap_table().find(
+                "Conversion\tCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest,
+       CustomKeymapMigrationFindsDeleteCommandAnywhereInSequence) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(),
+                         "custom_keymap_alternate_command_sequence.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config input;
+  input.set_session_keymap(Config::CUSTOM);
+  input.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tAlt Delete\tCancel | DeleteSelectedCandidate\n"
+      "Conversion\tCtrl y\tBackspace\n");
+
+  ConfigHandler::SetConfig(input);
+  const Config output = ConfigHandler::GetCopiedConfig();
+  EXPECT_EQ(output.custom_keymap_table().find(
+                "Conversion\tCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest, CustomKeymapMigrationPreservesOccupiedCtrlDelete) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "custom_keymap_ctrl_delete_busy.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config input;
+  input.set_session_keymap(Config::CUSTOM);
+  input.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tCtrl Delete\tCancel\n");
+
+  ConfigHandler::SetConfig(input);
+  const Config output = ConfigHandler::GetCopiedConfig();
+  EXPECT_NE(output.custom_keymap_table().find(
+                "Conversion\tCtrl Delete\tCancel"),
+            std::string::npos);
+  EXPECT_EQ(output.custom_keymap_table().find(
+                "Conversion\tCtrl Delete\tDeleteSelectedCandidate"),
+            std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest, CustomKeymapMigratesZenzSpaceExactlyOnce) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "zenz_space_migration.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config config;
+  config.set_session_keymap(Config::CUSTOM);
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tSpace\tConvertNext\n"
+      "Conversion\tEnter\tCommit\n");
+  ConfigHandler::SetConfig(config);
+
+  const std::string migrated =
+      ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  constexpr absl::string_view row =
+      "ZenzConversion\tSpace\tRevertZenzToMozc";
+  const size_t at = migrated.find(row);
+  ASSERT_NE(at, std::string::npos);
+  EXPECT_EQ(migrated.find(row, at + 1), std::string::npos);
+  EXPECT_NE(migrated.find("Conversion\tSpace\tConvertNext"),
+            std::string::npos);
+  EXPECT_NE(migrated.find("Conversion\tEnter\tCommit"),
+            std::string::npos);
+
+  ConfigHandler::SetConfig(ConfigHandler::GetCopiedConfig());
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), migrated);
+
+  // The migrated row must survive storage and a subsequent reload.
+  ConfigHandler::Reload();
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), migrated);
+  std::ifstream ifs(config_file, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  Config stored;
+  ASSERT_TRUE(stored.ParseFromIstream(&ifs));
+  EXPECT_EQ(stored.custom_keymap_table(), migrated);
+}
+
+TEST_F(ConfigHandlerTest, CustomKeymapZenzMigrationOnReloadPersists) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "zenz_space_reload.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config legacy;
+  legacy.set_session_keymap(Config::CUSTOM);
+  legacy.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tSpace\tConvertNext\n");
+  {
+    std::ofstream ofs(config_file, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(ofs);
+    const std::string bytes = legacy.SerializeAsString();
+    ofs.write(bytes.data(), bytes.size());
+    ASSERT_TRUE(ofs);
+  }
+  ConfigHandler::Reload();
+  const auto migrated = ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  EXPECT_NE(migrated.find("ZenzConversion\tSpace\tRevertZenzToMozc"),
+            std::string::npos);
+  ConfigHandler::Reload();
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), migrated);
+  std::ifstream ifs(config_file, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  Config stored;
+  ASSERT_TRUE(stored.ParseFromIstream(&ifs));
+  EXPECT_EQ(stored.custom_keymap_table(), migrated);
+}
+
+TEST_F(ConfigHandlerTest, CustomKeymapZenzMigrationPreservesUserSpaceRules) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "zenz_space_custom_rules.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  constexpr absl::string_view kZenzRevert =
+      "ZenzConversion\tSpace\tRevertZenzToMozc";
+  const std::vector<std::string> custom_tables = {
+      // User explicitly selected a different Zenz action.
+      "status\tkey\tcommand\n"
+      "Conversion\tSpace\tConvertNext\n"
+      "ZenzConversion\tSpace\tCommit\n",
+      // Non-standard base action and multi-step command: leave untouched.
+      "status\tkey\tcommand\n"
+      "Conversion\tSpace\tConvertPrev\n",
+      "status\tkey\tcommand\n"
+      "Conversion\tSpace\tConvertNext|ConvertNext\n",
+      // Missing base action and multiple base mappings are ambiguous.
+      "status\tkey\tcommand\n"
+      "Conversion\tEnter\tCommit\n",
+      "status\tkey\tcommand\n"
+      "Conversion\tSpace\tConvertNext\n"
+      "Conversion\tSpace\tCommit\n",
+  };
+  for (const std::string& table : custom_tables) {
+    Config config;
+    config.set_session_keymap(Config::CUSTOM);
+    config.set_custom_keymap_table(table);
+    ConfigHandler::SetConfig(config);
+    const std::string saved =
+        ConfigHandler::GetCopiedConfig().custom_keymap_table();
+    EXPECT_EQ(saved.find(kZenzRevert), std::string::npos);
+    EXPECT_NE(saved.find(table.substr(table.find("\n") + 1)),
+              std::string::npos);
+  }
+}
+
+TEST_F(ConfigHandlerTest, CustomKeymapZenzMigrationPreservesExistingRevert) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "zenz_space_existing_revert.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config config;
+  config.set_session_keymap(Config::CUSTOM);
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tSpace\tConvertNext\n"
+      "ZenzConversion\tSpace\tRevertZenzToMozc\n");
+  ConfigHandler::SetConfig(config);
+  const std::string table = ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  constexpr absl::string_view kRevert =
+      "ZenzConversion\tSpace\tRevertZenzToMozc";
+  const size_t first = table.find(kRevert);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(table.find(kRevert, first + 1), std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest, CustomZenzBlockMigrationIsSafeAndIdempotent) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "zenz_block_migration.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config config;
+  config.set_session_keymap(Config::CUSTOM);
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tCtrl Delete\tDeleteSelectedCandidate\n");
+  ConfigHandler::SetConfig(config);
+  const std::string migrated =
+      ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  constexpr absl::string_view row =
+      "ZenzConversion\tCtrl Delete\tBlockVisibleZenzCorrection";
+  const size_t first = migrated.find(row);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(migrated.find(row, first + 1), std::string::npos);
+  ConfigHandler::SetConfig(ConfigHandler::GetCopiedConfig());
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), migrated);
+  ConfigHandler::Reload();
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), migrated);
+
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tCtrl Delete\tCancel\n");
+  ConfigHandler::SetConfig(config);
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table().find(row),
+            std::string::npos);
+
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tCtrl Delete\tDeleteSelectedCandidate\n"
+      "ZenzConversion\tCtrl Delete\tCommit\n");
+  ConfigHandler::SetConfig(config);
+  const std::string custom =
+      ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  EXPECT_EQ(custom.find(row), std::string::npos);
+  EXPECT_NE(custom.find("ZenzConversion\tCtrl Delete\tCommit"),
+            std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest,
+       CustomZenzBlockMigrationPreservesSpecializedDeleteBindings) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file = FileUtil::JoinPath(
+      temp_dir.path(), "zenz_block_specialized_delete.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  // Ctrl Delete overlaps side-specific rules; ZenzConversion also has
+  // precedence over any LiveConversion Ctrl Delete fallback.
+  const std::vector<std::string> specialized_bindings = {
+      "ZenzConversion\tRightCtrl Delete\tCommit",
+      "ZenzConversion\tLeftCtrl Delete\tCommit",
+      "ZenzConversion\tCaps Ctrl Delete\tCommit",
+      "ZenzConversion\tCtrl Shift Delete\tCommit",
+      "LiveConversion\tCtrl Delete\tCancel",
+      "LiveConversion\tRightCtrl Delete\tCommit",
+  };
+  for (const std::string& specialized : specialized_bindings) {
+    Config config;
+    config.set_session_keymap(Config::CUSTOM);
+    const std::string table =
+        absl::StrCat("status\tkey\tcommand\n",
+                     "Conversion\tCtrl Delete\tDeleteSelectedCandidate\n",
+                     specialized, "\n");
+    config.set_custom_keymap_table(table);
+    ConfigHandler::SetConfig(config);
+    EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), table)
+        << specialized;
+  }
+}
+
+TEST_F(ConfigHandlerTest, LiveBackspaceMigrationAddsOnlyLiveRuleOnce) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "live_backspace_migration.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config config;
+  config.set_session_keymap(Config::CUSTOM);
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tBackspace\tCancel\n"
+      "Conversion\tSpace\tConvertNext\n");
+  ConfigHandler::SetConfig(config);
+  const std::string table = ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  constexpr absl::string_view live_row =
+      "LiveConversion\tBackspace\tBackspace";
+  constexpr absl::string_view zenz_row =
+      "ZenzConversion\tBackspace\tBackspace";
+  const size_t live_pos = table.find(live_row);
+  ASSERT_NE(live_pos, std::string::npos);
+  EXPECT_EQ(table.find(live_row, live_pos + 1), std::string::npos);
+  // Zenz correction inherits LiveConversion (live origin) or Conversion
+  // (manual origin). It must not receive a shared Backspace override.
+  EXPECT_EQ(table.find(zenz_row), std::string::npos);
+  ConfigHandler::SetConfig(ConfigHandler::GetCopiedConfig());
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), table);
+  ConfigHandler::Reload();
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), table);
+}
+
+TEST_F(ConfigHandlerTest, LiveBackspaceMigrationPreservesExplicitOverrides) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "live_backspace_overrides.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+  Config config;
+  config.set_session_keymap(Config::CUSTOM);
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tBackspace\tCancel\n"
+      "LiveConversion\tBackspace\tCommit\n");
+  ConfigHandler::SetConfig(config);
+  const std::string table = ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  EXPECT_NE(table.find("LiveConversion\tBackspace\tCommit"),
+            std::string::npos);
+  EXPECT_EQ(table.find("ZenzConversion\tBackspace\tBackspace"),
+            std::string::npos);
+  EXPECT_EQ(table.find("LiveConversion\tBackspace\tBackspace"),
+            std::string::npos);
+}
+
+TEST_F(ConfigHandlerTest, LiveBackspaceMigrationWithExistingLiveBindingIsNoop) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "live_backspace_noop.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  // The missing terminal newline detects a no-op migration that needlessly
+  // serializes a rewritten table without adding a new rule.
+  // Suppress the independent Ctrl+Delete migration so that this test
+  // exclusively exercises a no-op LiveConversion Backspace migration.
+  const std::string original_table =
+      "status\tkey\tcommand\n"
+      "Conversion\tCtrl Delete\tDeleteSelectedCandidate\n"
+      "ZenzConversion\tCtrl Delete\tBlockVisibleZenzCorrection\n"
+      "Conversion\tBackspace\tCancel\n"
+      "LiveConversion\tBackspace\tCommit";
+  Config config;
+  config.set_session_keymap(Config::CUSTOM);
+  config.set_custom_keymap_table(original_table);
+  ConfigHandler::SetConfig(config);
+  ASSERT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(),
+            original_table);
+
+  // Verify that Reload() does not persist a needless migration.  A fixed
+  // previous timestamp makes a spurious SetMetaData()/AtomicUpdate detectable.
+  Config stored = ConfigHandler::GetCopiedConfig();
+  stored.mutable_general_config()->set_last_modified_time(1000);
+  const std::string saved_bytes = stored.SerializeAsString();
+  {
+    std::ofstream ofs(config_file, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(ofs);
+    ofs.write(saved_bytes.data(), saved_bytes.size());
+    ASSERT_TRUE(ofs);
+  }
+  ConfigHandler::Reload();
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(),
+            original_table);
+  std::ifstream ifs(config_file, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  const std::string reloaded_bytes((std::istreambuf_iterator<char>(ifs)),
+                                   std::istreambuf_iterator<char>());
+  EXPECT_EQ(reloaded_bytes, saved_bytes);
+}
+
+TEST_F(ConfigHandlerTest, LiveBackspaceMigrationPreservesCustomZenzBinding) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "live_backspace_custom_zenz.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config config;
+  config.set_session_keymap(Config::CUSTOM);
+  config.set_custom_keymap_table(
+      "status\tkey\tcommand\n"
+      "Conversion\tBackspace\tCancel\n"
+      "ZenzConversion\tBackspace\tCommit\n");
+  ConfigHandler::SetConfig(config);
+  const std::string migrated =
+      ConfigHandler::GetCopiedConfig().custom_keymap_table();
+  EXPECT_NE(migrated.find("LiveConversion\tBackspace\tBackspace"),
+            std::string::npos);
+  EXPECT_NE(migrated.find("ZenzConversion\tBackspace\tCommit"),
+            std::string::npos);
+  EXPECT_EQ(migrated.find("ZenzConversion\tBackspace\tBackspace"),
+            std::string::npos);
+  ConfigHandler::Reload();
+  EXPECT_EQ(ConfigHandler::GetCopiedConfig().custom_keymap_table(), migrated);
+}
+
+TEST_F(ConfigHandlerTest, SwitchingConfigFilesDoesNotReuseOldHash) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string first_path =
+      FileUtil::JoinPath(temp_dir.path(), "hash_first.db");
+  const std::string second_path =
+      FileUtil::JoinPath(temp_dir.path(), "hash_second.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(first_path));
+  ASSERT_OK(FileUtil::UnlinkIfExists(second_path));
+
+  ConfigHandler::SetConfigFileNameForTesting(first_path);
+  Config input;
+  input.set_incognito_mode(true);
+  ConfigHandler::SetConfig(input);
+  ASSERT_TRUE(ConfigHandler::GetCopiedConfig().incognito_mode());
+
+  // The second file does not exist.  Its empty config must not inherit the
+  // fingerprint of the previously saved file.
+  ConfigHandler::SetConfigFileNameForTesting(second_path);
+  ASSERT_FALSE(ConfigHandler::GetCopiedConfig().incognito_mode());
+  ConfigHandler::SetConfig(input);
+  EXPECT_TRUE(ConfigHandler::GetCopiedConfig().incognito_mode());
+  std::ifstream ifs(second_path, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  Config persisted;
+  ASSERT_TRUE(persisted.ParseFromIstream(&ifs));
+  EXPECT_TRUE(persisted.incognito_mode());
+}
+
+TEST_F(ConfigHandlerTest, ReloadUpdatesDeduplicationHashes) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "hash_external_reload.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config input;
+  input.set_incognito_mode(true);
+  ConfigHandler::SetConfig(input);
+  ASSERT_TRUE(ConfigHandler::GetCopiedConfig().incognito_mode());
+
+  // Simulate a different process rewriting the same config file.
+  Config external = ConfigHandler::GetCopiedConfig();
+  external.set_incognito_mode(false);
+  const std::string external_bytes = external.SerializeAsString();
+  {
+    std::ofstream ofs(config_file, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(ofs);
+    ofs.write(external_bytes.data(), external_bytes.size());
+    ASSERT_TRUE(ofs);
+  }
+  ConfigHandler::Reload();
+  ASSERT_FALSE(ConfigHandler::GetCopiedConfig().incognito_mode());
+
+  // Restoring the former value must not be suppressed by a stale hash.
+  ConfigHandler::SetConfig(input);
+  EXPECT_TRUE(ConfigHandler::GetCopiedConfig().incognito_mode());
+  std::ifstream ifs(config_file, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  Config persisted;
+  ASSERT_TRUE(persisted.ParseFromIstream(&ifs));
+  EXPECT_TRUE(persisted.incognito_mode());
+}
+
+TEST_F(ConfigHandlerTest, MissingConfigUsesMozkeyProductDefaults) {
   TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
   const std::string config_file =
       FileUtil::JoinPath(temp_dir.path(), "mozc_config_test_tmp");
@@ -143,26 +789,11 @@ TEST_F(ConfigHandlerTest, NormalizeMozkeyInputDefaults) {
   ConfigHandler::Reload();
 
   const Config output = ConfigHandler::GetCopiedConfig();
-
-  EXPECT_TRUE(output.use_typing_correction());
-  EXPECT_TRUE(output.use_cycle_segmentation_shortcut());
-  EXPECT_TRUE(output.use_live_conversion());
-  EXPECT_TRUE(output.use_zenz_live_correction());
+  ExpectMozkeyProductDefaults(output);
   EXPECT_TRUE(output.zenz_live_correction_device().empty());
-  EXPECT_EQ(output.live_conversion_min_key_length(), 2);
-  EXPECT_TRUE(output.show_candidate_window_on_initial_conversion());
-  EXPECT_TRUE(output.use_direct_commit());
-  EXPECT_EQ(
-      output.direct_commit_key(),
-      Config::DIRECT_COMMIT_KUTEN |
-          Config::DIRECT_COMMIT_TOUTEN |
-          Config::DIRECT_COMMIT_QUESTION_MARK |
-          Config::DIRECT_COMMIT_EXCLAMATION_MARK |
-          Config::DIRECT_COMMIT_OPEN_BRACKET |
-          Config::DIRECT_COMMIT_CLOSE_BRACKET);
 }
 
-TEST_F(ConfigHandlerTest, NormalizeMozkeyInputDefaultsPreservesExplicitFalse) {
+TEST_F(ConfigHandlerTest, MozkeyProductDefaultsPreserveExplicitSettings) {
   TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
   const std::string config_file =
       FileUtil::JoinPath(temp_dir.path(), "mozc_config_test_tmp");
@@ -171,13 +802,37 @@ TEST_F(ConfigHandlerTest, NormalizeMozkeyInputDefaultsPreservesExplicitFalse) {
   ConfigHandler::Reload();
 
   Config input;
-  ConfigHandler::GetDefaultConfig(&input);
   input.set_use_typing_correction(false);
   input.set_use_cycle_segmentation_shortcut(false);
   input.set_use_live_conversion(false);
-  input.set_use_zenz_live_correction(false);
+  // Mozkey IbG shows the ruby window by default, so the explicit opposite
+  // value is false here.
+  input.set_show_live_conversion_ruby_window(false);
   input.set_show_candidate_window_on_initial_conversion(false);
   input.set_use_direct_commit(false);
+  input.set_direct_commit_key(0);
+  input.set_use_zenz_live_correction(false);
+  input.set_use_zenz_strict_reading_preservation(true);
+  input.set_allow_zenz_emoji_changes(true);
+  input.set_use_zenz_feedback_learning(false);
+  input.set_use_zenz_feedback_recording(false);
+  input.set_use_zenz_feedback_reuse(true);
+  input.set_use_zenz_mozc_history_learning(false);
+  input.set_use_zenz_feedback_min_key_length(false);
+  input.set_zenz_feedback_min_key_length(4);
+  input.set_use_zenz_auto_block_rejected_correction(false);
+  input.set_use_zenz_live_correction_right_context(false);
+  input.set_use_realtime_conversion(false);
+#ifdef _WIN32
+  // Use values opposite to the product defaults so this test proves that
+  // presence, not value equality, protects explicit user choices.
+  input.set_dim_pending_roman_input(true);
+  input.set_pending_roman_dimness_percent(40);
+  input.set_use_custom_preedit_underline_color(false);
+  input.set_preedit_underline_color(0x112233);
+  input.set_use_custom_preedit_target_underline_color(false);
+  input.set_preedit_target_underline_color(0x445566);
+#endif  // _WIN32
 
   ConfigHandler::SetConfig(input);
   const Config output = ConfigHandler::GetCopiedConfig();
@@ -185,9 +840,207 @@ TEST_F(ConfigHandlerTest, NormalizeMozkeyInputDefaultsPreservesExplicitFalse) {
   EXPECT_FALSE(output.use_typing_correction());
   EXPECT_FALSE(output.use_cycle_segmentation_shortcut());
   EXPECT_FALSE(output.use_live_conversion());
-  EXPECT_FALSE(output.use_zenz_live_correction());
+  EXPECT_FALSE(output.show_live_conversion_ruby_window());
   EXPECT_FALSE(output.show_candidate_window_on_initial_conversion());
   EXPECT_FALSE(output.use_direct_commit());
+  EXPECT_EQ(output.direct_commit_key(), 0);
+  EXPECT_FALSE(output.use_zenz_live_correction());
+  EXPECT_TRUE(output.use_zenz_strict_reading_preservation());
+  EXPECT_TRUE(output.allow_zenz_emoji_changes());
+  EXPECT_FALSE(output.use_zenz_feedback_learning());
+  EXPECT_FALSE(output.use_zenz_feedback_recording());
+  EXPECT_TRUE(output.use_zenz_feedback_reuse());
+  EXPECT_FALSE(output.use_zenz_mozc_history_learning());
+  EXPECT_FALSE(output.use_zenz_feedback_min_key_length());
+  EXPECT_EQ(output.zenz_feedback_min_key_length(), 4);
+  EXPECT_FALSE(output.use_zenz_auto_block_rejected_correction());
+  EXPECT_FALSE(output.use_zenz_live_correction_right_context());
+  EXPECT_FALSE(output.use_realtime_conversion());
+#ifdef _WIN32
+  EXPECT_TRUE(output.dim_pending_roman_input());
+  EXPECT_EQ(output.pending_roman_dimness_percent(), 40);
+  EXPECT_FALSE(output.use_custom_preedit_underline_color());
+  EXPECT_EQ(output.preedit_underline_color(), 0x112233);
+  EXPECT_FALSE(output.use_custom_preedit_target_underline_color());
+  EXPECT_EQ(output.preedit_target_underline_color(), 0x445566);
+#endif  // _WIN32
+}
+
+// Strict reading is opt-in. Missing fields must remain OFF, while an explicit
+// ON preference must survive persistence and reload.
+TEST_F(ConfigHandlerTest, StrictReadingDefaultOffPreservesExplicitOn) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file =
+      FileUtil::JoinPath(temp_dir.path(), "strict_reading_default.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+  ConfigHandler::Reload();
+
+  Config fresh;
+  EXPECT_FALSE(fresh.use_zenz_strict_reading_preservation());
+  EXPECT_FALSE(fresh.has_use_zenz_strict_reading_preservation());
+  EXPECT_FALSE(
+      ConfigHandler::GetCopiedConfig().use_zenz_strict_reading_preservation());
+
+  Config explicit_on;
+  explicit_on.set_use_zenz_strict_reading_preservation(true);
+  ConfigHandler::SetConfig(explicit_on);
+  EXPECT_TRUE(
+      ConfigHandler::GetCopiedConfig().use_zenz_strict_reading_preservation());
+  ConfigHandler::Reload();
+  const Config persisted = ConfigHandler::GetCopiedConfig();
+  EXPECT_TRUE(persisted.has_use_zenz_strict_reading_preservation());
+  EXPECT_TRUE(persisted.use_zenz_strict_reading_preservation());
+}
+
+// A legacy on-disk config may contain only field 1011. Normalization must
+// preserve that choice for all three new fields without rewriting the file.
+TEST_F(ConfigHandlerTest, LegacyZenzFeedbackSettingsMigrateWithoutDiskRewrite) {
+  for (const bool legacy_enabled : std::array{false, true}) {
+    TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+    const std::string config_file = FileUtil::JoinPath(
+        temp_dir.path(), "zenz_legacy_feedback_config.db");
+    Config legacy;
+    legacy.set_use_zenz_feedback_learning(legacy_enabled);
+    {
+      std::ofstream ofs(config_file, std::ios::binary | std::ios::trunc);
+      ASSERT_TRUE(ofs);
+      const std::string serialized = legacy.SerializeAsString();
+      ofs.write(serialized.data(), serialized.size());
+      ASSERT_TRUE(ofs);
+    }
+
+    ConfigHandler::SetConfigFileNameForTesting(config_file);
+    const Config migrated = ConfigHandler::GetCopiedConfig();
+    EXPECT_EQ(migrated.use_zenz_feedback_learning(), legacy_enabled);
+    EXPECT_EQ(migrated.use_zenz_feedback_recording(), legacy_enabled);
+    EXPECT_EQ(migrated.use_zenz_feedback_reuse(), legacy_enabled);
+    EXPECT_EQ(migrated.use_zenz_mozc_history_learning(), legacy_enabled);
+    EXPECT_TRUE(migrated.has_use_zenz_feedback_recording());
+    EXPECT_TRUE(migrated.has_use_zenz_feedback_reuse());
+    EXPECT_TRUE(migrated.has_use_zenz_mozc_history_learning());
+
+    std::ifstream ifs(config_file, std::ios::binary);
+    ASSERT_TRUE(ifs);
+    Config persisted;
+    ASSERT_TRUE(persisted.ParseFromIstream(&ifs));
+    EXPECT_EQ(persisted.use_zenz_feedback_learning(), legacy_enabled);
+    EXPECT_FALSE(persisted.has_use_zenz_feedback_recording());
+    EXPECT_FALSE(persisted.has_use_zenz_feedback_reuse());
+    EXPECT_FALSE(persisted.has_use_zenz_mozc_history_learning());
+  }
+}
+
+TEST_F(ConfigHandlerTest, PartialZenzFeedbackMigrationHonorsNewFields) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file = FileUtil::JoinPath(
+      temp_dir.path(), "zenz_partial_feedback_config.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  // An explicit new ON overrides old OFF. Missing siblings inherit old OFF.
+  Config input;
+  input.set_use_zenz_feedback_learning(false);
+  input.set_use_zenz_feedback_recording(true);
+  ConfigHandler::SetConfig(input);
+  const Config output = ConfigHandler::GetCopiedConfig();
+  EXPECT_FALSE(output.use_zenz_feedback_learning());
+  EXPECT_TRUE(output.use_zenz_feedback_recording());
+  EXPECT_FALSE(output.use_zenz_feedback_reuse());
+  EXPECT_FALSE(output.use_zenz_mozc_history_learning());
+
+  // The three preferences are not synchronized back to the old field.
+  ConfigHandler::Reload();
+  const Config reloaded = ConfigHandler::GetCopiedConfig();
+  EXPECT_FALSE(reloaded.use_zenz_feedback_learning());
+  EXPECT_TRUE(reloaded.use_zenz_feedback_recording());
+  EXPECT_FALSE(reloaded.use_zenz_feedback_reuse());
+  EXPECT_FALSE(reloaded.use_zenz_mozc_history_learning());
+
+  // Explicit new OFF must also override old ON (proto2 presence matters).
+  Config opposite;
+  opposite.set_use_zenz_feedback_learning(true);
+  opposite.set_use_zenz_feedback_recording(false);
+  ConfigHandler::SetConfig(opposite);
+  ConfigHandler::Reload();
+  const Config opposite_reloaded = ConfigHandler::GetCopiedConfig();
+  EXPECT_TRUE(opposite_reloaded.use_zenz_feedback_learning());
+  EXPECT_FALSE(opposite_reloaded.use_zenz_feedback_recording());
+  EXPECT_TRUE(opposite_reloaded.use_zenz_feedback_reuse());
+  EXPECT_TRUE(opposite_reloaded.use_zenz_mozc_history_learning());
+}
+
+TEST_F(ConfigHandlerTest, AllZenzLearningToggleCombinationsRoundTrip) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file = FileUtil::JoinPath(
+      temp_dir.path(), "zenz_all_toggle_combinations.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  // A/B/C must be independently persisted for all eight combinations.
+  for (int mask = 0; mask < 8; ++mask) {
+    const bool recording = (mask & 1) != 0;
+    const bool reuse = (mask & 2) != 0;
+    const bool mozc_history = (mask & 4) != 0;
+    Config config = ConfigHandler::GetCopiedConfig();
+    config.set_use_zenz_feedback_learning(false);
+    config.set_use_zenz_feedback_recording(recording);
+    config.set_use_zenz_feedback_reuse(reuse);
+    config.set_use_zenz_mozc_history_learning(mozc_history);
+    ConfigHandler::SetConfig(config);
+    ConfigHandler::Reload();
+
+    const Config actual = ConfigHandler::GetCopiedConfig();
+    EXPECT_FALSE(actual.use_zenz_feedback_learning()) << "mask=" << mask;
+    EXPECT_EQ(actual.use_zenz_feedback_recording(), recording)
+        << "mask=" << mask;
+    EXPECT_EQ(actual.use_zenz_feedback_reuse(), reuse) << "mask=" << mask;
+    EXPECT_EQ(actual.use_zenz_mozc_history_learning(), mozc_history)
+        << "mask=" << mask;
+  }
+}
+
+TEST_F(ConfigHandlerTest, ZenzFeedbackIndependentSettingsSurviveReload) {
+  TempDirectory temp_dir = testing::MakeTempDirectoryOrDie();
+  const std::string config_file = FileUtil::JoinPath(
+      temp_dir.path(), "zenz_independent_feedback_config.db");
+  ASSERT_OK(FileUtil::UnlinkIfExists(config_file));
+  ConfigHandler::SetConfigFileNameForTesting(config_file);
+
+  Config input;
+  input.set_use_zenz_feedback_learning(false);
+  input.set_use_zenz_feedback_recording(true);
+  input.set_use_zenz_feedback_reuse(false);
+  input.set_use_zenz_mozc_history_learning(true);
+  ConfigHandler::SetConfig(input);
+
+  Config normalized = ConfigHandler::GetCopiedConfig();
+  EXPECT_FALSE(normalized.use_zenz_feedback_learning());
+  EXPECT_TRUE(normalized.use_zenz_feedback_recording());
+  EXPECT_FALSE(normalized.use_zenz_feedback_reuse());
+  EXPECT_TRUE(normalized.use_zenz_mozc_history_learning());
+
+  // Changing B must not modify A, C, or the legacy preference.
+  normalized.set_use_zenz_feedback_reuse(true);
+  ConfigHandler::SetConfig(normalized);
+  ConfigHandler::Reload();
+  const Config reloaded = ConfigHandler::GetCopiedConfig();
+  EXPECT_FALSE(reloaded.use_zenz_feedback_learning());
+  EXPECT_TRUE(reloaded.use_zenz_feedback_recording());
+  EXPECT_TRUE(reloaded.use_zenz_feedback_reuse());
+  EXPECT_TRUE(reloaded.use_zenz_mozc_history_learning());
+
+  std::ifstream ifs(config_file, std::ios::binary);
+  ASSERT_TRUE(ifs);
+  Config persisted;
+  ASSERT_TRUE(persisted.ParseFromIstream(&ifs));
+  EXPECT_TRUE(persisted.has_use_zenz_feedback_recording());
+  EXPECT_TRUE(persisted.has_use_zenz_feedback_reuse());
+  EXPECT_TRUE(persisted.has_use_zenz_mozc_history_learning());
+  EXPECT_FALSE(persisted.use_zenz_feedback_learning());
+  EXPECT_TRUE(persisted.use_zenz_feedback_recording());
+  EXPECT_TRUE(persisted.use_zenz_feedback_reuse());
+  EXPECT_TRUE(persisted.use_zenz_mozc_history_learning());
 }
 
 TEST_F(ConfigHandlerTest, SetMetadata) {
@@ -322,10 +1175,20 @@ TEST_F(ConfigHandlerTest, GetDefaultConfig) {
   EXPECT_EQ(output.session_keymap(), Config::MSIME);
 #endif  // __APPLE__ || OS_CHROMEOS
 
+  EXPECT_FALSE(output.has_use_live_conversion());
+  EXPECT_FALSE(output.has_show_candidate_window_on_initial_conversion());
+  EXPECT_FALSE(output.has_use_direct_commit());
+  EXPECT_FALSE(output.has_direct_commit_key());
+  EXPECT_FALSE(output.has_use_zenz_live_correction());
+  EXPECT_FALSE(output.has_use_zenz_feedback_learning());
+  EXPECT_FALSE(output.has_use_zenz_feedback_recording());
+  EXPECT_FALSE(output.has_use_zenz_feedback_reuse());
+  EXPECT_FALSE(output.has_use_zenz_mozc_history_learning());
+  EXPECT_FALSE(output.has_use_zenz_live_correction_right_context());
+  EXPECT_FALSE(output.has_use_realtime_conversion());
   EXPECT_EQ(output.live_conversion_min_key_length(), 2);
   EXPECT_TRUE(output.use_typing_correction());
   EXPECT_TRUE(output.use_cycle_segmentation_shortcut());
-  EXPECT_TRUE(output.use_zenz_live_correction());
   EXPECT_TRUE(output.zenz_live_correction_device().empty());
   EXPECT_EQ(output.character_form_rules_size(), 13);
 
@@ -361,6 +1224,10 @@ TEST_F(ConfigHandlerTest, GetDefaultConfig) {
     EXPECT_EQ(output.character_form_rules(i).conversion_character_form(),
               kTestCases[i].conversion_character_form);
   }
+}
+
+TEST_F(ConfigHandlerTest, ProductDefaultConfig) {
+  ExpectMozkeyProductDefaults(ConfigHandler::GetProductDefaultConfig());
 }
 
 TEST_F(ConfigHandlerTest, DefaultConfig) {

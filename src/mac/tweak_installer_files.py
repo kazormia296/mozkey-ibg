@@ -42,8 +42,17 @@ import tempfile
 from build_tools import util
 
 
-_NESTED_EXECUTABLE_NAMES = frozenset(('llama-server', 'mozc_zenz_scorer'))
+# Raw Mach-O helpers of the macOS Zenz runtime (Resources/ZenzRuntime).  The
+# scorer always starts llama-server through mozc_zenz_guard.
+_NESTED_EXECUTABLE_NAMES = frozenset(
+    ('llama-server', 'mozc_zenz_scorer', 'mozc_zenz_guard')
+)
+_ZENZ_RUNTIME_DIRECTORY = 'ZenzRuntime'
 _ZENZ_MODEL_NAME = 'zenz-v3.2-small-Q5_K_M.gguf'
+_ZENZ_BUILD_CONTRACT_NAME = 'BUILD-CONTRACT.txt'
+# Must match //mac/installer/zenz_runtime:{apache_license,llama_cpp_license,
+# third_party_notices,zenz_model_notice,cpp_httplib_license,
+# nlohmann_json_license}.
 _ZENZ_RUNTIME_LICENSE_NAMES = (
     'Apache-2.0.txt',
     'THIRD_PARTY_NOTICES.md',
@@ -220,7 +229,15 @@ def TweakForProductbuild(
 
 
 def NormalizeAndValidateZenzRuntime(top_dir: str, oss: bool) -> None:
-  """Validates and normalizes the canonical packaged Zenz runtime."""
+  """Validates and normalizes the canonical packaged Zenz runtime.
+
+  The runtime follows upstream Mozkey's macOS layout: it lives in
+  <app>/Contents/Resources/ZenzRuntime, which is where
+  session/zenz_client_factory.cc launches mozc_zenz_scorer from.  A package
+  built without --define=macos_zenz_runtime=1 lacks llama-server, the model
+  and BUILD-CONTRACT.txt and is rejected here instead of shipping an input
+  method whose Zenz runtime can never start.
+  """
   name = 'MozkeyIbG' if oss else 'GoogleJapaneseInput'
   relative_resources = os.path.join(
       'root',
@@ -229,9 +246,7 @@ def NormalizeAndValidateZenzRuntime(top_dir: str, oss: bool) -> None:
       f'{name}.app',
       'Contents',
       'Resources',
-      f'{name}Converter.app',
-      'Contents',
-      'Resources',
+      _ZENZ_RUNTIME_DIRECTORY,
   )
   resources = os.path.join(top_dir, relative_resources)
 
@@ -256,8 +271,9 @@ def NormalizeAndValidateZenzRuntime(top_dir: str, oss: bool) -> None:
   expected_files = [
       (os.path.join(resources, 'llama-server'), 0o755),
       (os.path.join(resources, 'mozc_zenz_scorer'), 0o755),
+      (os.path.join(resources, 'mozc_zenz_guard'), 0o755),
       (os.path.join(resources, 'models', _ZENZ_MODEL_NAME), 0o644),
-      (os.path.join(resources, 'zenz-runtime-manifest.json'), 0o644),
+      (os.path.join(resources, _ZENZ_BUILD_CONTRACT_NAME), 0o644),
   ]
   expected_files.extend(
       (os.path.join(resources, 'licenses', name), 0o644)
@@ -334,6 +350,11 @@ def Codesign(
     codesign = ['/usr/bin/codesign', *args, path]
     util.RunOrDie(codesign)
 
+  # Upstream Mozkey signs the ZenzRuntime helpers (llama-server,
+  # mozc_zenz_scorer, mozc_zenz_guard) in a dedicated pass.  Here they are
+  # already covered by _NESTED_EXECUTABLE_NAMES above, which additionally
+  # refuses symlinks and non-executable helpers, so they are not signed twice.
+
   # codesign apps
   # Walk the directory from the bottom to the top. This is necessary because
   # the sub apps should be signed before the main app.
@@ -356,7 +377,7 @@ def TweakInstallerFiles(args: argparse.Namespace, work_dir: str) -> None:
     shutil.rmtree(top_dir)
 
   # The zip file should contain the 'installer' directory.
-  util.RunOrDie(['unzip', '-q', args.input, '-d', work_dir])
+  util.RunOrDie(['/usr/bin/ditto', '-x', '-k', args.input, work_dir])
 
   tweak_qt = not args.noqt
 

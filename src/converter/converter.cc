@@ -33,11 +33,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -46,6 +46,7 @@
 #include "absl/log/log.h"
 #include "absl/random/random.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -55,6 +56,7 @@
 #include "composer/composer.h"
 #include "converter/attribute.h"
 #include "converter/candidate.h"
+#include "converter/converter_util.h"
 #include "converter/history_reconstructor.h"
 #include "converter/immutable_converter_interface.h"
 #include "converter/inner_segment.h"
@@ -62,11 +64,13 @@
 #include "converter/segments.h"
 #include "dictionary/dictionary_interface.h"
 #include "dictionary/pos_matcher.h"
+#include "engine/contextual_candidate_reranker.h"
 #include "engine/modules.h"
 #include "prediction/predictor_interface.h"
 #include "prediction/result.h"
 #include "protocol/commands.pb.h"
 #include "request/conversion_request.h"
+#include "request/request_util.h"
 #include "rewriter/rewriter_interface.h"
 #include "transliteration/transliteration.h"
 
@@ -83,6 +87,32 @@ size_t GetSegmentIndex(const Segments* segments, size_t segment_index) {
     return kErrorIndex;
   }
   return result;
+}
+
+
+// Consolidates a multi-segment candidate (span > 1) at `raw_segment_index` into
+// a single segment by updating the segment key to the candidate's full reading,
+// erasing covered trailing segments, and decrementing `converted_segment_count`
+// accordingly.
+void MergeMultiSegmentCandidate(Segments* segments, size_t raw_segment_index,
+                                bool force_update_key = false) {
+  Segment* seg = segments->mutable_segment(raw_segment_index);
+  if (seg->candidates_size() == 0) {
+    return;
+  }
+  Candidate* top_cand = seg->mutable_candidate(0);
+  const size_t span = top_cand->effective_converted_segment_count();
+  if ((force_update_key || span > 1) && !top_cand->key.empty()) {
+    seg->set_key(top_cand->key);
+  }
+  if (span > 1 && raw_segment_index + 1 < segments->segments_size()) {
+    const size_t remaining_segments =
+        segments->segments_size() - 1 - raw_segment_index;
+    DCHECK_LE(span - 1, remaining_segments);
+    const size_t erase_count = std::min(span - 1, remaining_segments);
+    segments->erase_segments(raw_segment_index + 1, erase_count);
+    top_cand->converted_segment_count -= erase_count;
+  }
 }
 
 bool ShouldInitSegmentsForPrediction(absl::string_view key,
@@ -287,6 +317,17 @@ void Converter::ApplyPostProcessing(const ConversionRequest& request,
 
 void Converter::FinishConversion(const ConversionRequest& request,
                                  Segments* segments) const {
+  // Consolidates multi-segment candidates (span > 1) into single segments
+  // before committing to history and learning. During conversion, individual
+  // segments are preserved for navigation and reversion, but upon commit,
+  // covered trailing segments are merged and erased.
+  const size_t hist_size = segments->history_segments_size();
+  const bool force_update_key =
+      request.request_type() != ConversionRequest::CONVERSION;
+  for (size_t i = 0; i < segments->conversion_segments_size(); ++i) {
+    MergeMultiSegmentCandidate(segments, hist_size + i, force_update_key);
+  }
+
   for (Segment& segment : *segments) {
     // revert SUBMITTED segments to FIXED_VALUE
     // SUBMITTED segments are created by "submit first segment" operation
@@ -310,22 +351,404 @@ void Converter::FinishConversion(const ConversionRequest& request,
       absl::IntervalClosed, bitgen, 1, std::numeric_limits<uint64_t>::max());
   segments->set_revert_id(revert_id);
 
-  const prediction::Result history_result = MakeHistoryResult(*segments);
+  const prediction::Result history_result = HistorySegmentsToResult(*segments);
   const std::vector<prediction::Result> committed_results =
-      MakeLearningResults(*segments);
+      ConversionSegmentsToResults(*segments);
   const ConversionRequest finish_req = ConversionRequestBuilder()
                                            .SetConversionRequestView(request)
                                            .SetHistoryResultView(history_result)
                                            .Build();
-  rewriter_->Finish(finish_req, *segments);
-  predictor_->Finish(finish_req, committed_results, segments->revert_id());
 
-  if (request.request_type() != ConversionRequest::CONVERSION &&
-      segments->conversion_segments_size() >= 1 &&
-      segments->conversion_segment(0).candidates_size() >= 1) {
-    Segment* segment = segments->mutable_conversion_segment(0);
-    segment->set_key(segment->candidate(0).key);
+  // A suggestion is represented as one outer Segment whose key can still be
+  // the typed prefix, while its selected candidate holds the complete reading
+  // and (sometimes) multiple inner segments. Preserve that ordinary commit
+  // for the predictor, history context, character-form rules, and undo.
+  // Build a separately verified view *only* for user segment history.
+  std::optional<Segments> suggestion_learning_segments;
+  if (request.options().enable_verified_suggestion_segment_learning &&
+      request.request_type() == ConversionRequest::CONVERSION &&
+      !request.request().mixed_conversion() && !request.incognito_mode() &&
+      !request.context().is_private_input() &&
+      request.composer().GetInputFieldType() != commands::Context::PASSWORD &&
+      request.options().enable_user_history_for_conversion &&
+      request.config().history_learning_level() ==
+          config::Config::DEFAULT_HISTORY &&
+      !segments->resized() && segments->conversion_segments_size() == 1 &&
+      segments->conversion_segment(0).candidates_size() > 0) {
+    // Undo cleanup must precede speculative candidate ranking and learning.
+    rewriter_->PrepareForSuggestionLearning(finish_req);
+    const Segment& source = segments->conversion_segment(0);
+    const Candidate& selected = source.candidate(0);
+    constexpr uint32_t kUnsafeSuggestionAttributes =
+        Attribute::NO_HISTORY_LEARNING | Attribute::NO_SUGGEST_LEARNING |
+        Attribute::PARTIALLY_KEY_CONSUMED |
+        Attribute::AUTO_PARTIAL_SUGGESTION |
+        Attribute::TYPING_CORRECTION | Attribute::SPELLING_CORRECTION |
+        Attribute::KEY_EXPANDED_IN_DICTIONARY |
+        Attribute::COMMAND_CANDIDATE | Attribute::POST_CORRECTION |
+        Attribute::NUMBER;
+    constexpr size_t kMaxSegments = 16;
+    constexpr size_t kMaxKeyChars = 64;
+    constexpr size_t kMaxValueChars = 64;
+    constexpr size_t kMaxValueBytes = 512;
+    const auto valid_text = [](absl::string_view text) {
+      return !text.empty() && Util::IsValidUtf8(text) &&
+             text.find_first_of("\t\r\n") == absl::string_view::npos;
+    };
+    if (valid_text(source.key()) && valid_text(selected.key) &&
+        valid_text(selected.value) &&
+        source.key() == request.key() &&
+        absl::StartsWith(selected.key, source.key()) &&
+        selected.effective_converted_segment_count() == 1 &&
+        (selected.attributes & kUnsafeSuggestionAttributes) == 0 &&
+        Util::CharsLen(selected.key) <= kMaxKeyChars &&
+        Util::CharsLen(selected.value) <= kMaxValueChars &&
+        selected.value.size() <= kMaxValueBytes) {
+      // Preserve the original commit for every component except legacy
+      // segment-history learning. A learning view retains native candidate
+      // metadata and the original revert_id; it is not another commit.
+      auto build_learning_view =
+          [&](const Segments& native,
+              const std::vector<std::pair<std::string, std::string>>& pairs,
+              const std::vector<size_t>& selected_indices)
+          -> std::optional<Segments> {
+        if (pairs.empty() || pairs.size() != selected_indices.size() ||
+            native.conversion_segments_size() != pairs.size()) {
+          return std::nullopt;
+        }
+        Segments learning = *segments;
+        learning.clear_conversion_segments();
+        learning.set_resized(false);  // This is not a boundary edit.
+        for (size_t i = 0; i < pairs.size(); ++i) {
+          const Segment& native_seg = native.conversion_segment(i);
+          const auto& [key, value] = pairs[i];
+          const size_t matched = selected_indices[i];
+          if (native_seg.key() != key ||
+              matched >= native_seg.candidates_size() ||
+              native_seg.candidate(matched).key != key ||
+              native_seg.candidate(matched).value != value ||
+              native_seg.candidate(matched)
+                      .effective_converted_segment_count() != 1 ||
+              (native_seg.candidate(matched).attributes &
+               Attribute::NO_HISTORY_LEARNING) != 0) {
+            return std::nullopt;
+          }
+          Segment* dest = learning.add_segment();
+          *dest = native_seg;
+          dest->set_segment_type(Segment::FIXED_VALUE);
+          dest->mutable_candidate(0)->attributes |= Attribute::BEST_CANDIDATE;
+          dest->move_candidate(matched, 0);
+          if (matched != 0) {
+            dest->mutable_candidate(0)->attributes |= Attribute::RERANKED;
+            dest->mutable_candidate(0)->attributes &=
+                ~Attribute::BEST_CANDIDATE;
+          }
+        }
+        return learning;
+      };
+
+      // Only a postprocessed *normal* conversion has a meaningful displayed
+      // default rank. Dictionary-only paths can verify spelling and boundaries
+      // but must never supply RERANKED/BEST_CANDIDATE provenance.
+      std::optional<Segments> displayed_normal;
+
+      // Verify candidate-supplied boundaries (or strict reverse-resolved
+      // boundaries) against the immutable converter before learning.
+      auto verify_learning_pairs =
+          [&](const std::vector<std::pair<std::string, std::string>>& pairs)
+          -> std::optional<Segments> {
+        if (pairs.empty() || pairs.size() > kMaxSegments) {
+          return std::nullopt;
+        }
+        std::vector<uint8_t> key_sizes;
+        std::string joined_key;
+        std::string joined_value;
+        key_sizes.reserve(pairs.size());
+        for (const auto& [key, value] : pairs) {
+          const size_t key_chars = Util::CharsLen(key);
+          if (!valid_text(key) || !valid_text(value) || key_chars == 0 ||
+              key_chars > std::numeric_limits<uint8_t>::max()) {
+            return std::nullopt;
+          }
+          key_sizes.push_back(static_cast<uint8_t>(key_chars));
+          joined_key.append(key);
+          joined_value.append(value);
+        }
+        if (joined_key != selected.key || joined_value != selected.value) {
+          return std::nullopt;
+        }
+
+        // Fixed-boundary conversion is read-only and keeps native candidate
+        // metadata (including POS and content keys) instead of inventing it.
+        Segments native;
+        native.InitForConvert(selected.key);
+        ConversionRequest::Options native_options = request.options();
+        native_options.request_type = ConversionRequest::CONVERSION;
+        native_options.enable_user_history_for_conversion = false;
+        native_options.enable_verified_suggestion_segment_learning = false;
+        native_options.max_conversion_candidates_size = std::max<int>(
+            64, native_options.max_conversion_candidates_size);
+        if (!native.Resize(0, key_sizes) ||
+            !immutable_converter_->Convert(native_options, &native) ||
+            native.conversion_segments_size() != pairs.size()) {
+          return std::nullopt;
+        }
+
+        std::vector<size_t> selected_indices;
+        selected_indices.reserve(pairs.size());
+        for (size_t i = 0; i < pairs.size(); ++i) {
+          const Segment& native_seg = native.conversion_segment(i);
+          const auto& [key, value] = pairs[i];
+          if (native_seg.key() != key) {
+            return std::nullopt;
+          }
+          size_t matched = native_seg.candidates_size();
+          for (size_t j = 0; j < native_seg.candidates_size(); ++j) {
+            const Candidate& cand = native_seg.candidate(j);
+            if (cand.key == key && cand.value == value &&
+                cand.effective_converted_segment_count() == 1 &&
+                (cand.attributes & Attribute::NO_HISTORY_LEARNING) == 0) {
+              matched = j;
+              break;
+            }
+          }
+          if (matched == native_seg.candidates_size()) {
+            return std::nullopt;
+          }
+          selected_indices.push_back(matched);
+        }
+        // Validate that the very same pairs exist in the real, postprocessed
+        // normal-conversion candidate list, and take their indices from THERE.
+        // The natural segmentation may differ from the forced dictionary
+        // boundaries; in that case the native ranks cannot be generalized to
+        // an ordinary full-reading conversion, so skip extra segment learning.
+        if (!displayed_normal.has_value() ||
+            displayed_normal->conversion_segments_size() != pairs.size()) {
+          return std::nullopt;
+        }
+        std::vector<size_t> displayed_indices;
+        displayed_indices.reserve(pairs.size());
+        for (size_t i = 0; i < pairs.size(); ++i) {
+          const Segment& visible = displayed_normal->conversion_segment(i);
+          const auto& [key, value] = pairs[i];
+          if (visible.key() != key) {
+            return std::nullopt;
+          }
+          size_t matched = visible.candidates_size();
+          for (size_t j = 0; j < visible.candidates_size(); ++j) {
+            const Candidate& candidate = visible.candidate(j);
+            if (candidate.key == key && candidate.value == value &&
+                candidate.effective_converted_segment_count() == 1 &&
+                (candidate.attributes & Attribute::NO_HISTORY_LEARNING) == 0) {
+              if (matched != visible.candidates_size()) {
+                return std::nullopt;  // Ambiguous identical surfaces.
+              }
+              matched = j;
+            }
+          }
+          if (matched == visible.candidates_size()) {
+            return std::nullopt;
+          }
+          displayed_indices.push_back(matched);
+        }
+        return build_learning_view(*displayed_normal, pairs,
+                                   displayed_indices);
+      };
+
+      // A suggestion may lack inner boundaries even when its complete
+      // surface corresponds to candidates visible in ordinary conversion.
+      // Match the *postprocessed* normal-conversion segments, not only the
+      // immutable converter output. The probe never commits anything.
+      auto match_normal_conversion = [&](const Segments& normal)
+          -> std::optional<Segments> {
+        if (normal.conversion_segments_size() <= 1 ||
+            normal.conversion_segments_size() > kMaxSegments) {
+          return std::nullopt;
+        }
+        std::string joined_key;
+        for (const Segment& seg : normal.conversion_segments()) {
+          if (!valid_text(seg.key()) || seg.candidates_size() == 0) {
+            return std::nullopt;
+          }
+          joined_key.append(seg.key());
+        }
+        if (joined_key != selected.key) {
+          return std::nullopt;
+        }
+
+        // A capped, exhaustive walk of *visible* candidate surfaces.  The
+        // default conversion size is 200, so an arbitrary 64-candidate
+        // threshold would reject common readings even when the second
+        // candidate is the user's explicit choice.
+        constexpr size_t kMaxCandidateChecks = 32768;
+        constexpr size_t kMaxCandidatesPerSegment = 512;
+        size_t candidate_checks = 0;
+        size_t distinct_paths = 0;
+        bool exhausted = false;
+        std::vector<size_t> active_indices;
+        std::vector<size_t> matched_indices;
+        std::function<void(size_t, size_t)> find_path =
+            [&](size_t segment_index, size_t byte_offset) {
+              if (exhausted || distinct_paths > 1) {
+                return;
+              }
+              if (segment_index == normal.conversion_segments_size()) {
+                if (byte_offset == selected.value.size()) {
+                  ++distinct_paths;
+                  if (distinct_paths == 1) {
+                    matched_indices = active_indices;
+                  }
+                }
+                return;
+              }
+              const Segment& seg = normal.conversion_segment(segment_index);
+              const size_t limit = std::min(seg.candidates_size(),
+                                            kMaxCandidatesPerSegment);
+              if (seg.candidates_size() > limit) {
+                exhausted = true;  // Cannot prove uniqueness by truncation.
+                return;
+              }
+              for (size_t j = 0; j < limit; ++j) {
+                if (++candidate_checks > kMaxCandidateChecks) {
+                  exhausted = true;
+                  return;
+                }
+                const Candidate& cand = seg.candidate(j);
+                if (cand.key != seg.key() || cand.value.empty() ||
+                    cand.effective_converted_segment_count() != 1 ||
+                    (cand.attributes & Attribute::NO_HISTORY_LEARNING) != 0 ||
+                    cand.value.size() > selected.value.size() - byte_offset ||
+                    selected.value.compare(byte_offset, cand.value.size(),
+                                           cand.value) != 0) {
+                  continue;
+                }
+                bool duplicate_surface = false;
+                for (size_t previous = 0; previous < j; ++previous) {
+                  const Candidate& earlier = seg.candidate(previous);
+                  if (earlier.key == cand.key && earlier.value == cand.value &&
+                      earlier.effective_converted_segment_count() == 1 &&
+                      (earlier.attributes & Attribute::NO_HISTORY_LEARNING) ==
+                          0) {
+                    duplicate_surface = true;
+                    break;
+                  }
+                }
+                if (duplicate_surface) {
+                  continue;
+                }
+                active_indices.push_back(j);
+                find_path(segment_index + 1,
+                          byte_offset + cand.value.size());
+                active_indices.pop_back();
+                if (exhausted || distinct_paths > 1) {
+                  return;
+                }
+              }
+            };
+        find_path(0, 0);
+        if (exhausted || distinct_paths != 1) {
+          return std::nullopt;
+        }
+        std::vector<std::pair<std::string, std::string>> pairs;
+        pairs.reserve(matched_indices.size());
+        for (size_t i = 0; i < matched_indices.size(); ++i) {
+          const Segment& seg = normal.conversion_segment(i);
+          pairs.emplace_back(seg.key(),
+                             seg.candidate(matched_indices[i]).value);
+        }
+        // A non-top choice in the actual conversion is the same signal as
+        // a direct CommitSegmentValue(..., nonzero_index).
+        return build_learning_view(normal, pairs, matched_indices);
+      };
+
+      // Complete normal conversion, including history prediction and rewriter
+      // ordering, on an isolated Segments copy.  The composer may still hold
+      // the typed prefix, so SetKey explicitly supplies the full reading.
+      // Suppress pending-revert consumption while examining candidates.
+      {
+        ConversionRequest::Options normal_options = request.options();
+        normal_options.request_type = ConversionRequest::CONVERSION;
+        normal_options.enable_verified_suggestion_segment_learning = false;
+        normal_options.used_in_predictor_realtime_conversion = false;
+        normal_options.skip_pending_revert_for_suggestion_learning = true;
+        normal_options.use_explicit_key_for_user_history_conversion = true;
+        const ConversionRequest normal_request =
+            ConversionRequestBuilder()
+                .SetConversionRequestView(request)
+                .SetOptions(normal_options)
+                .SetKey(selected.key)
+                .Build();
+        Segments normal = *segments;
+        normal.clear_conversion_segments();
+        normal.set_revert_id(0);
+        normal.set_resized(false);
+        if (StartConversion(normal_request, &normal)) {
+          // EngineConverter::Convert applies this final contextual ranking
+          // after Converter::StartConversion. Learning must compare against
+          // the same displayed default as ordinary conversion.
+          engine::ContextualCandidateReranker contextual_reranker;
+          contextual_reranker.Rerank(&normal);
+          suggestion_learning_segments = match_normal_conversion(normal);
+          if (!suggestion_learning_segments.has_value()) {
+            displayed_normal = std::move(normal);
+          }
+        }
+      }
+
+      // Retain strict source-boundary verification when the visible native
+      // conversion cannot uniquely explain the selected suggestion.
+      std::vector<std::pair<std::string, std::string>> original_pairs;
+      for (const auto& inner : selected.inner_segments()) {
+        if (original_pairs.size() >= kMaxSegments) {
+          original_pairs.clear();
+          break;
+        }
+        original_pairs.emplace_back(inner.GetKey(), inner.GetValue());
+      }
+      if (!suggestion_learning_segments.has_value() &&
+          original_pairs.size() > 1) {
+        suggestion_learning_segments = verify_learning_pairs(original_pairs);
+      }
+
+      // Do not treat immutable dictionary order as the order of candidates
+      // shown in ordinary conversion. If the visible candidate path cannot be
+      // proven, the original whole-suggestion history is still committed.
+
+      if (!suggestion_learning_segments.has_value()) {
+        // Zenz already uses this native reverse-reading resolver for text
+        // without segment boundaries. It requires an exact key/value round
+        // trip and a unique forward-verified segmentation. Failure is safe:
+        // retain the existing whole-suggestion learning behavior.
+        std::vector<ExternalConversionSegment> resolved;
+        if (ResolveExternalConversionSegments(request, selected.key,
+                                              selected.value, &resolved) &&
+            resolved.size() > 1 && resolved.size() <= kMaxSegments) {
+          std::vector<std::pair<std::string, std::string>> resolved_pairs;
+          resolved_pairs.reserve(resolved.size());
+          for (const ExternalConversionSegment& segment : resolved) {
+            resolved_pairs.emplace_back(segment.key, segment.value);
+          }
+          suggestion_learning_segments = verify_learning_pairs(resolved_pairs);
+        }
+      }
+
+      // Preserve Phase 1's verified full-reading single-segment learning when
+      // there was no usable multi-segment explanation. No partial or guessed
+      // segmentation is persisted.
+      if (!suggestion_learning_segments.has_value() &&
+          original_pairs.size() == 1) {
+        suggestion_learning_segments = verify_learning_pairs(original_pairs);
+      }
+    }
   }
+
+  if (suggestion_learning_segments.has_value()) {
+    rewriter_->FinishWithSuggestionLearningSegments(
+        finish_req, *segments, &*suggestion_learning_segments);
+  } else {
+    rewriter_->Finish(finish_req, *segments);
+  }
+  predictor_->Finish(finish_req, committed_results, segments->revert_id());
 
   // Remove the front segments except for some segments which will be
   // used as history segments.
@@ -345,6 +768,15 @@ bool Converter::LearnExternalConversionResult(
     const ConversionRequest& request,
     absl::string_view key,
     absl::string_view value) const {
+  return LearnExternalConversionResultReversibly(
+      request, key, value, /*revert_segments=*/nullptr);
+}
+
+bool Converter::LearnExternalConversionResultReversibly(
+    const ConversionRequest& request,
+    absl::string_view key,
+    absl::string_view value,
+    Segments* revert_segments) const {
   key = absl::StripAsciiWhitespace(key);
   value = absl::StripAsciiWhitespace(value);
 
@@ -425,16 +857,31 @@ bool Converter::LearnExternalConversionResult(
   candidate->attributes |= Attribute::RERANKED;
 
   FinishConversion(request, &learning_segments);
+  if (revert_segments != nullptr) {
+    *revert_segments = learning_segments;
+  }
   return true;
 }
 
 bool Converter::LearnExternalConversionSegments(
     const ConversionRequest& request,
     absl::Span<const ExternalConversionSegment> segments) const {
+  return LearnExternalConversionSegmentsReversibly(
+      request, segments, /*revert_segments=*/nullptr);
+}
+
+bool Converter::LearnExternalConversionSegmentsReversibly(
+    const ConversionRequest& request,
+    absl::Span<const ExternalConversionSegment> segments,
+    Segments* revert_segments) const {
   constexpr size_t kMaxSegments = 16;
   constexpr size_t kMaxSegmentKeyChars = 128;
   constexpr size_t kMaxSegmentValueChars = 128;
   constexpr size_t kMaxSegmentValueBytes = 512;
+  // UserBoundaryHistoryRewriter persists each target segment length in a
+  // 4-bit field. A boundary-resized external commit must not claim success
+  // when its target boundary cannot be represented by that downstream store.
+  constexpr size_t kMaxBoundaryHistorySegmentKeyChars = 15;
   constexpr size_t kMinTotalKeyChars = 2;
   constexpr size_t kMaxTotalKeyChars = 256;
   constexpr size_t kMaxTotalValueChars = 256;
@@ -461,12 +908,20 @@ bool Converter::LearnExternalConversionSegments(
     return false;
   }
 
+  const bool boundary_resized = segments.front().boundary_resized;
+
   std::vector<ExternalConversionSegment> normalized_segments;
   normalized_segments.reserve(segments.size());
+  std::vector<uint8_t> key_sizes;
+  key_sizes.reserve(segments.size());
 
   std::string total_key;
   std::string total_value;
   for (const ExternalConversionSegment& segment : segments) {
+    if (segment.boundary_resized != boundary_resized) {
+      return false;
+    }
+
     const std::string key =
         std::string(absl::StripAsciiWhitespace(segment.key));
     const std::string value =
@@ -478,9 +933,16 @@ bool Converter::LearnExternalConversionSegments(
     if (!Util::IsValidUtf8(key) || !Util::IsValidUtf8(value)) {
       return false;
     }
-    if (Util::CharsLen(key) > kMaxSegmentKeyChars ||
+
+    const size_t key_chars = Util::CharsLen(key);
+    if (key_chars > kMaxSegmentKeyChars ||
         Util::CharsLen(value) > kMaxSegmentValueChars ||
-        value.size() > kMaxSegmentValueBytes) {
+        value.size() > kMaxSegmentValueBytes ||
+        key_chars > std::numeric_limits<uint8_t>::max()) {
+      return false;
+    }
+    if (boundary_resized &&
+        key_chars > kMaxBoundaryHistorySegmentKeyChars) {
       return false;
     }
 
@@ -496,7 +958,9 @@ bool Converter::LearnExternalConversionSegments(
 
     absl::StrAppend(&total_key, key);
     absl::StrAppend(&total_value, value);
-    normalized_segments.push_back({key, value, segment.is_reranked});
+    key_sizes.push_back(static_cast<uint8_t>(key_chars));
+    normalized_segments.push_back(
+        {key, value, segment.is_reranked, boundary_resized});
   }
 
   if (Util::CharsLen(total_key) < kMinTotalKeyChars ||
@@ -506,66 +970,450 @@ bool Converter::LearnExternalConversionSegments(
     return false;
   }
 
-  // Learn the accepted external result as one multi-segment committed
-  // conversion.  This keeps the phrase boundaries derived from Mozc live
-  // conversion, so callers can approximate a normal multi-segment commit
-  // without writing segment-local records to ZenzFeedbackStore.
+  // Probe the accepted sequence once with the caller-supplied boundaries and
+  // user history disabled.  This preserves intra-phrase context when copying
+  // native candidate metadata and avoids N independent StartConversion calls.
+  // For a caller-reported boundary change, every accepted surface must be
+  // reproduced exactly by this immutable fixed-boundary conversion.
+  std::vector<std::optional<Candidate>> fixed_boundary_candidates(
+      normalized_segments.size());
+  bool fixed_boundary_probe_valid = false;
+
+  Segments fixed_segments;
+  fixed_segments.InitForConvert(total_key);
+  if (fixed_segments.Resize(0, key_sizes)) {
+    ConversionRequest::Options fixed_options = request.options();
+    fixed_options.request_type = ConversionRequest::CONVERSION;
+    fixed_options.enable_user_history_for_conversion = false;
+    fixed_options.max_conversion_candidates_size =
+        std::max<int>(64, fixed_options.max_conversion_candidates_size);
+
+    if (immutable_converter_->Convert(fixed_options, &fixed_segments) &&
+        fixed_segments.conversion_segments_size() ==
+            normalized_segments.size()) {
+      fixed_boundary_probe_valid = true;
+      for (size_t i = 0; i < normalized_segments.size(); ++i) {
+        const Segment& fixed_segment = fixed_segments.conversion_segment(i);
+        if (fixed_segment.key() != normalized_segments[i].key) {
+          fixed_boundary_probe_valid = false;
+          break;
+        }
+
+        for (size_t j = 0; j < fixed_segment.candidates_size(); ++j) {
+          const Candidate& candidate = fixed_segment.candidate(j);
+          if (candidate.value == normalized_segments[i].value) {
+            fixed_boundary_candidates[i] = candidate;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (boundary_resized) {
+    if (!fixed_boundary_probe_valid) {
+      return false;
+    }
+    for (const std::optional<Candidate>& candidate :
+         fixed_boundary_candidates) {
+      if (!candidate.has_value()) {
+        return false;
+      }
+    }
+  }
+
+  // Learn the accepted external result as one committed sequence. Phrase
+  // boundaries are either the unchanged live Mozc boundaries or a
+  // converter-verified native resegmentation.
   Segments learning_segments;
   learning_segments.clear_conversion_segments();
 
-  for (const ExternalConversionSegment& segment : normalized_segments) {
+  for (size_t segment_index = 0;
+       segment_index < normalized_segments.size(); ++segment_index) {
+    const ExternalConversionSegment& segment =
+        normalized_segments[segment_index];
+
     Segment* learning_segment = learning_segments.add_segment();
     learning_segment->set_key(segment.key);
     learning_segment->set_segment_type(Segment::FIXED_VALUE);
 
     Candidate* candidate = learning_segment->add_candidate();
-
-    bool copied_normal_candidate = false;
-    Segments probe_segments;
-    probe_segments.InitForConvert(segment.key);
-
-    const ConversionRequest probe_request =
-        ConversionRequestBuilder()
-            .SetConversionRequestView(request)
-            .SetKey(segment.key)
-            .Build();
-
-    if (StartConversion(probe_request, &probe_segments) &&
-        probe_segments.conversion_segments_size() == 1) {
-      const Segment& probe_segment = probe_segments.conversion_segment(0);
-      for (size_t i = 0; i < probe_segment.candidates_size(); ++i) {
-        const Candidate& probe_candidate = probe_segment.candidate(i);
-        if (probe_candidate.value == segment.value) {
-          *candidate = probe_candidate;
-          copied_normal_candidate = true;
-          break;
-        }
-      }
-    }
-
-    if (!copied_normal_candidate) {
+    if (fixed_boundary_probe_valid &&
+        fixed_boundary_candidates[segment_index].has_value()) {
+      *candidate = *fixed_boundary_candidates[segment_index];
+    } else {
       candidate->key = segment.key;
       candidate->content_key = segment.key;
       candidate->value = segment.value;
       candidate->content_value = segment.value;
     }
 
-    // The copied candidate may already contain ranking-related attributes from
-    // normal conversion.  External learning should control those explicitly.
+    // The copied candidate may already contain ranking-related attributes.
+    // External learning controls only those ranking signals explicitly.
     candidate->attributes &=
         ~(Attribute::RERANKED |
           Attribute::BEST_CANDIDATE |
           Attribute::USER_SEGMENT_HISTORY_REWRITER);
 
-    // Treat only segments actually changed by Zenz as user-selected non-default
-    // commits.  Unchanged context segments are kept in the committed phrase
-    // sequence, but they should not create extra trigger-key evidence.
+    // Treat only segments with explicit local evidence as user-selected
+    // non-default commits. Other context segments remain part of the committed
+    // sequence and are learned with ordinary Mozc commit semantics.
     if (segment.is_reranked) {
       candidate->attributes |= Attribute::RERANKED;
     }
   }
 
+  // A caller-proven and converter-verified resegmentation reproduces the same
+  // signal as a manual boundary edit.  A one-segment result is intentional:
+  // UserBoundaryHistoryRewriter uses it to learn joining several old segments
+  // into one.
+  learning_segments.set_resized(boundary_resized);
+
   FinishConversion(request, &learning_segments);
+  if (revert_segments != nullptr) {
+    *revert_segments = learning_segments;
+  }
+  return true;
+}
+
+bool Converter::ResolveExternalConversionSegments(
+    const ConversionRequest& request, absl::string_view key,
+    absl::string_view value,
+    std::vector<ExternalConversionSegment>* segments) const {
+  if (segments == nullptr) {
+    return false;
+  }
+  segments->clear();
+
+  constexpr size_t kMaxSegments = 16;
+  // Native resegmentation is best-effort user-history enrichment on the
+  // latency-sensitive IME path. Long spans are more expensive to reverse and
+  // are also less suitable for durable local generalization, so fail closed
+  // and leave them to the existing full-sequence feedback/fallback paths.
+  constexpr size_t kMaxKeyChars = 64;
+  constexpr size_t kMaxValueChars = 64;
+  constexpr size_t kMaxValueBytes = 1024;
+  // Explore lower-ranked reverse readings only while the ambiguity remains
+  // small. Once many exact prefix paths survive, the evidence is weak enough
+  // that persistent local-boundary learning is not worth blocking the IME.
+  constexpr size_t kMaxReverseReadingPaths = 16;
+
+  if (key.empty() || value.empty() ||
+      request.request_type() != ConversionRequest::CONVERSION) {
+    return false;
+  }
+  if (!Util::IsValidUtf8(key) || !Util::IsValidUtf8(value) ||
+      Util::CharsLen(key) > kMaxKeyChars ||
+      Util::CharsLen(value) > kMaxValueChars ||
+      value.size() > kMaxValueBytes) {
+    return false;
+  }
+
+  // First ask Mozc's reverse converter for a native surface segmentation.
+  // Reverse conversion can expose multiple reading candidates for one surface.
+  // Candidate rank is useful evidence, but it must not choose a persistent
+  // boundary when another exact reading-boundary explanation also round-trips.
+  Segments reverse_segments;
+  if (!StartReverseConversion(&reverse_segments, value)) {
+    return false;
+  }
+  const size_t reverse_size = reverse_segments.conversion_segments_size();
+  if (reverse_size == 0 || reverse_size > kMaxSegments) {
+    return false;
+  }
+
+  std::vector<std::string> native_values;
+  native_values.reserve(reverse_size);
+  std::string reconstructed_value;
+  for (const Segment& reverse_segment : reverse_segments.conversion_segments()) {
+    if (reverse_segment.key().empty() ||
+        reverse_segment.candidates_size() == 0 ||
+        reverse_segment.candidate(0).value.empty()) {
+      return false;
+    }
+
+    const std::string native_value(reverse_segment.key());
+    // LearnExternalConversionSegments strips ASCII whitespace at segment
+    // boundaries.  A reverse surface containing such whitespace cannot be
+    // represented by the downstream learning contract without mutation.
+    if (absl::StripAsciiWhitespace(native_value).size() !=
+        native_value.size()) {
+      return false;
+    }
+    reconstructed_value.append(native_value);
+    native_values.push_back(native_value);
+  }
+  if (reconstructed_value != value) {
+    return false;
+  }
+
+  ConversionRequest::Options probe_options = request.options();
+  probe_options.request_type = ConversionRequest::CONVERSION;
+  probe_options.enable_user_history_for_conversion = false;
+  probe_options.max_conversion_candidates_size =
+      std::max<int>(64, probe_options.max_conversion_candidates_size);
+
+  // Validates one complete reading path by forcing its boundaries onto the
+  // original key and asking the immutable converter to reproduce every reverse
+  // surface exactly.  This probe has no rewriter / Finish() side effects.
+  auto validate_reading_path =
+      [&](const std::vector<std::string>& native_keys,
+          std::vector<ExternalConversionSegment>* resolved) -> bool {
+    if (resolved == nullptr || native_keys.size() != reverse_size) {
+      return false;
+    }
+    resolved->clear();
+
+    std::vector<uint8_t> native_key_sizes;
+    native_key_sizes.reserve(reverse_size);
+    std::string reconstructed_key;
+    for (const std::string& native_key : native_keys) {
+      if (native_key.empty() || !Util::IsValidUtf8(native_key) ||
+          absl::StripAsciiWhitespace(native_key).size() != native_key.size()) {
+        return false;
+      }
+      const size_t key_chars = Util::CharsLen(native_key);
+      if (key_chars == 0 || key_chars > std::numeric_limits<uint8_t>::max()) {
+        return false;
+      }
+      reconstructed_key.append(native_key);
+      native_key_sizes.push_back(static_cast<uint8_t>(key_chars));
+    }
+    if (reconstructed_key != key) {
+      return false;
+    }
+
+    Segments forward_segments;
+    forward_segments.InitForConvert(key);
+    if (!forward_segments.Resize(0, native_key_sizes)) {
+      return false;
+    }
+    if (!immutable_converter_->Convert(probe_options, &forward_segments) ||
+        forward_segments.conversion_segments_size() != reverse_size) {
+      return false;
+    }
+
+    std::vector<ExternalConversionSegment> candidate_resolution;
+    candidate_resolution.reserve(reverse_size);
+    for (size_t i = 0; i < reverse_size; ++i) {
+      const Segment& forward_segment = forward_segments.conversion_segment(i);
+      if (forward_segment.key() != native_keys[i]) {
+        return false;
+      }
+
+      size_t matched_index = forward_segment.candidates_size();
+      for (size_t j = 0; j < forward_segment.candidates_size(); ++j) {
+        if (forward_segment.candidate(j).value == native_values[i]) {
+          matched_index = j;
+          break;
+        }
+      }
+      if (matched_index == forward_segment.candidates_size()) {
+        return false;
+      }
+
+      candidate_resolution.push_back(
+          {native_keys[i], native_values[i], matched_index != 0});
+    }
+
+    *resolved = std::move(candidate_resolution);
+    return true;
+  };
+
+  // Enumerate every byte-exact reverse-reading path, including candidate(0).
+  // The resolver is allowed to persist a boundary only when forward verification
+  // leaves exactly one explanation.  This intentionally gives up the old
+  // candidate(0) fast return in exchange for fail-closed boundary learning.
+
+  struct ReverseReadingPath {
+    size_t key_bytes = 0;
+    std::vector<std::string> readings;
+  };
+
+  std::vector<ReverseReadingPath> paths(1);
+  paths.front().readings.reserve(reverse_size);
+
+  // Search only reading candidates that are byte-exact prefixes of the
+  // original Zenz key.  Duplicate readings inside one reverse segment are
+  // collapsed so duplicate dictionary candidates do not create fake
+  // ambiguity.  Search explosion fails closed.
+  for (size_t segment_index = 0; segment_index < reverse_size;
+       ++segment_index) {
+    const Segment& reverse_segment =
+        reverse_segments.conversion_segment(segment_index);
+    std::vector<ReverseReadingPath> next_paths;
+
+    for (const ReverseReadingPath& path : paths) {
+      std::vector<absl::string_view> seen_readings;
+      seen_readings.reserve(reverse_segment.candidates_size());
+
+      for (const auto& candidate_ptr : reverse_segment.candidates()) {
+        const Candidate& candidate = *candidate_ptr;
+        const absl::string_view reading = candidate.value;
+        if (reading.empty() ||
+            std::find(seen_readings.begin(), seen_readings.end(), reading) !=
+                seen_readings.end()) {
+          continue;
+        }
+        seen_readings.push_back(reading);
+
+        if (absl::StripAsciiWhitespace(reading).size() != reading.size() ||
+            path.key_bytes + reading.size() > key.size() ||
+            key.substr(path.key_bytes, reading.size()) != reading) {
+          continue;
+        }
+
+        const size_t next_key_bytes = path.key_bytes + reading.size();
+        const bool is_last = segment_index + 1 == reverse_size;
+        if ((is_last && next_key_bytes != key.size()) ||
+            (!is_last && next_key_bytes == key.size())) {
+          continue;
+        }
+
+        if (next_paths.size() >= kMaxReverseReadingPaths) {
+          return false;
+        }
+        ReverseReadingPath next = path;
+        next.key_bytes = next_key_bytes;
+        next.readings.emplace_back(reading);
+        next_paths.push_back(std::move(next));
+      }
+    }
+
+    if (next_paths.empty()) {
+      return false;
+    }
+    paths = std::move(next_paths);
+  }
+
+  // Do not guess between multiple reading-boundary explanations, regardless of
+  // reverse-candidate rank.  Forward verification may eliminate false reverse
+  // candidates; exactly one verified path is required.
+  std::vector<ExternalConversionSegment> unique_resolution;
+  bool found_resolution = false;
+  for (const ReverseReadingPath& path : paths) {
+    if (path.key_bytes != key.size()) {
+      continue;
+    }
+    std::vector<ExternalConversionSegment> candidate_resolution;
+    if (!validate_reading_path(path.readings, &candidate_resolution)) {
+      continue;
+    }
+    if (found_resolution) {
+      segments->clear();
+      return false;
+    }
+    unique_resolution = std::move(candidate_resolution);
+    found_resolution = true;
+  }
+
+  if (!found_resolution) {
+    return false;
+  }
+  *segments = std::move(unique_resolution);
+  return true;
+}
+
+bool Converter::EvaluateExternalConversionSegments(
+    const ConversionRequest& request,
+    absl::Span<const ExternalConversionSegment> segments,
+    std::vector<ExternalConversionSegment>* evaluated_segments) const {
+  if (evaluated_segments == nullptr) {
+    return false;
+  }
+  evaluated_segments->clear();
+
+  constexpr size_t kMaxSegments = 16;
+  constexpr size_t kMaxTotalKeyChars = 256;
+  constexpr size_t kMaxTotalValueChars = 256;
+  constexpr size_t kMaxTotalValueBytes = 1024;
+
+  if (segments.empty() || segments.size() > kMaxSegments ||
+      request.request_type() != ConversionRequest::CONVERSION) {
+    return false;
+  }
+
+  std::string total_key;
+  std::string total_value;
+  std::vector<uint8_t> key_sizes;
+  key_sizes.reserve(segments.size());
+
+  for (const ExternalConversionSegment& segment : segments) {
+    if (segment.key.empty() || segment.value.empty() ||
+        !Util::IsValidUtf8(segment.key) || !Util::IsValidUtf8(segment.value)) {
+      return false;
+    }
+
+    // Keep the exact boundary contract. Trimming here would make the probe
+    // evaluate a different segment sequence than the one observed by Session.
+    if (absl::StripAsciiWhitespace(segment.key).size() != segment.key.size() ||
+        absl::StripAsciiWhitespace(segment.value).size() !=
+            segment.value.size()) {
+      return false;
+    }
+
+    const size_t key_chars = Util::CharsLen(segment.key);
+    if (key_chars == 0 || key_chars > std::numeric_limits<uint8_t>::max()) {
+      return false;
+    }
+
+    total_key.append(segment.key);
+    total_value.append(segment.value);
+    key_sizes.push_back(static_cast<uint8_t>(key_chars));
+  }
+
+  if (Util::CharsLen(total_key) > kMaxTotalKeyChars ||
+      Util::CharsLen(total_value) > kMaxTotalValueChars ||
+      total_value.size() > kMaxTotalValueBytes) {
+    return false;
+  }
+
+  Segments probe_segments;
+  probe_segments.InitForConvert(total_key);
+  if (!probe_segments.Resize(0, key_sizes)) {
+    return false;
+  }
+
+  ConversionRequest::Options probe_options = request.options();
+  probe_options.request_type = ConversionRequest::CONVERSION;
+  probe_options.enable_user_history_for_conversion = false;
+  probe_options.max_conversion_candidates_size =
+      std::max<int>(64, probe_options.max_conversion_candidates_size);
+
+  // Use the immutable converter so this probe cannot invoke a history rewriter
+  // or a Finish() hook. The supplied Resize() boundaries are the only
+  // segmentation under evaluation.
+  if (!immutable_converter_->Convert(probe_options, &probe_segments) ||
+      probe_segments.conversion_segments_size() != segments.size()) {
+    return false;
+  }
+
+  std::vector<ExternalConversionSegment> evaluated;
+  evaluated.reserve(segments.size());
+  for (size_t i = 0; i < segments.size(); ++i) {
+    const Segment& probe_segment = probe_segments.conversion_segment(i);
+    const ExternalConversionSegment& expected = segments[i];
+
+    if (probe_segment.key() != expected.key) {
+      return false;
+    }
+
+    size_t matched_index = probe_segment.candidates_size();
+    for (size_t j = 0; j < probe_segment.candidates_size(); ++j) {
+      if (probe_segment.candidate(j).value == expected.value) {
+        matched_index = j;
+        break;
+      }
+    }
+    if (matched_index == probe_segment.candidates_size()) {
+      return false;
+    }
+
+    evaluated.push_back(
+        {expected.key, expected.value, matched_index != 0, false});
+  }
+
+  *evaluated_segments = std::move(evaluated);
   return true;
 }
 
@@ -613,6 +1461,15 @@ void Converter::RevertConversion(Segments* segments) const {
   segments->set_revert_id(0);
 }
 
+void Converter::DiscardConversionRevertState(Segments* segments) const {
+  if (segments == nullptr || segments->revert_id() == 0) {
+    return;
+  }
+  rewriter_->DiscardRevert(*segments);
+  predictor_->DiscardRevert(segments->revert_id());
+  segments->set_revert_id(0);
+}
+
 bool Converter::DeleteCandidateFromHistory(const Segments& segments,
                                            size_t segment_index,
                                            int candidate_index) const {
@@ -626,6 +1483,11 @@ bool Converter::DeleteCandidateFromHistory(const Segments& segments,
   result |= predictor_->ClearHistoryEntry(candidate.key, candidate.value);
 
   return result;
+}
+
+bool Converter::AddSuppressionEntry(absl::string_view key,
+                                    absl::string_view value) const {
+  return user_dictionary_.AddSuppressionEntry(key, value);
 }
 
 bool Converter::ReconstructHistory(
@@ -704,10 +1566,12 @@ bool Converter::CommitSegments(Segments* segments,
     // 2nd argument must always be 0 because on each iteration
     // 1st segment is submitted.
     // Using 0 means submitting 1st segment iteratively.
+    const size_t raw_segment_index = GetSegmentIndex(segments, 0);
     if (!CommitSegmentValueInternal(segments, 0, candidate_index[i],
                                     Segment::SUBMITTED)) {
       return false;
     }
+    MergeMultiSegmentCandidate(segments, raw_segment_index);
   }
   return true;
 }
@@ -769,14 +1633,298 @@ void Converter::CommitContext(const ConversionRequest& request) const {
 
 void Converter::ApplyConversion(Segments* segments,
                                 const ConversionRequest& request) const {
-  if (!immutable_converter_->Convert(request, segments)) {
+  if (!immutable_converter_->Convert(request.options(), segments)) {
     // Conversion can fail for keys like "12". Even in such cases, rewriters
     // (e.g., number and variant rewriters) can populate some candidates.
     // Therefore, this is not an error.
     MOZC_VLOG(1) << "Convert failed for key: " << segments->segment(0).key();
   }
 
+  MaybeApplyPredictionToConversion(request, segments);
   ApplyPostProcessing(request, segments);
+}
+
+bool Converter::ResizeSegmentsByResult(const ConversionRequest& request,
+                                       const prediction::Result& result,
+                                       Segments* segments) const {
+  std::vector<uint8_t> new_sizes;
+  for (const auto& inner_seg : result.inner_segments()) {
+    const size_t char_len = Util::CharsLen(inner_seg.GetKey());
+    if (char_len == 0 || char_len > std::numeric_limits<uint8_t>::max()) {
+      return false;
+    }
+    new_sizes.push_back(static_cast<uint8_t>(char_len));
+  }
+
+  bool need_resize = (segments->conversion_segments_size() < new_sizes.size());
+  if (!need_resize) {
+    for (size_t i = 0; i < new_sizes.size(); ++i) {
+      if (segments->conversion_segment(i).key_len() != new_sizes[i]) {
+        need_resize = true;
+        break;
+      }
+    }
+  }
+
+  if (need_resize) {
+    if (!ResizeSegments(segments, request, 0, new_sizes)) {
+      LOG(WARNING) << "Failed to resize or convert segments for result match";
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void Converter::ApplyResultToSegments(const prediction::Result& result,
+                                      size_t target_pos,
+                                      uint32_t additional_attributes,
+                                      Segments* segments) const {
+  if (result.inner_segments().size() != segments->conversion_segments_size()) {
+    return;
+  }
+
+  size_t seg_idx = 0;
+  size_t inner_idx = 0;
+  const size_t inner_segment_count = result.inner_segments().size();
+  for (const auto& inner_seg : result.inner_segments()) {
+    if (seg_idx >= segments->conversion_segments_size()) break;
+    const size_t current_seg_idx = seg_idx++;
+    Segment* segment = segments->mutable_conversion_segment(current_seg_idx);
+    const uint8_t ranking_constraints =
+        (result.inner_segment_ranking_constraints.size() ==
+         inner_segment_count)
+            ? result.inner_segment_ranking_constraints[inner_idx]
+            : result.ranking_constraints;
+    ++inner_idx;
+
+    // Find existing candidate with matching value.
+    int existing_index = -1;
+    for (int i = 0; i < segment->candidates_size(); ++i) {
+      if (segment->candidate(i).value == inner_seg.GetValue()) {
+        existing_index = i;
+        break;
+      }
+    }
+
+    const size_t pos = std::min(
+        target_pos, static_cast<size_t>(segment->candidates_size() - 1));
+    if (existing_index >= 0) {
+      segment->move_candidate(existing_index, pos);
+      Candidate* cand = segment->mutable_candidate(pos);
+      cand->cost = std::min(cand->cost, result.cost);
+      cand->wcost = std::min(cand->wcost, result.wcost);
+      cand->attributes |= (result.attributes | additional_attributes);
+      // The existing candidate and `result` are alternative derivations of
+      // the same surface.  Keep NO_TOP only when both derivations require it.
+      // This preserves the explicit non-EMOTICON user-dictionary escape hatch.
+      // Mozkey IbG: PROJECT_DICTIONARY is provenance, not an ordering
+      // constraint, so it is kept when either derivation carries it.
+      const uint8_t project_provenance =
+          (cand->ranking_constraints | ranking_constraints) &
+          RankingConstraint::PROJECT_DICTIONARY;
+      cand->ranking_constraints =
+          (cand->ranking_constraints & ranking_constraints) |
+          project_provenance;
+      if (current_seg_idx < result.inner_segment_boundary.size()) {
+        cand->inner_segment_boundary = {
+            result.inner_segment_boundary[current_seg_idx]};
+      }
+    } else {
+      Candidate* cand = (pos == 0) ? segment->push_front_candidate()
+                                   : segment->insert_candidate(pos);
+      strings::Assign(cand->key, inner_seg.GetKey());
+      strings::Assign(cand->value, inner_seg.GetValue());
+      strings::Assign(cand->content_key, inner_seg.GetContentKey());
+      strings::Assign(cand->content_value, inner_seg.GetContentValue());
+      cand->lid = result.lid;
+      cand->rid = result.rid;
+      cand->wcost = result.wcost;
+      cand->cost = result.cost;
+      cand->attributes = (result.attributes | additional_attributes);
+      cand->ranking_constraints = ranking_constraints;
+      cand->consumed_key_size = result.consumed_key_size;
+      if (current_seg_idx < result.inner_segment_boundary.size()) {
+        cand->inner_segment_boundary = {
+            result.inner_segment_boundary[current_seg_idx]};
+      }
+    }
+  }
+}
+
+std::vector<prediction::Result> Converter::PredictForConversion(
+    const ConversionRequest& request, const Segments& segments,
+    const prediction::Result& default_result) const {
+  // Build ConversionRequest with history_result extracted from segments,
+  // consistent with PredictForRequestWithSegments.
+  const prediction::Result history_result = HistorySegmentsToResult(segments);
+  const ConversionRequest conv_req = ConversionRequestBuilder()
+                                         .SetConversionRequestView(request)
+                                         .SetHistoryResultView(history_result)
+                                         .Build();
+
+  // 1. Run SupplementalModel (PostCorrect).
+  // Stop applying post correction when handwriting mode, consistent with
+  // DictionaryPredictor::MaybeApplyPostCorrection.
+  // For single-segment conversion, passes up to 5 N-best candidates so that
+  // supplemental model works consistently with SUGGESTION mode.
+  // TODO(taku): Extend multi-segment conversion to also pass N-best candidates
+  // instead of only the single top composite result.
+  std::vector<prediction::Result> pc_results =
+      ConversionSegmentsToResults(segments);
+  if (!request_util::IsHandwriting(conv_req) &&
+      modules_->GetSupplementalModel().IsAvailable() &&
+      RewriterInterface::DisableLegacyRewriter(
+          conv_req, RewriterInterface::kDisableCollocation)) {
+    modules_->GetSupplementalModel().PostCorrect(conv_req, pc_results);
+  }
+
+  // 2. Run UserHistoryPredictor.
+  std::vector<prediction::Result> user_history_results;
+  constexpr int kLegacyHistoryMode =
+      RewriterInterface::kDisableUserSegmentHistory |
+      RewriterInterface::kDisableUserBoundaryHistory;
+  if (predictor_ &&
+      RewriterInterface::DisableLegacyRewriter(conv_req, kLegacyHistoryMode)) {
+    user_history_results = predictor_->Convert(conv_req);
+  }
+
+  const bool is_default_multi_segment =
+      (segments.conversion_segments_size() > 1);
+  const bool enable_multi_segment = request.request()
+                                        .decoder_experiment_params()
+                                        .enable_multi_segment_candidate();
+
+  // Fail-safe for legacy single-segment resizing (!enable_multi_segment):
+  // Older history entries lack inner_segment boundary information, indicated
+  // by Attribute::USER_HISTORY_EMPTY_INNER_SEGMENT_BOUNDARY.
+  // When enable_multi_segment is false and top_result is a single-segment
+  // prediction without boundary info, resizing a multi-segment default Viterbi
+  // would corrupt the structure.
+  // When enable_multi_segment is true, multi-segment alignment handles
+  // single-segment candidates as spanning multi-segment entries without
+  // resizing.
+  if (!user_history_results.empty()) {
+    const prediction::Result& history_top = user_history_results.front();
+    const bool is_history_multi_segment =
+        (history_top.inner_segment_boundary.size() > 1);
+    const bool missing_boundary_error =
+        !enable_multi_segment && !is_history_multi_segment &&
+        is_default_multi_segment &&
+        (history_top.attributes &
+         Attribute::USER_HISTORY_EMPTY_INNER_SEGMENT_BOUNDARY);
+    if (missing_boundary_error || history_top.key.empty() ||
+        history_top.value.empty()) {
+      user_history_results.clear();
+    }
+  }
+
+  // 3. Merge results: user_history_results -> pc_results.
+  return MergePredictionResults(std::move(user_history_results),
+                                std::move(pc_results));
+}
+
+void Converter::PopulatePredictionResultsToSegments(
+    const ConversionRequest& request, const prediction::Result& default_result,
+    absl::Span<const prediction::Result> results, Segments* segments) const {
+  if (results.empty()) {
+    return;
+  }
+
+  const bool enable_multi_segment = request.request()
+                                        .decoder_experiment_params()
+                                        .enable_multi_segment_candidate();
+
+  const prediction::Result& top_result = results.front();
+  const bool is_default_multi_segment =
+      (segments->conversion_segments_size() > 1);
+  const bool top_is_same_as_default =
+      (top_result.value == default_result.value &&
+       top_result.inner_segment_boundary ==
+           default_result.inner_segment_boundary);
+
+  if (!enable_multi_segment) {
+    // If there is no change in the top candidate and the conversion has
+    // multiple segments, do nothing.
+    if (top_is_same_as_default && is_default_multi_segment) {
+      return;
+    }
+
+    // 1. Resize segments if needed to match top_result's inner segment
+    // boundaries.
+    if (!ResizeSegmentsByResult(request, top_result, segments)) {
+      return;
+    }
+
+    // 2. Apply results across conversion segments.
+    // For single-segment conversion, apply up to 5 results.
+    // If the 1st candidate is identical to the default result, apply starting
+    // from candidate position 1.
+    const bool is_single_segment = (!is_default_multi_segment &&
+                                    segments->conversion_segments_size() == 1);
+    const size_t start_idx = top_is_same_as_default ? 1 : 0;
+
+    if (is_single_segment) {
+      const size_t max_results = std::min<size_t>(results.size(), 5);
+      for (size_t i = start_idx; i < max_results; ++i) {
+        const prediction::Result& res = results[i];
+        if (res.key.empty() || res.value.empty()) continue;
+        ApplyResultToSegments(res, /*target_pos=*/i,
+                              Attribute::DEFAULT_ATTRIBUTE, segments);
+      }
+    } else if (!top_is_same_as_default) {
+      // Multi-segment conversion: only apply top_result when it modifies
+      // default.
+      ApplyResultToSegments(top_result, /*target_pos=*/0,
+                            Attribute::DEFAULT_ATTRIBUTE, segments);
+    }
+    return;
+  }
+
+  // When enable_multi_segment is true:
+  // Do NOT resize segments. Apply up to 5 results with multi-segment alignment.
+  const size_t start_idx = top_is_same_as_default ? 1 : 0;
+  const size_t max_results = std::min<size_t>(results.size(), 5);
+  for (size_t i = start_idx; i < max_results; ++i) {
+    ApplyResultToSegmentsMultiSegment(results[i], /*target_pos=*/i, *segments);
+  }
+}
+
+void Converter::MaybeApplyPredictionToConversion(
+    const ConversionRequest& request, Segments* segments) const {
+  // NOTE: Skip when `used_in_predictor_realtime_conversion` is true to prevent
+  // PostCorrect and UserHistoryPredictor from being called twice per
+  // keystroke (once inside RealtimeDecoder's nested StartConversion call and
+  // once in DictionaryPredictor).
+  // TODO(taku): This is a temporary workaround during the migration period;
+  // remove once nested Converter::StartConversion in RealtimeDecoder is
+  // deprecated and removed.
+  if (segments == nullptr || segments->conversion_segments_size() == 0 ||
+      segments->resized() ||
+      request.options().used_in_predictor_realtime_conversion) {
+    return;
+  }
+
+  // 1. Build a single Result from the top candidates of default conversion
+  // segments.
+  const std::optional<prediction::Result> default_result =
+      ConversionSegmentsToResult(segments->conversion_segments());
+  if (!default_result.has_value()) {
+    return;
+  }
+
+  // 2. Generate and merge prediction results from UserHistoryPredictor and
+  // SupplementalModel (PostCorrection).
+  const std::vector<prediction::Result> results =
+      PredictForConversion(request, *segments, *default_result);
+  if (results.empty()) {
+    return;
+  }
+
+  // 3. Populate prediction results into conversion segments (including segment
+  // resizing if needed).
+  PopulatePredictionResultsToSegments(request, *default_result, results,
+                                      segments);
 }
 
 void Converter::CompletePosIds(Candidate* candidate) const {
@@ -817,7 +1965,7 @@ void Converter::CompletePosIds(Candidate* candidate) const {
             })
             .Build();
     // In order to complete PosIds, call ImmutableConverter again.
-    if (!immutable_converter_->Convert(request, &segments)) {
+    if (!immutable_converter_->Convert(request.options(), &segments)) {
       LOG(ERROR) << "ImmutableConverter::Convert() failed";
       return;
     }
@@ -861,30 +2009,31 @@ void Converter::RewriteAndSuppressCandidates(const ConversionRequest& request,
   }
 
   // 2. Rewrite candidates in each segment.
-  if (!rewriter_->Rewrite(request, segments)) {
-    return;
-  }
+  // Suppression below is a final converter invariant and must not depend on
+  // whether the rewriter chain reports that it modified the segments.
+  rewriter_->Rewrite(request, segments);
 
   // 3. Suppress candidates in each segment.
-  // Optimization for common use case: Since most of users don't use suppression
-  // dictionary and we can skip the subsequent check.
-  if (!user_dictionary_.HasSuppressedEntries()) {
-    return;
-  }
   // Although the suppression dictionary is applied at node-level in dictionary
   // layer, there's possibility that bad words are generated from multiple nodes
-  // and by rewriters. Hence, we need to apply it again at the last stage of
-  // converter.
-  for (Segment& segment : segments->conversion_segments()) {
-    for (size_t j = 0; j < segment.candidates_size();) {
-      const Candidate& cand = segment.candidate(j);
-      if (user_dictionary_.IsSuppressedEntry(cand.key, cand.value)) {
-        segment.erase_candidate(j);
-      } else {
-        ++j;
+  // and by rewriters. Hence, apply it again at the last stage of converter when
+  // suppression entries exist.
+  if (user_dictionary_.HasSuppressedEntries()) {
+    for (Segment& segment : segments->conversion_segments()) {
+      for (size_t j = 0; j < segment.candidates_size();) {
+        const Candidate& cand = segment.candidate(j);
+        if (user_dictionary_.IsSuppressedEntry(cand.key, cand.value)) {
+          segment.erase_candidate(j);
+        } else {
+          ++j;
+        }
       }
     }
   }
+
+  // 4. Hard final-ranking invariants must run after every ordinary rewriter,
+  // history reranking path, prediction-to-conversion merge, and suppression.
+  EnforceCandidateRankingConstraints(request, segments);
 }
 
 void Converter::TrimCandidates(const ConversionRequest& request,
@@ -1005,143 +2154,23 @@ bool Converter::PredictForRequestWithSegments(const ConversionRequest& request,
   DCHECK(segments);
   DCHECK(predictor_);
 
-  const prediction::Result history_result = MakeHistoryResult(*segments);
+  const prediction::Result history_result = HistorySegmentsToResult(*segments);
 
   const ConversionRequest conv_req = ConversionRequestBuilder()
                                          .SetConversionRequestView(request)
                                          .SetHistoryResultView(history_result)
                                          .Build();
 
-  const std::vector<prediction::Result> results = predictor_->Predict(conv_req);
+  std::vector<prediction::Result> results = predictor_->Predict(conv_req);
 
   Segment* segment = segments->mutable_conversion_segment(0);
   DCHECK(segment);
 
-  // TODO(taku): Make utility functions to convert
-  // Segments <-> history_result, committed_results.
-
-  for (const prediction::Result& result : results) {
-    Candidate* candidate = segment->add_candidate();
-    strings::Assign(candidate->key, result.key);
-    strings::Assign(candidate->value, result.value);
-    strings::Assign(candidate->description, result.description);
-    strings::Assign(candidate->display_value, result.display_value);
-    candidate->lid = result.lid;
-    candidate->rid = result.rid;
-    candidate->wcost = result.wcost;
-    candidate->cost = result.cost;
-    candidate->attributes = result.candidate_attributes;
-    candidate->consumed_key_size = result.consumed_key_size;
-    candidate->inner_segment_boundary = result.inner_segment_boundary;
-
-    // When inner_segment_boundary is available, generate
-    // content_key and content_value from the boundary info.
-    std::tie(candidate->content_key, candidate->content_value) =
-        result.inner_segments().GetMergedContentKeyAndValue();
-#ifndef NDEBUG
-    absl::StrAppend(&candidate->log, "\n", result.log);
-#endif  // NDEBUG
+  for (prediction::Result& result : results) {
+    PopulateCandidateFromResult(std::move(result), segment->add_candidate());
   }
 
   return !results.empty();
-}
-
-// static
-std::vector<prediction::Result> Converter::MakeLearningResults(
-    const Segments& segments) {
-  std::vector<prediction::Result> results;
-
-  if (segments.conversion_segments_size() == 0) {
-    return results;
-  }
-
-  // - segments_size = 1: Populates the nbest candidates to result.
-  if (segments.conversion_segments_size() == 1) {
-    // Populates only top 5 results.
-    // See UserHistoryPredictor::MaybeRemoveUnselectedHistory
-    constexpr int kMaxHistorySize = 5;
-    for (const auto& candidate : segments.conversion_segment(0).candidates()) {
-      prediction::Result result;
-      strings::Assign(result.key, candidate->key);
-      strings::Assign(result.value, candidate->value);
-      strings::Assign(result.description, candidate->description);
-      strings::Assign(result.display_value, candidate->display_value);
-      result.lid = candidate->lid;
-      result.rid = candidate->rid;
-      result.wcost = candidate->wcost;
-      result.cost = candidate->cost;
-      result.candidate_attributes = candidate->attributes;
-      result.consumed_key_size = candidate->consumed_key_size;
-      result.inner_segment_boundary = candidate->inner_segment_boundary;
-      // Force to set inner_segment_boundary from key/content_key.
-      if (result.inner_segment_boundary.empty()) {
-        result.inner_segment_boundary = BuildInnerSegmentBoundary(
-            {{candidate->key.size(), candidate->value.size(),
-              candidate->content_key.size(), candidate->content_value.size()}},
-            result.key, result.value);
-      }
-      results.emplace_back(std::move(result));
-      if (results.size() >= kMaxHistorySize) break;
-    }
-
-    return results;
-  }
-
-  // segments_size > 1: Populates the top candidate to result by
-  //                    concatenating the segments.
-  {
-    prediction::Result result;
-    InnerSegmentBoundaryBuilder builder;
-    for (const auto& segment : segments.conversion_segments()) {
-      if (segment.candidates_size() == 0) return {};
-      const Candidate& candidate = segment.candidate(0);
-      absl::StrAppend(&result.key, candidate.key);
-      absl::StrAppend(&result.value, candidate.value);
-      result.candidate_attributes |= candidate.attributes;
-      result.wcost += candidate.wcost;
-      result.cost += candidate.cost;
-      builder.Add(candidate.key.size(), candidate.value.size(),
-                  candidate.content_key.size(), candidate.content_value.size());
-    }
-    result.inner_segment_boundary = builder.Build(result.key, result.value);
-    result.lid = segments.conversion_segments().front().candidate(0).lid;
-    result.rid = segments.conversion_segments().back().candidate(0).rid;
-
-    results.emplace_back(std::move(result));
-  }
-
-  return results;
-}
-
-// static
-prediction::Result Converter::MakeHistoryResult(const Segments& segments) {
-  prediction::Result result;
-
-  if (segments.history_segments_size() == 0) {
-    return result;
-  }
-
-  InnerSegmentBoundaryBuilder builder;
-  for (const auto& segment : segments.history_segments()) {
-    if (segment.candidates_size() == 0) {
-      return prediction::Result::DefaultResult();  // Returns an empty result.
-    }
-    const Candidate& candidate = segment.candidate(0);
-    absl::StrAppend(&result.key, candidate.key);
-    absl::StrAppend(&result.value, candidate.value);
-    result.candidate_attributes |= candidate.attributes;
-    builder.Add(candidate.key.size(), candidate.value.size(),
-                candidate.content_key.size(), candidate.content_value.size());
-  }
-
-  result.inner_segment_boundary = builder.Build(result.key, result.value);
-
-  const int size = segments.history_segments_size();
-  result.lid = segments.history_segment(0).candidate(0).lid;
-  result.rid = segments.history_segment(size - 1).candidate(0).rid;
-  result.cost = segments.history_segment(size - 1).candidate(0).cost;
-
-  return result;
 }
 
 }  // namespace converter

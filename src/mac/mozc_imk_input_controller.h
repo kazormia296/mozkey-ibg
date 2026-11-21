@@ -65,6 +65,9 @@
    * should be -1. */
   int cursorPosition_;
 
+  /** True when AppKit should choose the native marked-text selection. */
+  bool useUnspecifiedSelectionRange_;
+
   /** |mode_| stores the current input mode (Direct or conversion). */
   mozc::commands::CompositionMode mode_;
 
@@ -88,9 +91,6 @@
   bool grimodexSecureInputInitialized_;
   bool grimodexActive_;
 
-  /** Test-only override: -1 uses Carbon, 0 means non-secure, and 1 means secure. */
-  NSInteger secureInputOverrideForTest_;
-
   NSRange replacementRange_;
 
   /** |lastKeyDownTime_| and |lastKeyCode_| are used to handle double tapping. */
@@ -103,15 +103,22 @@
   /** |rendererCommand_| stores the command sent to |mozcRenderer_| */
   mozc::commands::RendererCommand rendererCommand_;
 
+  /** Writing-direction snapshot reported by InputMethodKit for the active composition. */
+  bool hasWritingDirection_;
+  bool verticalWriting_;
+
   /** Frozen left edge of the live-conversion ruby anchor while composition stays active. */
   int liveConversionAnchorLeft_;
   bool hasLiveConversionAnchorLeft_;
 
   /** True when the current config enables live conversion. */
   bool useLiveConversion_;
-
-  /** True after explicit conversion request so candidate UI may be shown. */
-  bool allowCandidateWindowForLiveConversion_;
+  /** True when the current config enables the independent status overlay. */
+  bool useConversionStatusIndicator_;
+  /** True when a Zenz context-length preflight is useful for this config. */
+  bool useZenzContextAcquisition_;
+  /** -1 uses Carbon; 0/1 are deterministic test overrides. */
+  int secureEventInputStateForTest_;
 
   /** Latest delayed callback requested by Output::Callback. */
   std::unique_ptr<mozc::commands::SessionCommand> delayedSessionCommand_;
@@ -144,8 +151,8 @@
 @property(readwrite, assign) NSRange replacementRange;
 @property(readwrite, retain) id imkClientForTest;
 @property(readwrite, assign) bool useLiveConversionForTest;
-@property(readwrite, assign) bool allowCandidateWindowForLiveConversionForTest;
-@property(readwrite, assign) NSInteger secureInputOverrideForTest;
+@property(readwrite, assign) bool useZenzContextAcquisitionForTest;
+@property(readwrite, assign) int secureEventInputStateForTest;
 @property(readonly) uint64_t grimodexFocusEpochForTest;
 
 /** Sets the RendererReceiver used by all instances of the controller.
@@ -204,6 +211,10 @@
  * @param preedit The protobuf data representing the composed string.
  */
 - (void)updateComposedString:(const mozc::commands::Preedit *)preedit;
+
+/** Updates the composed string with the display semantics of live conversion. */
+- (void)updateComposedString:(const mozc::commands::Preedit *)preedit
+              liveConversion:(bool)liveConversion;
 
 /** Updates |candidates_| from the result of a key event.
  *
@@ -286,6 +297,12 @@
  * @return YES if context was filled; NO otherwise.
  */
 - (BOOL)fillSurroundingContext:(mozc::commands::Context *)context client:(id<IMKTextInput>)client;
+
+/** Fills bounded Zenz-specific context requested by TEST_SEND_KEY. */
+- (BOOL)fillZenzSurroundingContext:(mozc::commands::Context *)context
+                            client:(id<IMKTextInput>)client
+                   precedingLength:(uint32_t)precedingLength
+                   followingLength:(uint32_t)followingLength;
 
 @end
 

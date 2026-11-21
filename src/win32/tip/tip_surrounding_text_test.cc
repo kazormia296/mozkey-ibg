@@ -29,6 +29,8 @@
 
 #include "win32/tip/tip_surrounding_text.h"
 
+#include <textstor.h>
+
 #include <cstddef>
 #include <string>
 
@@ -39,6 +41,94 @@ namespace mozc {
 namespace win32 {
 namespace tsf {
 namespace {
+
+TEST(TipSurroundingTextInfoTest, DefaultsToNoLegacyImm32Fallback) {
+  const TipSurroundingTextInfo info;
+  EXPECT_FALSE(info.is_private_input_scope);
+  EXPECT_FALSE(info.used_legacy_imm32_fallback);
+}
+
+TEST(TipSurroundingTextUtilTest, ExplicitSelectionNeedsTsfProvenance) {
+  TipSurroundingTextInfo info;
+  EXPECT_FALSE(TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(
+      info));
+
+  // A text string without a verified TSF selection is not sufficient.
+  info.selected_text = L"x";
+  EXPECT_FALSE(TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(
+      info));
+
+  info.has_selected_text = true;
+  EXPECT_TRUE(TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(
+      info));
+
+  info.selected_text = L"xyz";
+  EXPECT_TRUE(TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(
+      info));
+
+  // IMM32 may return an adjacent one-character target with no selection.
+  info.used_legacy_imm32_fallback = true;
+  EXPECT_FALSE(TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(
+      info));
+  info.selected_text = L"x";
+  EXPECT_FALSE(TipSurroundingTextUtil::HasExplicitlySelectedTextForReconversion(
+      info));
+}
+
+TEST(TipSurroundingTextUtilTest, ContainsEmbeddedObject) {
+  EXPECT_FALSE(TipSurroundingTextUtil::ContainsEmbeddedObject(L""));
+  EXPECT_FALSE(TipSurroundingTextUtil::ContainsEmbeddedObject(L"abc"));
+
+  const std::wstring embedded(1, static_cast<wchar_t>(TS_CHAR_EMBEDDED));
+  EXPECT_TRUE(TipSurroundingTextUtil::ContainsEmbeddedObject(embedded));
+  EXPECT_TRUE(
+      TipSurroundingTextUtil::ContainsEmbeddedObject(L"before" + embedded));
+}
+
+TEST(TipSurroundingTextUtilTest, ShouldMoveAnchorForReconversion) {
+  TipSurroundingTextInfo info;
+
+  EXPECT_FALSE(TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+      false, true, info));
+  EXPECT_TRUE(TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+      true, false, info));
+
+  // Failed or unavailable selected-text retrieval must not mutate selection.
+  EXPECT_FALSE(TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+      true, true, info));
+
+  info.has_selected_text = true;
+  EXPECT_FALSE(TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+      true, true, info));
+
+  info.selected_text = L"selected";
+  EXPECT_TRUE(TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+      true, true, info));
+
+  info.selected_text.assign(1, static_cast<wchar_t>(TS_CHAR_EMBEDDED));
+  EXPECT_FALSE(TipSurroundingTextUtil::ShouldMoveAnchorForReconversion(
+      true, true, info));
+}
+
+TEST(TipSurroundingTextUtilTest, ContainsPasswordInputScope) {
+  EXPECT_FALSE(TipSurroundingTextUtil::ContainsPasswordInputScope({}));
+  EXPECT_FALSE(TipSurroundingTextUtil::ContainsPasswordInputScope(
+      std::vector<InputScope>{IS_DEFAULT, IS_URL}));
+  EXPECT_TRUE(TipSurroundingTextUtil::ContainsPasswordInputScope(
+      std::vector<InputScope>{IS_PASSWORD}));
+  EXPECT_TRUE(TipSurroundingTextUtil::ContainsPasswordInputScope(
+      std::vector<InputScope>{IS_URL, IS_PASSWORD, IS_HIRAGANA}));
+}
+
+TEST(TipSurroundingTextUtilTest, ContainsPrivateInputScope) {
+  EXPECT_FALSE(TipSurroundingTextUtil::ContainsPrivateInputScope({}));
+  EXPECT_FALSE(TipSurroundingTextUtil::ContainsPrivateInputScope(
+      std::vector<InputScope>{IS_DEFAULT, IS_URL}));
+  EXPECT_TRUE(TipSurroundingTextUtil::ContainsPrivateInputScope(
+      std::vector<InputScope>{IS_PRIVATE}));
+  EXPECT_TRUE(TipSurroundingTextUtil::ContainsPrivateInputScope(
+      std::vector<InputScope>{IS_URL, IS_PRIVATE, IS_HIRAGANA}));
+}
 
 TEST(TipSurroundingTextUtilTest, MeasureCharactersBackward) {
   {

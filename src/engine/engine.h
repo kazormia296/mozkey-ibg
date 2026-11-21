@@ -31,6 +31,7 @@
 #define MOZC_ENGINE_ENGINE_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -145,7 +146,6 @@ class Engine : public EngineInterface {
 
   DataLoader loader_;
 
-  std::unique_ptr<engine::SupplementalModelInterface> supplemental_model_;
   std::shared_ptr<converter::Converter> converter_;
   std::shared_ptr<ConverterInterface> minimal_converter_;
   std::shared_ptr<dictionary::ProjectDictionaryProviderInterface>
@@ -153,6 +153,7 @@ class Engine : public EngineInterface {
   std::unique_ptr<DataLoader::Response> loader_response_;
   std::unique_ptr<user_dictionary::AsyncUserDictionaryImporter>
       async_user_dictionary_importer_;
+  std::optional<EngineReloadRequest> pending_supplemental_model_request_;
   bool always_wait_for_testing_ = false;
 };
 

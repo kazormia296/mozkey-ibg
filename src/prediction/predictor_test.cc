@@ -159,6 +159,7 @@ class PredictorTestPeer : public testing::TestPeer<Predictor> {
  public:
   explicit PredictorTestPeer(Predictor& predictor)
       : testing::TestPeer<Predictor>(predictor) {}
+  PEER_METHOD(MixCandidates);
   PEER_STATIC_METHOD(DemoteWeakUserHistory);
 };
 
@@ -492,7 +493,7 @@ TEST_F(MixedDecodingPredictorTest, MixCandidates) {
     const std::vector<Result> results =
         predict(std::move(predictor_results), std::move(history_results));
     EXPECT_EQ(results.size(), expected_size);
-    return results[0].candidate_attributes & converter::Attribute::NO_DELETABLE;
+    return results[0].attributes & converter::Attribute::NO_DELETABLE;
   };
 
   {
@@ -535,7 +536,7 @@ TEST_F(MixedDecodingPredictorTest, MixCandidates) {
 
     predictor_results[0].value = "dic_value";
     history_results[0].value = "history_value";
-    history_results[0].types |= prediction::WEAK_USER_HISTORY_PREDICTION;
+    history_results[0].attributes |= prediction::WEAK_USER_HISTORY_PREDICTION;
     std::vector<Result> mixed_results =
         predict(std::move(predictor_results), std::move(history_results));
 
@@ -546,17 +547,19 @@ TEST_F(MixedDecodingPredictorTest, MixCandidates) {
 }
 
 TEST_F(MixedDecodingPredictorTest, DemoteWeakUserHistoryTest) {
+  const ConversionRequest convreq =
+      CreateConversionRequest(ConversionRequest::SUGGESTION);
   // sets WEAK_USER_HISTORY_PREDICTION attributes to
   // the results[index], and call DemoteWeakUserHistory.
-  auto demote = [](absl::Span<const int> index) {
+  auto demote = [&](absl::Span<const int> index) {
     std::vector<Result> results(5);
     for (int i = 0; i < results.size(); ++i) {
       results[i].value = absl::StrCat(i);
     }
     for (const int i : index) {
-      results[i].types |= prediction::WEAK_USER_HISTORY_PREDICTION;
+      results[i].attributes |= prediction::WEAK_USER_HISTORY_PREDICTION;
     }
-    PredictorTestPeer::DemoteWeakUserHistory(absl::MakeSpan(results));
+    PredictorTestPeer::DemoteWeakUserHistory(convreq, absl::MakeSpan(results));
     std::vector<absl::string_view> v;
     for (int i = 0; i < results.size(); ++i) v.emplace_back(results[i].value);
     return absl::StrJoin(v, ",");
@@ -573,6 +576,117 @@ TEST_F(MixedDecodingPredictorTest, DemoteWeakUserHistoryTest) {
   EXPECT_EQ(demote({1}), "0,1,2,3,4");
   EXPECT_EQ(demote({1, 2}), "0,1,2,3,4");
   EXPECT_EQ(demote({1, 2, 3}), "0,1,2,3,4");
+}
+
+TEST_F(MixedDecodingPredictorTest, MixCandidatesWithWeakUserHistoryTest) {
+  auto predictor = std::make_unique<Predictor>(
+      *modules_, std::make_unique<NullPredictor>(true),
+      std::make_unique<NullPredictor>(true));
+  PredictorTestPeer peer(*predictor);
+  // Case 1: Top history candidate is Non-weak ("今日は"), second is Weak
+  // ("今日は言った"). Position 0 is already protected by "今日は", so
+  // "今日は言った" remains at position 1 ahead of dictionary homophones.
+  {
+    composer_->SetPreeditTextForTestOnly("きょうは");
+    const ConversionRequest convreq =
+        CreateConversionRequest(ConversionRequest::SUGGESTION);
+
+    std::vector<Result> history_results(2);
+    history_results[0].key = "きょうは";
+    history_results[0].value = "今日は";
+    history_results[0].attributes |=
+        converter::Attribute::USER_HISTORY_PREDICTION;
+
+    history_results[1].key = "きょうはいった";
+    history_results[1].value = "今日は言った";
+    history_results[1].attributes |=
+        (converter::Attribute::USER_HISTORY_PREDICTION |
+         prediction::WEAK_USER_HISTORY_PREDICTION);
+
+    std::vector<Result> dictionary_results(2);
+    dictionary_results[0].key = "きょうは";
+    dictionary_results[0].value = "教は";
+    dictionary_results[1].key = "きょうは";
+    dictionary_results[1].value = "京は";
+
+    std::vector<Result> results = peer.MixCandidates(
+        convreq, std::move(history_results), std::move(dictionary_results));
+
+    ASSERT_EQ(results.size(), 4);
+    EXPECT_EQ(results[0].value, "今日は");
+    EXPECT_EQ(results[1].value, "今日は言った");
+    EXPECT_EQ(results[2].value, "教は");
+    EXPECT_EQ(results[3].value, "京は");
+  }
+
+  // Case 2: Top history candidate is Weak ("今日は駅に行った"). Only the first
+  // non-weak candidate ("今日は駅に") is promoted to position 0, preserving
+  // "今日は駅に行った" at position 1 ahead of other dictionary homophones.
+  {
+    composer_->SetPreeditTextForTestOnly("きょうはえきに");
+    const ConversionRequest convreq =
+        CreateConversionRequest(ConversionRequest::SUGGESTION);
+
+    std::vector<Result> history_results(1);
+    history_results[0].key = "きょうはえきにいった";
+    history_results[0].value = "今日は駅に行った";
+    history_results[0].attributes |=
+        (converter::Attribute::USER_HISTORY_PREDICTION |
+         prediction::WEAK_USER_HISTORY_PREDICTION);
+
+    std::vector<Result> dictionary_results(2);
+    dictionary_results[0].key = "きょうはえきに";
+    dictionary_results[0].value = "今日は駅に";
+    dictionary_results[1].key = "きょうはえきに";
+    dictionary_results[1].value = "今日は液に";
+
+    std::vector<Result> results = peer.MixCandidates(
+        convreq, std::move(history_results), std::move(dictionary_results));
+
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_EQ(results[0].value, "今日は駅に");
+    EXPECT_EQ(results[1].value, "今日は駅に行った");
+    EXPECT_EQ(results[2].value, "今日は液に");
+  }
+}
+
+TEST_F(MixedDecodingPredictorTest,
+       MixCandidatesFiltersStandaloneWeekdayFromUserHistory) {
+  auto predictor = std::make_unique<Predictor>(
+      *modules_, std::make_unique<NullPredictor>(true),
+      std::make_unique<NullPredictor>(true));
+  PredictorTestPeer peer(*predictor);
+
+  request_->mutable_decoder_experiment_params()
+      ->set_enable_weekday_zero_query_prediction(true);
+  composer_->Reset();
+  context_.set_preceding_text("9/16 (水)");
+  const ConversionRequest convreq =
+      CreateConversionRequest(ConversionRequest::PREDICTION);
+  ASSERT_TRUE(convreq.IsZeroQuerySuggestion());
+
+  std::vector<Result> history_results(2);
+  history_results[0].key = "すい";
+  history_results[0].value = " (水)";
+  history_results[0].attributes |=
+      converter::Attribute::USER_HISTORY_PREDICTION;
+  history_results[1].key = "の";
+  history_results[1].value = "の";
+  history_results[1].attributes |=
+      converter::Attribute::USER_HISTORY_PREDICTION;
+
+  std::vector<Result> dictionary_results(2);
+  dictionary_results[0].key = "すい";
+  dictionary_results[0].value = " (水)";
+  dictionary_results[1].key = "に";
+  dictionary_results[1].value = "に";
+
+  std::vector<Result> results = peer.MixCandidates(
+      convreq, std::move(history_results), std::move(dictionary_results));
+
+  ASSERT_EQ(results.size(), 2);
+  EXPECT_EQ(results[0].value, "の");
+  EXPECT_EQ(results[1].value, "に");
 }
 
 }  // namespace mozc::prediction

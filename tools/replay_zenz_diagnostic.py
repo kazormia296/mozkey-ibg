@@ -301,6 +301,12 @@ def _server_command(
         str(ctx),
         "-t",
         str(threads),
+        # Same execution contract as src/zenz_scorer: one server slot (so the
+        # whole context belongs to that slot) and no global RAM prompt cache.
+        "--parallel",
+        "1",
+        "--cache-ram",
+        "0",
         "--host",
         host,
         "--port",
