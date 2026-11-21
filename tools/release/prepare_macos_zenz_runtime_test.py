@@ -12,10 +12,10 @@ from tools.release import prepare_macos_zenz_runtime as target
 
 class PrepareMacosZenzRuntimeTest(unittest.TestCase):
     def test_pins_source_and_model_digests(self):
-        self.assertEqual(target.LLAMA_CPP_TAG, "b9637")
+        self.assertEqual(target.LLAMA_CPP_TAG, "v1.0.0")
         self.assertEqual(
             target.LLAMA_CPP_ARCHIVE_SHA256,
-            "762283319feb3de30886dc850d42f0e426b06600e7f9639d34e06506597309ca",
+            "3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b",
         )
         self.assertEqual(
             target.NORMALIZED_MODEL_SHA256,

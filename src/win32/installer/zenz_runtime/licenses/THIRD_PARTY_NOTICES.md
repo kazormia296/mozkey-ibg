@@ -32,9 +32,9 @@ This product includes third-party software and model files.
 - Project: ggml-org/llama.cpp
 - Source repository URL: https://github.com/ggml-org/llama.cpp
 - Windows runtime: `llama-server.exe` is built as a static CPU runtime from the
-  official llama.cpp `b9637` source archive (commit
-  `aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3`), pinned by SHA-256
-  `762283319feb3de30886dc850d42f0e426b06600e7f9639d34e06506597309ca`.
+  official llama.cpp `v1.0.0` source archive (commit
+  `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`), pinned by SHA-256
+  `3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b`.
   Separate x64 and ARM64 release inputs are generated and their PE machine,
   CLI contract, file digest, CMake options, and toolchain are recorded in the
   packaged `runtime-manifest.json`. The CPU-only build disables CURL, RPC,
@@ -47,7 +47,7 @@ This product includes third-party software and model files.
 - License: MIT License
 - Linux runtime: Arch/source installs link to a compatible
   distribution-provided `llama-server`. Debian and RPM packages bundle a
-  static CPU-only `llama-server` built from the same pinned b9637 archive and
+  static CPU-only `llama-server` built from the same pinned v1.0.0 archive and
   install the llama.cpp, cpp-httplib, and nlohmann/json MIT notices.
 - macOS runtime: since the sync to upstream Mozkey v1.0.0 the macOS package
   uses upstream Mozkey's Universal (arm64 and x86_64) `llama-server`, built by
@@ -61,7 +61,7 @@ This product includes third-party software and model files.
 ## cpp-httplib
 
 - Project: yhirose/cpp-httplib
-- Version vendored by llama.cpp `b9637`: 0.47.0
+- Version vendored by llama.cpp `v1.0.0`: 0.66.0
 - Source repository URL: https://github.com/yhirose/cpp-httplib
 - License: MIT License
 - Packaged license file: `cpp-httplib-MIT.txt`
@@ -72,7 +72,7 @@ This product includes third-party software and model files.
 ## JSON for Modern C++ (nlohmann/json)
 
 - Project: nlohmann/json
-- Version vendored by llama.cpp `b9637`: 3.12.0
+- Version vendored by llama.cpp `v1.0.0`: 3.12.0
 - Source repository URL: https://github.com/nlohmann/json
 - License: MIT License
 - Packaged license file: `nlohmann-json-MIT.txt`

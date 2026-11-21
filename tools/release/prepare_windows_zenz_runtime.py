@@ -41,13 +41,16 @@ from tools.release import normalize_zenz_gguf  # noqa: E402
 
 
 SCHEMA_VERSION = "mozkey.windows_zenz_runtime.v2"
-LLAMA_CPP_TAG = "b9637"
-LLAMA_CPP_COMMIT = "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3"
+LLAMA_CPP_TAG = "v1.0.0"
+LLAMA_CPP_COMMIT = "b1b770d90d94cad9e9ea5b993bdbc383a522fb28"
+# What llama.cpp derives from `git rev-list --count` for the tagged commit;
+# the source archive carries no git history.
+LLAMA_CPP_BUILD_NUMBER = "12359"
 LLAMA_CPP_ARCHIVE_URL = (
-    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9637.tar.gz"
+    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v1.0.0.tar.gz"
 )
 LLAMA_CPP_ARCHIVE_SHA256 = (
-    "762283319feb3de30886dc850d42f0e426b06600e7f9639d34e06506597309ca"
+    "3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b"
 )
 NORMALIZED_MODEL_SHA256 = (
     "601572033a0c231857864ab0a2ccf40fbd1abe6ee4ccecd5399bf82e3e559772"
@@ -138,7 +141,7 @@ LEGACY_CMAKE_OFF_OPTIONS = ("LLAMA_CURL",)
 REQUIRED_CMAKE_STRING_OPTIONS = {
     "GGML_BUILD_COMMIT": LLAMA_CPP_COMMIT,
     "LLAMA_BUILD_COMMIT": LLAMA_CPP_COMMIT,
-    "LLAMA_BUILD_NUMBER": LLAMA_CPP_TAG.removeprefix("b"),
+    "LLAMA_BUILD_NUMBER": LLAMA_CPP_BUILD_NUMBER,
 }
 REQUIRED_CMAKE_PATH_OPTIONS = {"GIT_EXE": "FALSE"}
 
@@ -821,7 +824,7 @@ def prepare_runtime(
     if digest != NORMALIZED_MODEL_SHA256:
         raise PreparationError("zenz_model_checksum_mismatch")
 
-    with tempfile.TemporaryDirectory(prefix="mozkey-llama-b9637-") as name:
+    with tempfile.TemporaryDirectory(prefix="mozkey-llama-") as name:
         work = Path(name)
         source = work / "source"
         build = work / "build"
@@ -892,7 +895,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--archive",
         type=Path,
-        default=REPOSITORY_ROOT / "src/third_party_cache/llama.cpp-b9637.tar.gz",
+        default=REPOSITORY_ROOT / "src/third_party_cache/llama.cpp-v1.0.0.tar.gz",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--verify-only", action="store_true")
