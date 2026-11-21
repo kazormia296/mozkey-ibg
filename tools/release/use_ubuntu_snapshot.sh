@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly SNAPSHOT_URL="https://snapshot.ubuntu.com/ubuntu/20260701T000000Z/"
+readonly SNAPSHOT_URL="https://snapshot.ubuntu.com/ubuntu/20261120T000000Z/"
 readonly SOURCES_FILE="/etc/apt/sources.list.d/mozkey-snapshot.sources"
 readonly APT_UPDATE_ATTEMPTS=5
 readonly TEMP_SOURCES="$(mktemp)"
