@@ -135,6 +135,10 @@ msgstr "プログラム"
 msgid "Shared Input State"
 msgstr "入力状態の共有"
 
+#: mozc_engine.h:93
+msgid "Show conversion status (Mozc / Zenz) next to the reading"
+msgstr "変換ステータス (Mozc / Zenz) を読みの横に表示する"
+
 #: mozc_engine.h:75
 msgid "Vertical candidate list"
 msgstr "候補を縦に並べる"

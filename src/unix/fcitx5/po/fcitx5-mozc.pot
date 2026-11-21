@@ -130,6 +130,10 @@ msgstr ""
 msgid "Shared Input State"
 msgstr ""
 
+#: mozc_engine.h:93
+msgid "Show conversion status (Mozc / Zenz) next to the reading"
+msgstr ""
+
 #: mozc_engine.h:75
 msgid "Vertical candidate list"
 msgstr ""

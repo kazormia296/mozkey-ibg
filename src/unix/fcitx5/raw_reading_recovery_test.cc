@@ -788,5 +788,321 @@ TEST(RawReadingRecoveryTest, CommitClearsJournal) {
   EXPECT_EQ(recovery.journal_size_for_test(), 0);
 }
 
+TEST(RawReadingRecoveryTest, ReconversionSuppressesJournalUntilCommit) {
+  RecoveryTestClient client;
+  RawReadingRecovery recovery = MakeRecovery();
+  mozc::commands::Output recovered;
+  const mozc::commands::Context context = ValidContext();
+  ASSERT_EQ(recovery.Prepare(&client, context, false, &recovered),
+            RawReadingRecovery::PrepareResult::kReady);
+
+  // The composition now on screen came from CONVERT_REVERSE, not from keys.
+  recovery.MarkCompositionNotReplayable();
+  EXPECT_EQ(recovery.journal_size_for_test(), 0);
+  EXPECT_TRUE(recovery.journal_suppressed_for_test());
+
+  // Edits of that composition must not start a journal of their own: a lone
+  // Backspace or a trailing character would rebuild something else.
+  mozc::commands::KeyEvent backspace;
+  backspace.set_special_key(mozc::commands::KeyEvent::BACKSPACE);
+  recovery.RecordSuccessfulKey(backspace, ActiveOutput(), false);
+  recovery.RecordSuccessfulKey(Key('a'), ActiveOutput(), false);
+  EXPECT_EQ(recovery.journal_size_for_test(), 0);
+  EXPECT_EQ(recovery.journal_bytes_for_test(), 0);
+  EXPECT_TRUE(recovery.journal_suppressed_for_test());
+
+  // A replacement session gets nothing replayed into it.
+  client.generation = 2;
+  EXPECT_EQ(recovery.Prepare(&client, context, false, &recovered),
+            RawReadingRecovery::PrepareResult::kSessionChanged);
+  EXPECT_TRUE(client.sent_keys.empty());
+  EXPECT_FALSE(recovered.has_consumed());
+
+  // The commit is the composition boundary that re-enables journalling.
+  mozc::commands::Output committed;
+  committed.set_consumed(true);
+  committed.mutable_result()->set_value("committed");
+  recovery.RecordSuccessfulKey(Key('\n'), committed, false);
+  EXPECT_FALSE(recovery.journal_suppressed_for_test());
+  recovery.RecordSuccessfulKey(Key('a'), ActiveOutput(), false);
+  EXPECT_EQ(recovery.journal_size_for_test(), 1);
+}
+
+TEST(RawReadingRecoveryTest, ReconversionDropsReadingTypedBefore) {
+  RecoveryTestClient client;
+  RawReadingRecovery recovery = MakeRecovery();
+  mozc::commands::Output recovered;
+  const mozc::commands::Context context = ValidContext();
+  ASSERT_EQ(recovery.Prepare(&client, context, false, &recovered),
+            RawReadingRecovery::PrepareResult::kReady);
+  recovery.RecordSuccessfulKey(Key('a'), ActiveOutput(), false);
+  ASSERT_EQ(recovery.journal_size_for_test(), 1);
+
+  recovery.MarkCompositionNotReplayable();
+  EXPECT_EQ(recovery.journal_size_for_test(), 0);
+  EXPECT_EQ(recovery.journal_bytes_for_test(), 0);
+  EXPECT_TRUE(recovery.journal_suppressed_for_test());
+}
+
+mozc::commands::KeyEvent KeyInMode(char code,
+                                   mozc::commands::CompositionMode mode) {
+  mozc::commands::KeyEvent key = Key(code);
+  key.set_mode(mode);
+  return key;
+}
+
+mozc::commands::Output ActiveOutputInMode(
+    mozc::commands::CompositionMode mode) {
+  mozc::commands::Output output = ActiveOutput();
+  output.set_mode(mode);
+  return output;
+}
+
+TEST(RawReadingRecoveryTest, ReplayedKeysCarryTheirRecordedMode) {
+  RecoveryTestClient client;
+  RawReadingRecovery recovery = MakeRecovery();
+  mozc::commands::Output recovered;
+  const mozc::commands::Context context = ValidContext();
+  ASSERT_EQ(recovery.Prepare(&client, context, false, &recovered),
+            RawReadingRecovery::PrepareResult::kReady);
+
+  // "e." typed in half-width ASCII mode.  Replayed without the mode the
+  // server would compose it in the initial mode and direct-commit at the
+  // punctuation.
+  const mozc::commands::KeyEvent letter =
+      KeyInMode('e', mozc::commands::HALF_ASCII);
+  const mozc::commands::KeyEvent period =
+      KeyInMode('.', mozc::commands::HALF_ASCII);
+  recovery.RecordSuccessfulKey(letter, ActiveOutput(), false);
+  recovery.RecordSuccessfulKey(period, ActiveOutput(), false);
+  ASSERT_EQ(recovery.journal_size_for_test(), 2);
+  EXPECT_FALSE(recovery.journal_suppressed_for_test());
+  EXPECT_EQ(recovery.journal_bytes_for_test(),
+            letter.ByteSizeLong() + period.ByteSizeLong());
+
+  client.generation = 2;
+  EXPECT_EQ(recovery.Prepare(&client, context, false, &recovered),
+            RawReadingRecovery::PrepareResult::kSessionChanged);
+  ASSERT_EQ(client.sent_keys.size(), 2);
+  ASSERT_TRUE(client.sent_keys[0].has_mode());
+  EXPECT_EQ(client.sent_keys[0].mode(), mozc::commands::HALF_ASCII);
+  EXPECT_EQ(client.sent_keys[0].SerializeAsString(),
+            letter.SerializeAsString());
+  ASSERT_TRUE(client.sent_keys[1].has_mode());
+  EXPECT_EQ(client.sent_keys[1].mode(), mozc::commands::HALF_ASCII);
+  EXPECT_EQ(client.sent_keys[1].SerializeAsString(),
+            period.SerializeAsString());
+}
+
+TEST(RawReadingRecoveryTest, EveryCompositionModeIsPartOfTheReading) {
+  for (const mozc::commands::CompositionMode mode :
+       {mozc::commands::HIRAGANA, mozc::commands::FULL_KATAKANA,
+        mozc::commands::HALF_ASCII, mozc::commands::FULL_ASCII,
+        mozc::commands::HALF_KATAKANA}) {
+    RecoveryTestClient client;
+    RawReadingRecovery recovery = MakeRecovery();
+    mozc::commands::Output recovered;
+    ASSERT_EQ(recovery.Prepare(&client, ValidContext(), false, &recovered),
+              RawReadingRecovery::PrepareResult::kReady);
+    recovery.RecordSuccessfulKey(KeyInMode('a', mode), ActiveOutput(), false);
+    EXPECT_EQ(recovery.journal_size_for_test(), 1) << mode;
+    EXPECT_FALSE(recovery.journal_suppressed_for_test()) << mode;
+  }
+}
+
+TEST(RawReadingRecoveryTest, DirectModeOrActivationKeyIsNotReading) {
+  const mozc::commands::Context context = ValidContext();
+  {
+    RecoveryTestClient client;
+    RawReadingRecovery recovery = MakeRecovery();
+    mozc::commands::Output recovered;
+    ASSERT_EQ(recovery.Prepare(&client, context, false, &recovered),
+              RawReadingRecovery::PrepareResult::kReady);
+    recovery.RecordSuccessfulKey(Key('a'), ActiveOutput(), false);
+    // A key that carries DIRECT would turn the IME off when replayed.
+    recovery.RecordSuccessfulKey(KeyInMode('b', mozc::commands::DIRECT),
+                                 ActiveOutput(), false);
+    EXPECT_EQ(recovery.journal_size_for_test(), 0);
+    EXPECT_TRUE(recovery.journal_suppressed_for_test());
+  }
+  {
+    RecoveryTestClient client;
+    RawReadingRecovery recovery = MakeRecovery();
+    mozc::commands::Output recovered;
+    ASSERT_EQ(recovery.Prepare(&client, context, false, &recovered),
+              RawReadingRecovery::PrepareResult::kReady);
+    recovery.RecordSuccessfulKey(Key('a'), ActiveOutput(), false);
+    mozc::commands::KeyEvent activating =
+        KeyInMode('b', mozc::commands::HIRAGANA);
+    activating.set_activated(true);
+    recovery.RecordSuccessfulKey(activating, ActiveOutput(), false);
+    EXPECT_EQ(recovery.journal_size_for_test(), 0);
+    EXPECT_TRUE(recovery.journal_suppressed_for_test());
+  }
+}
+
+// Stands in for MozcState: the adapter mirrors the session's composition mode,
+// its session initializer applies the initial mode, and its key finalizer
+// stamps the mode of the session that receives the key.
+struct ModeHost {
+  static constexpr mozc::commands::CompositionMode kInitialMode =
+      mozc::commands::HIRAGANA;
+
+  RawReadingRecovery MakeRecovery() {
+    return RawReadingRecovery(
+        [this](MozcClientInterface* client, uint64_t generation,
+               const mozc::commands::Context&) {
+          if (client == nullptr ||
+              client->session_generation() != generation) {
+            return false;
+          }
+          ++initializer_calls;
+          mode = kInitialMode;
+          return true;
+        },
+        [this](const mozc::commands::Output* replayed_output,
+               mozc::commands::KeyEvent* key) {
+          finalized_after_initializer_calls.push_back(initializer_calls);
+          finalized_with_replay.push_back(replayed_output != nullptr);
+          key->set_mode(replayed_output != nullptr &&
+                                replayed_output->has_mode()
+                            ? replayed_output->mode()
+                            : mode);
+        });
+  }
+
+  mozc::commands::CompositionMode mode = kInitialMode;
+  int initializer_calls = 0;
+  std::vector<int> finalized_after_initializer_calls;
+  std::vector<bool> finalized_with_replay;
+};
+
+TEST(RawReadingRecoveryTest, UserKeyIsFinalizedForTheSessionThatReceivesIt) {
+  RecoveryTestClient client;
+  ModeHost host;
+  RawReadingRecovery recovery = host.MakeRecovery();
+  mozc::commands::Output output;
+  const mozc::commands::Context context = ValidContext();
+  ASSERT_EQ(recovery.Prepare(&client, context, false, &output),
+            RawReadingRecovery::PrepareResult::kReady);
+  ASSERT_EQ(host.initializer_calls, 1);
+
+  // The user switched to katakana; the first session follows.
+  host.mode = mozc::commands::FULL_KATAKANA;
+  mozc::commands::KeyEvent dispatched;
+  ASSERT_TRUE(recovery.DispatchKey(&client, Key('a'), context, false, &output,
+                                   &dispatched));
+  ASSERT_EQ(client.sent_keys.size(), 1);
+  EXPECT_EQ(client.sent_keys[0].mode(), mozc::commands::FULL_KATAKANA);
+  EXPECT_EQ(dispatched.SerializeAsString(),
+            client.sent_keys[0].SerializeAsString());
+  client.sent_keys.clear();
+
+  // The server dies.  The send that discovers it still carries the old mode,
+  // but the retry goes to a session the initializer just put into the initial
+  // mode, and must not override it with the mode of the session that is gone.
+  client.recreate_on_next_key = true;
+  ASSERT_TRUE(recovery.DispatchKey(&client, Key('b'), context, false, &output,
+                                   &dispatched));
+  ASSERT_EQ(client.sent_keys.size(), 2);
+  EXPECT_EQ(client.sent_keys[0].key_code(), 'b');
+  EXPECT_EQ(client.sent_keys[0].mode(), mozc::commands::FULL_KATAKANA);
+  EXPECT_EQ(client.sent_keys[1].key_code(), 'b');
+  EXPECT_EQ(client.sent_keys[1].mode(), ModeHost::kInitialMode);
+  EXPECT_EQ(host.initializer_calls, 2);
+  // What the caller journals is the key the surviving session received.
+  EXPECT_EQ(dispatched.SerializeAsString(),
+            client.sent_keys[1].SerializeAsString());
+
+  // First key, discovering key, retry: the retry was stamped after the
+  // initializer of the replacement session ran, and nothing was replayed.
+  EXPECT_EQ(host.finalized_after_initializer_calls,
+            (std::vector<int>{1, 1, 2}));
+  EXPECT_EQ(host.finalized_with_replay,
+            (std::vector<bool>{false, false, false}));
+}
+
+TEST(RawReadingRecoveryTest, UserKeyAfterReplayContinuesInTheReplayedMode) {
+  RecoveryTestClient client;
+  ModeHost host;
+  RawReadingRecovery recovery = host.MakeRecovery();
+  mozc::commands::Output output;
+  const mozc::commands::Context context = ValidContext();
+  ASSERT_EQ(recovery.Prepare(&client, context, false, &output),
+            RawReadingRecovery::PrepareResult::kReady);
+
+  // A composition typed in half-width ASCII mode.
+  host.mode = mozc::commands::HALF_ASCII;
+  mozc::commands::KeyEvent dispatched;
+  ASSERT_TRUE(recovery.DispatchKey(&client, Key('e'), context, false, &output,
+                                   &dispatched));
+  recovery.RecordSuccessfulKey(dispatched, output, false);
+  ASSERT_EQ(recovery.journal_size_for_test(), 1);
+  client.sent_keys.clear();
+  host.finalized_with_replay.clear();
+
+  // The server dies.  The initializer resets the adapter to the initial
+  // mode, the replay rebuilds the ASCII composition, and the key that
+  // triggered all this continues that composition instead of switching it to
+  // the initial mode half-way.
+  client.recreate_on_next_key = true;
+  client.queued_outputs.push_back(
+      ActiveOutputInMode(mozc::commands::HALF_ASCII));  // Reply to the replay.
+  ASSERT_TRUE(recovery.DispatchKey(&client, Key('x'), context, false, &output,
+                                   &dispatched));
+  EXPECT_EQ(host.mode, ModeHost::kInitialMode);
+  ASSERT_EQ(client.sent_keys.size(), 3);
+  EXPECT_EQ(client.sent_keys[0].key_code(), 'x');  // Failed discovery call.
+  EXPECT_EQ(client.sent_keys[1].key_code(), 'e');  // Replay, as journalled.
+  EXPECT_EQ(client.sent_keys[1].mode(), mozc::commands::HALF_ASCII);
+  EXPECT_EQ(client.sent_keys[2].key_code(), 'x');  // Retry.
+  EXPECT_EQ(client.sent_keys[2].mode(), mozc::commands::HALF_ASCII);
+  EXPECT_EQ(dispatched.SerializeAsString(),
+            client.sent_keys[2].SerializeAsString());
+  EXPECT_EQ(host.finalized_with_replay, (std::vector<bool>{false, true}));
+}
+
+TEST(RawReadingRecoveryTest, ReplayFoundBeforeTheFirstSendDecidesTheMode) {
+  RecoveryTestClient client;
+  ModeHost host;
+  RawReadingRecovery recovery = host.MakeRecovery();
+  mozc::commands::Output output;
+  const mozc::commands::Context context = ValidContext();
+  ASSERT_EQ(recovery.Prepare(&client, context, false, &output),
+            RawReadingRecovery::PrepareResult::kReady);
+  recovery.RecordSuccessfulKey(KeyInMode('e', mozc::commands::HALF_ASCII),
+                               ActiveOutput(), false);
+
+  // The replacement session already exists when the next key arrives.
+  host.mode = mozc::commands::HALF_ASCII;
+  client.generation = 2;
+  client.queued_outputs.push_back(
+      ActiveOutputInMode(mozc::commands::HALF_ASCII));  // Reply to the replay.
+  ASSERT_TRUE(recovery.DispatchKey(&client, Key('x'), context, false, &output));
+  EXPECT_EQ(host.mode, ModeHost::kInitialMode);
+  ASSERT_EQ(client.sent_keys.size(), 2);
+  EXPECT_EQ(client.sent_keys[0].key_code(), 'e');
+  EXPECT_EQ(client.sent_keys[0].mode(), mozc::commands::HALF_ASCII);
+  EXPECT_EQ(client.sent_keys[1].key_code(), 'x');
+  EXPECT_EQ(client.sent_keys[1].mode(), mozc::commands::HALF_ASCII);
+  EXPECT_EQ(host.finalized_with_replay, (std::vector<bool>{true}));
+}
+
+TEST(RawReadingRecoveryTest, FailedDispatchReportsNoDispatchedKey) {
+  RecoveryTestClient client;
+  ModeHost host;
+  RawReadingRecovery recovery = host.MakeRecovery();
+  mozc::commands::Output output;
+  const mozc::commands::Context context = ValidContext();
+  ASSERT_EQ(recovery.Prepare(&client, context, false, &output),
+            RawReadingRecovery::PrepareResult::kReady);
+
+  mozc::commands::KeyEvent dispatched;
+  client.fail_next_key = true;
+  EXPECT_FALSE(recovery.DispatchKey(&client, Key('a'), context, false, &output,
+                                    &dispatched));
+  EXPECT_EQ(dispatched.ByteSizeLong(), 0);
+}
+
 }  // namespace
 }  // namespace fcitx

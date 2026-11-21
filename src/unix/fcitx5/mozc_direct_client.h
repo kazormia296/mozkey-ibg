@@ -39,7 +39,11 @@ class MozcDirectClient : public MozcClientInterface {
   bool LaunchToolWithProtoBuf(const mozc::commands::Output& output) override;
 
  private:
-  // Initializes `request_` with the flag.
+  // Initializes `request_` with the defaults every desktop client sends
+  // (the additional character groups this platform can render).
+  // This function should be called before EnsureSession.
+  void InitDefaultRequest();
+  // Sets or clears the SVS flag on `request_`, keeping its other fields.
   // This function should be called before EnsureSession.
   void InitRequestForSvsJapanese(bool use_svs);
   // Converts Output message from server to corresponding mozc_tool arguments
