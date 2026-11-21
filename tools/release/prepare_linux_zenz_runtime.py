@@ -104,7 +104,7 @@ def cmake_configure_command(
         "-DLLAMA_USE_PREBUILT_UI=OFF",
         "-DLLAMA_FATAL_WARNINGS=OFF",
         "-DGGML_FATAL_WARNINGS=OFF",
-        "-DLLAMA_BUILD_NUMBER=9637",
+        f"-DLLAMA_BUILD_NUMBER={common.LLAMA_CPP_BUILD_NUMBER}",
         f"-DLLAMA_BUILD_COMMIT={common.LLAMA_CPP_TAG}",
         f"-DGGML_BUILD_COMMIT={common.LLAMA_CPP_TAG}",
     ]
@@ -256,7 +256,7 @@ def prepare_runtime(root: Path, archive: Path, output: Path) -> None:
     except common.PreparationError as error:
         raise PreparationError(str(error)) from error
 
-    with tempfile.TemporaryDirectory(prefix="mozkey-linux-llama-b9637-") as name:
+    with tempfile.TemporaryDirectory(prefix="mozkey-linux-llama-") as name:
         work = Path(name)
         source = work / "source"
         source.mkdir()

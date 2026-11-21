@@ -37,12 +37,15 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from tools.release import normalize_zenz_gguf  # noqa: E402
 
 
-LLAMA_CPP_TAG = "b9637"
+LLAMA_CPP_TAG = "v1.0.0"
+# What llama.cpp derives from `git rev-list --count` for the tagged commit;
+# the source archive carries no git history.
+LLAMA_CPP_BUILD_NUMBER = "12359"
 LLAMA_CPP_ARCHIVE_URL = (
-    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9637.tar.gz"
+    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v1.0.0.tar.gz"
 )
 LLAMA_CPP_ARCHIVE_SHA256 = (
-    "762283319feb3de30886dc850d42f0e426b06600e7f9639d34e06506597309ca"
+    "3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b"
 )
 NORMALIZED_MODEL_SHA256 = (
     "601572033a0c231857864ab0a2ccf40fbd1abe6ee4ccecd5399bf82e3e559772"
@@ -68,7 +71,7 @@ REQUIRED_CMAKE_BOOL_OPTIONS = {
     "LLAMA_BUILD_EXAMPLES": "OFF",
     "LLAMA_BUILD_SERVER": "ON",
     "LLAMA_BUILD_TESTS": "OFF",
-    # b9637 defines llama-server under the tools subtree.  Configure that
+    # llama.cpp defines llama-server under the tools subtree.  Configure that
     # subtree, but build and stage only the explicit llama-server target.
     "LLAMA_BUILD_TOOLS": "ON",
     "LLAMA_BUILD_UI": "OFF",
@@ -219,7 +222,7 @@ def cmake_configure_command(
         "-DLLAMA_USE_PREBUILT_UI=OFF",
         "-DLLAMA_FATAL_WARNINGS=OFF",
         "-DGGML_FATAL_WARNINGS=OFF",
-        "-DLLAMA_BUILD_NUMBER=9637",
+        f"-DLLAMA_BUILD_NUMBER={LLAMA_CPP_BUILD_NUMBER}",
         f"-DLLAMA_BUILD_COMMIT={LLAMA_CPP_TAG}",
         f"-DGGML_BUILD_COMMIT={LLAMA_CPP_TAG}",
     ]
@@ -292,7 +295,7 @@ def _verify_cmake_cache(build: Path) -> None:
     for key, expected in REQUIRED_CMAKE_BOOL_OPTIONS.items():
         if values.get(key) != ("BOOL", expected):
             raise PreparationError("cmake_backend_contract_invalid")
-    # b9637 still reads LLAMA_CURL as a deprecated compatibility variable,
+    # llama.cpp still reads LLAMA_CURL as a deprecated compatibility variable,
     # rather than declaring it with option().  CMake therefore may retain the
     # command-line value as UNINITIALIZED.  Require the exact OFF value here;
     # the Mach-O dependency check below remains the authoritative proof that
@@ -512,7 +515,7 @@ def prepare_runtime(root: Path, archive: Path, output: Path) -> None:
     if digest != NORMALIZED_MODEL_SHA256:
         raise PreparationError("normalized_model_checksum_mismatch")
 
-    with tempfile.TemporaryDirectory(prefix="mozkey-llama-b9637-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="mozkey-llama-") as temporary:
         work = Path(temporary)
         source = work / "source"
         source.mkdir()

@@ -79,14 +79,14 @@ class PrepareWindowsZenzRuntimeTest(unittest.TestCase):
             )
             document = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(document["schema_version"], target.SCHEMA_VERSION)
-            self.assertEqual(document["llama_cpp"]["tag"], "b9637")
+            self.assertEqual(document["llama_cpp"]["tag"], "v1.0.0")
             self.assertEqual(
                 document["llama_cpp"]["commit"],
-                "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
+                "b1b770d90d94cad9e9ea5b993bdbc383a522fb28",
             )
             self.assertEqual(
                 document["cmake_string_options"]["LLAMA_BUILD_COMMIT"],
-                "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
+                "b1b770d90d94cad9e9ea5b993bdbc383a522fb28",
             )
             self.assertEqual(
                 document["cmake_path_options"],

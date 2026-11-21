@@ -95,8 +95,8 @@ If you would like to manually confirm the Qt license, omit the
 
 The MSI never packages the historical root-level llama.cpp PE files. Build and
 verify the architecture-specific static runtime from the checksum-pinned
-official llama.cpp `b9637` archive (commit
-`aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3`) first:
+official llama.cpp `v1.0.0` archive (commit
+`b1b770d90d94cad9e9ea5b993bdbc383a522fb28`) first:
 
 ```
 python ..\tools\release\prepare_windows_zenz_runtime.py --arch x64

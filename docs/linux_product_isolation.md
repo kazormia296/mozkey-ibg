@@ -141,7 +141,7 @@ Release CI builds three Linux products natively on x86_64:
   sidecar, and SPDX 2.3 inventory. The published payload backs the
   `mozkey-ibg-bin` AUR package.
 
-The deb and RPM contain a separately attested, pinned llama.cpp b9637
+The deb and RPM contain a separately attested, pinned llama.cpp v1.0.0
 `llama-server` built without shared llama/ggml libraries, network clients,
 hardware-specific CPU tuning, or extended x86 instruction-set requirements.
 The Arch payload instead requires compatible `fcitx5`, `llama-cpp`, and
@@ -188,7 +188,7 @@ runtime before staging. Release CI and dogfood additionally load the bundled
 model and exercise `/completion` while checking that the child listener is
 loopback-only. The 2026-07-17 host dogfood gate uses llama.cpp build 9859
 (`4fc4ec5541`); the Arch CI payload records its exact rolling package version,
-while deb/rpm record the pinned b9637 runtime digest and build options.
+while deb/rpm record the pinned v1.0.0 runtime digest and build options.
 Prompt construction follows the model's reference tokenizer preparation:
 ASCII spaces become U+3000 and line feeds are removed before inference. This
 keeps the Windows source model and Linux normalized model on one prompt

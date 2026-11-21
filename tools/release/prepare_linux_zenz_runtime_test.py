@@ -31,7 +31,8 @@ class PrepareLinuxZenzRuntimeTest(unittest.TestCase):
             "-DLLAMA_BUILD_UI=OFF",
         ):
             self.assertIn(option, command)
-        self.assertIn("-DLLAMA_BUILD_COMMIT=b9637", command)
+        self.assertIn("-DLLAMA_BUILD_COMMIT=v1.0.0", command)
+        self.assertIn("-DLLAMA_BUILD_NUMBER=12359", command)
 
     def test_cache_verifier_rejects_backend_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -66,7 +67,7 @@ class PrepareLinuxZenzRuntimeTest(unittest.TestCase):
             document = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(document["schema_version"], target.SCHEMA)
             self.assertEqual(document["architecture"], "x86_64")
-            self.assertEqual(document["llama_cpp"]["tag"], "b9637")
+            self.assertEqual(document["llama_cpp"]["tag"], "v1.0.0")
             self.assertEqual(document["server"]["size_bytes"], len(server.read_bytes()))
 
 
