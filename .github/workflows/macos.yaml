@@ -289,10 +289,24 @@ jobs:
           test "$(printf '%s\n' "$preinstall" | grep -c .)" -eq 1
           # The installer files are built in the package's transitioned
           # (arm64) configuration, so preflight.sh is not under bazel-bin.
-          built_preflight="$(find -L src/bazel-out/ -mindepth 4 -maxdepth 4 \
-            -path '*/bin/mac/preflight.sh' -type f -print)"
-          test "$(printf '%s\n' "$built_preflight" | grep -c .)" -eq 1
-          cmp "$preinstall" "$built_preflight"
+          # More than one configuration may build it; every copy must be the
+          # file that was packaged.  This step runs under macOS /bin/bash 3.2,
+          # so it avoids mapfile and arrays.
+          built_preflights="$(find -L src/bazel-out/ -mindepth 4 -maxdepth 4 \
+            -path '*/bin/mac/preflight.sh' -type f -print | sort)"
+          printf 'built preflight: %s\n' "$built_preflights"
+          if [ -z "$built_preflights" ]; then
+            echo "::error::No built mac/preflight.sh was found under bazel-out." >&2
+            exit 1
+          fi
+          while IFS= read -r built_preflight; do
+            if ! cmp "$preinstall" "$built_preflight"; then
+              echo "::error::The packaged preinstall differs from $built_preflight." >&2
+              exit 1
+            fi
+          done <<EOF_PREFLIGHTS
+          $built_preflights
+          EOF_PREFLIGHTS
           if grep -F -q 'PKG is NOT INSTALLABLE' "$preinstall"; then
             echo "::error::The stage-1 non-installable preflight was packaged." >&2
             exit 1
@@ -301,7 +315,10 @@ jobs:
             echo "::error::The installer version placeholder was not resolved." >&2
             exit 1
           fi
-          grep -F -q "io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" "$preinstall"
+          if ! grep -F -q "io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" "$preinstall"; then
+            echo "::error::The packaged preinstall does not name the Mozkey IbG package." >&2
+            exit 1
+          fi
 
       - name: Prepare the package tree before loading signing credentials
         run: |
