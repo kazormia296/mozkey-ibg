@@ -64,19 +64,6 @@ namespace fcitx {
 
 namespace {
 
-// Returns a position that determines a preedit cursor position _AND_ top-left
-// position of a candidate window. Note that we can't set these two positions
-// independently. That's a SCIM's limitation.
-uint32_t GetCursorPosition(const mozc::commands::Output& response) {
-  if (!response.has_preedit()) {
-    return 0;
-  }
-  if (response.preedit().has_highlighted_position()) {
-    return response.preedit().highlighted_position();
-  }
-  return response.preedit().cursor();
-}
-
 std::string CreateDescriptionString(const std::string& description) {
   return " [" + description + "]";
 }
@@ -404,7 +391,7 @@ bool MozcResponseParser::ParseResponseInternal(
   // First, determine the cursor position.
   if (response.has_preedit()) {
     const mozc::commands::Preedit& preedit = response.preedit();
-    ParsePreedit(preedit, GetCursorPosition(response), ic);
+    ParsePreedit(preedit, PreeditCaretPosition(response), ic);
   }
 
   // Then show the candidate window.

@@ -142,6 +142,17 @@ mozc::commands::SessionCommand::CommandType SelectContextLossCommand(
 void ApplySessionModeHint(mozc::commands::CompositionMode mode,
                           mozc::commands::KeyEvent* key);
 
+// The position, in characters, to report as the preedit caret.
+// - During live conversion (shown or pending) the composition is still being
+//   edited, so the editing caret (Preedit.cursor) is used.  The highlighted
+//   segment is not the insertion point there: following it makes the caret
+//   jump to the beginning whenever a delayed conversion reply arrives or a
+//   clause boundary moves.  The Windows and IBus clients do the same.
+// - In conventional conversion the caret also anchors the candidate list, so
+//   the start of the highlighted segment is kept.
+// Output.pre_live_conversion_reading alone is not live conversion.
+uint32_t PreeditCaretPosition(const mozc::commands::Output& output);
+
 // Serialized form of everything in `output` that reaches the screen.  Two
 // Outputs with the same signature are drawn identically.
 std::string DisplaySignature(const mozc::commands::Output& output);

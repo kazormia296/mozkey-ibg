@@ -316,8 +316,20 @@ bool KeyTranslator::Translate(KeySym keyval, uint32_t keycode,
   DCHECK(out_event) << "out_event is NULL";
   out_event->Clear();
 
-  /* this is key we cannot handle, don't process it */
-  if (modifiers & KeyState::Super) {
+  // Keys with a modifier Mozc has no notion of are left to Fcitx and the
+  // application (Super+Space and the like):
+  // - Super (Mod4), and the virtual Super / Hyper bits GTK based frontends
+  //   report for it (Super2, Hyper2).
+  // Deliberately NOT refused, as in the IBus frontend
+  // (https://github.com/google/mozc/issues/1590):
+  // - Mod3 (Level 5 Shift, KeyState::Hyper is the same bit in Fcitx) and Mod5
+  //   (Level 3 Shift / AltGr): they only select the character a key types
+  //   (Neo2 / Bone and European layouts).
+  // - NumLock (Mod2), which must not affect shortcuts.
+  // KeyState::Meta is not refused either: it is a virtual modifier that
+  // usually shares Mod1 with Alt, and Mozc shortcuts use Alt.
+  if (modifiers.testAny(
+          KeyStates{KeyState::Super, KeyState::Super2, KeyState::Hyper2})) {
     return false;
   }
 

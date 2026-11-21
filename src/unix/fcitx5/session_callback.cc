@@ -256,6 +256,20 @@ void ApplySessionModeHint(mozc::commands::CompositionMode mode,
   key->set_mode(mode);
 }
 
+uint32_t PreeditCaretPosition(const mozc::commands::Output& output) {
+  if (!output.has_preedit()) {
+    return 0;
+  }
+  const mozc::commands::Preedit& preedit = output.preedit();
+  if (output.live_conversion() || output.live_conversion_pending()) {
+    return preedit.cursor();
+  }
+  if (preedit.has_highlighted_position()) {
+    return preedit.highlighted_position();
+  }
+  return preedit.cursor();
+}
+
 std::string DisplaySignature(const mozc::commands::Output& output) {
   mozc::commands::Output displayed;
   if (output.has_consumed()) {

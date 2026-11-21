@@ -373,6 +373,22 @@ mozc_cc_library(
     ],
 )
 
+mozc_cc_test(
+    name = "fcitx_key_translator_test",
+    size = "small",
+    srcs = [
+        "fcitx_key_translator_test.cc",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":fcitx_key_util",
+        "//protocol:commands_cc_proto",
+        "//protocol:config_cc_proto",
+        "//testing:gunit_main",
+        "@fcitx5",
+    ],
+)
+
 mozc_cc_library(
     name = "surrounding_text_util",
     srcs = [

@@ -850,5 +850,64 @@ TEST(SessionCallbackTest, CommandsWithoutTextAreLoggedInFull) {
   EXPECT_EQ(logged_reply.find("preedit_segments="), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// Preedit caret
+
+Output PreeditWithCaret(uint32_t cursor, uint32_t highlighted_position) {
+  Output output;
+  output.set_consumed(true);
+  output.mutable_preedit()->set_cursor(cursor);
+  output.mutable_preedit()->set_highlighted_position(highlighted_position);
+  return output;
+}
+
+TEST(SessionCallbackTest, CaretWithoutPreeditIsZero) {
+  Output output;
+  output.set_live_conversion(true);
+  EXPECT_EQ(PreeditCaretPosition(output), 0u);
+}
+
+TEST(SessionCallbackTest, PlainCompositionUsesEditingCaret) {
+  Output output = PreeditWithCaret(4, 0);
+  output.mutable_preedit()->clear_highlighted_position();
+  EXPECT_EQ(PreeditCaretPosition(output), 4u);
+}
+
+TEST(SessionCallbackTest, ConventionalConversionKeepsCandidateAnchor) {
+  EXPECT_EQ(PreeditCaretPosition(PreeditWithCaret(7, 2)), 2u);
+}
+
+TEST(SessionCallbackTest, LiveConversionUsesEditingCaret) {
+  Output output = PreeditWithCaret(7, 0);
+  output.set_live_conversion(true);
+  EXPECT_EQ(PreeditCaretPosition(output), 7u);
+
+  // A moving clause boundary does not move the caret.
+  output.mutable_preedit()->set_highlighted_position(3);
+  EXPECT_EQ(PreeditCaretPosition(output), 7u);
+
+  // Not even next to a candidate list.
+  output.mutable_candidate_window();
+  EXPECT_EQ(PreeditCaretPosition(output), 7u);
+}
+
+TEST(SessionCallbackTest, PendingLiveConversionUsesEditingCaret) {
+  Output output = PreeditWithCaret(5, 0);
+  output.set_live_conversion_pending(true);
+  EXPECT_EQ(PreeditCaretPosition(output), 5u);
+}
+
+TEST(SessionCallbackTest, EditingCaretAtStartIsRespectedInLiveConversion) {
+  Output output = PreeditWithCaret(0, 4);
+  output.set_live_conversion(true);
+  EXPECT_EQ(PreeditCaretPosition(output), 0u);
+}
+
+TEST(SessionCallbackTest, ReadingFlagAloneIsNotLiveConversion) {
+  Output output = PreeditWithCaret(8, 1);
+  output.set_pre_live_conversion_reading(true);
+  EXPECT_EQ(PreeditCaretPosition(output), 1u);
+}
+
 }  // namespace
 }  // namespace fcitx
