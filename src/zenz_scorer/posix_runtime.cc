@@ -29,7 +29,7 @@ PosixZenzResponse ChildUnavailableResponse() {
 }  // namespace
 
 PosixScorerRuntime::PosixScorerRuntime(PosixScorerRuntimeOptions options)
-    : options_(std::move(options)), llama_process_(options_.llama_server) {}
+    : options_(std::move(options)) {}
 
 PosixScorerRuntime::~PosixScorerRuntime() { Stop(); }
 
@@ -39,7 +39,7 @@ bool PosixScorerRuntime::Start(std::string* error) {
   }
   error->clear();
 
-  if (server_ != nullptr || llama_process_.running()) {
+  if (server_ != nullptr || llama_process_ != nullptr) {
     *error = "already_started";
     return false;
   }
@@ -49,33 +49,66 @@ bool PosixScorerRuntime::Start(std::string* error) {
     return false;
   }
 
-  if (!llama_process_.Start(error)) {
+  if (!LaunchLlamaServer(requested_backend_device_, error)) {
+    return false;
+  }
+
+  server_ = std::make_unique<PosixZenzScorerServer>(
+      options_.socket_path,
+      [this](const PosixZenzRequest& request) { return Handle(request); });
+
+  if (!server_->Start(error)) {
+    server_.reset();
+    llama_process_.reset();
+    http_backend_ = nullptr;
+    return false;
+  }
+  return true;
+}
+
+bool PosixScorerRuntime::LaunchLlamaServer(const std::string& backend_device,
+                                           std::string* error) {
+  // Stop the current child first: only one model is resident at a time.
+  llama_process_.reset();
+  http_backend_ = nullptr;
+
+  LlamaServerProcessOptions process_options = options_.llama_server;
+  if (!backend_device.empty()) {
+    process_options.additional_args.push_back("--device");
+    process_options.additional_args.push_back(backend_device);
+  }
+  auto process =
+      std::make_unique<LlamaServerProcess>(std::move(process_options));
+  if (!process->Start(error)) {
     return false;
   }
 
   LlamaBackendOptions backend_options;
-  backend_options.port = llama_process_.port();
-  backend_options.api_key = llama_process_.api_key();
+  backend_options.port = process->port();
+  backend_options.api_key = process->api_key();
   backend_options.n_predict = options_.n_predict;
-  PosixZenzBackend http_backend =
-      CreateLlamaHttpBackend(std::move(backend_options));
-
-  server_ = std::make_unique<PosixZenzScorerServer>(
-      options_.socket_path,
-      [this, http_backend = std::move(http_backend)](
-          const PosixZenzRequest& request) mutable -> PosixZenzResponse {
-        if (!llama_process_.running()) {
-          return ChildUnavailableResponse();
-        }
-        return http_backend(request);
-      });
-
-  if (!server_->Start(error)) {
-    server_.reset();
-    llama_process_.Stop();
-    return false;
-  }
+  http_backend_ = CreateLlamaHttpBackend(std::move(backend_options));
+  llama_process_ = std::move(process);
   return true;
+}
+
+PosixZenzResponse PosixScorerRuntime::Handle(
+    const PosixZenzRequest& request) {
+  if (request.backend_device != requested_backend_device_) {
+    requested_backend_device_ = request.backend_device;
+    std::string error;
+    if (!LaunchLlamaServer(requested_backend_device_, &error) &&
+        !requested_backend_device_.empty()) {
+      // The device is missing or cannot load the model; keep Zenz usable
+      // with automatic selection.
+      LaunchLlamaServer(std::string(), &error);
+    }
+  }
+  if (llama_process_ == nullptr || !http_backend_ ||
+      !llama_process_->running()) {
+    return ChildUnavailableResponse();
+  }
+  return http_backend_(request);
 }
 
 bool PosixScorerRuntime::ServeOne(int timeout_msec, std::string* error) {
@@ -88,7 +121,7 @@ bool PosixScorerRuntime::ServeOne(int timeout_msec, std::string* error) {
     *error = "not_started";
     return false;
   }
-  if (!llama_process_.running()) {
+  if (llama_process_ == nullptr || !llama_process_->running()) {
     *error = "llama_server_exited";
     return false;
   }
@@ -99,11 +132,13 @@ void PosixScorerRuntime::Stop() {
   // Remove the public-facing socket before stopping the child so no new
   // requests can enter while the localhost backend is shutting down.
   server_.reset();
-  llama_process_.Stop();
+  llama_process_.reset();
+  http_backend_ = nullptr;
 }
 
 bool PosixScorerRuntime::running() {
-  return server_ != nullptr && llama_process_.running();
+  return server_ != nullptr && llama_process_ != nullptr &&
+         llama_process_->running();
 }
 
 }  // namespace zenz_scorer

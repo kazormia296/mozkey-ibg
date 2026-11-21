@@ -5,6 +5,7 @@
 #include <string>
 
 #include "zenz_scorer/llama_server_process.h"
+#include "zenz_scorer/posix_server.h"
 
 namespace mozc {
 namespace zenz_scorer {
@@ -38,8 +39,19 @@ class PosixScorerRuntime final {
   bool running();
 
  private:
+  // Mozkey IbG: llama-server is (re)started for the inference device the
+  // latest request asked for.  An empty device selects automatically.
+  bool LaunchLlamaServer(const std::string& backend_device,
+                         std::string* error);
+  PosixZenzResponse Handle(const PosixZenzRequest& request);
+
   PosixScorerRuntimeOptions options_;
-  LlamaServerProcess llama_process_;
+  std::unique_ptr<LlamaServerProcess> llama_process_;
+  PosixZenzBackend http_backend_;
+  // The device the client asked for last.  It is remembered even when the
+  // launch fell back to automatic selection, so a device that cannot start
+  // is not retried on every request.
+  std::string requested_backend_device_;
   std::unique_ptr<PosixZenzScorerServer> server_;
 };
 

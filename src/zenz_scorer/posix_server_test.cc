@@ -23,8 +23,11 @@ namespace {
 using ::mozc::zenz::kZenzWireKindRequest;
 using ::mozc::zenz::kZenzWireKindResponse;
 using ::mozc::zenz::kZenzWireMagic;
+using ::mozc::zenz::kZenzWireStatusError;
 using ::mozc::zenz::kZenzWireStatusOk;
 using ::mozc::zenz::kZenzWireVersion;
+using ::mozc::zenz::kZenzWireVersionWithDevice;
+using ::mozc::zenz::ZenzWireDeviceTrailer;
 using ::mozc::zenz::ZenzWireRequestHeader;
 using ::mozc::zenz::ZenzWireResponseHeader;
 
@@ -139,6 +142,7 @@ TEST(PosixZenzScorerServerTest, ServesWireRequestWithPartialWrites) {
           EXPECT_EQ(request.timeout_msec, 1200);
           EXPECT_EQ(request.max_output_chars, 48);
           EXPECT_EQ(request.prompt, "prompt-data");
+          EXPECT_TRUE(request.backend_device.empty());
           PosixZenzResponse response;
           response.status = kZenzWireStatusOk;
           response.value = "converted";
@@ -196,6 +200,107 @@ TEST(PosixZenzScorerServerTest, ServesWireRequestWithPartialWrites) {
     EXPECT_TRUE(server.ServeOne(2000, &error)) << error;
     client.join();
     EXPECT_TRUE(client_ok);
+  }
+  Cleanup(directory);
+}
+
+// Sends a version 2 request carrying |device| and returns the response status
+// and debug string the server answered with.
+bool ExchangeDeviceRequest(const std::string& socket_path,
+                           const std::string& device, uint32_t* status,
+                           std::string* debug) {
+  const int fd = Connect(socket_path);
+  if (fd < 0) {
+    return false;
+  }
+  const std::string prompt = "prompt-data";
+  ZenzWireRequestHeader request = {};
+  request.magic = kZenzWireMagic;
+  request.version = kZenzWireVersionWithDevice;
+  request.kind = kZenzWireKindRequest;
+  request.generation = 74;
+  request.timeout_msec = 1200;
+  request.max_output_chars = 48;
+  request.prompt_size = static_cast<uint32_t>(prompt.size());
+  ZenzWireDeviceTrailer trailer = {};
+  trailer.backend_device_size = static_cast<uint32_t>(device.size());
+  bool ok = WriteChunks(fd, &request, sizeof(request)) &&
+            WriteChunks(fd, prompt.data(), prompt.size()) &&
+            WriteChunks(fd, &trailer, sizeof(trailer)) &&
+            WriteChunks(fd, device.data(), device.size());
+  ZenzWireResponseHeader response = {};
+  ok = ok && ReadAll(fd, &response, sizeof(response));
+  std::string value(ok ? response.value_size : 0, '\0');
+  debug->assign(ok ? response.debug_size : 0, '\0');
+  ok = ok && (value.empty() || ReadAll(fd, value.data(), value.size())) &&
+       (debug->empty() || ReadAll(fd, debug->data(), debug->size()));
+  *status = response.status;
+  ::close(fd);
+  return ok && response.version == kZenzWireVersion &&
+         response.generation == 74;
+}
+
+TEST(PosixZenzScorerServerTest, PassesRequestedBackendDeviceToBackend) {
+  const std::string directory = MakeTestDirectory();
+  Cleanup(directory);
+  const std::string socket_path = directory + "/scorer.sock";
+  {
+    std::string seen_device;
+    PosixZenzScorerServer server(
+        socket_path, [&](const PosixZenzRequest& request) {
+          seen_device = request.backend_device;
+          EXPECT_EQ(request.prompt, "prompt-data");
+          PosixZenzResponse response;
+          response.status = kZenzWireStatusOk;
+          response.debug = "test_backend";
+          return response;
+        });
+    std::string error;
+    ASSERT_TRUE(server.Start(&error)) << error;
+
+    bool exchanged = false;
+    uint32_t status = kZenzWireStatusError;
+    std::string debug;
+    std::thread client([&]() {
+      exchanged = ExchangeDeviceRequest(socket_path, "MTL0", &status, &debug);
+    });
+    EXPECT_TRUE(server.ServeOne(2000, &error)) << error;
+    client.join();
+    EXPECT_TRUE(exchanged);
+    EXPECT_EQ(status, kZenzWireStatusOk);
+    EXPECT_EQ(debug, "test_backend");
+    EXPECT_EQ(seen_device, "MTL0");
+  }
+  Cleanup(directory);
+}
+
+TEST(PosixZenzScorerServerTest, RejectsOptionLikeBackendDevice) {
+  const std::string directory = MakeTestDirectory();
+  Cleanup(directory);
+  const std::string socket_path = directory + "/scorer.sock";
+  {
+    bool backend_called = false;
+    PosixZenzScorerServer server(
+        socket_path, [&](const PosixZenzRequest&) {
+          backend_called = true;
+          return PosixZenzResponse();
+        });
+    std::string error;
+    ASSERT_TRUE(server.Start(&error)) << error;
+
+    bool exchanged = false;
+    uint32_t status = kZenzWireStatusOk;
+    std::string debug;
+    std::thread client([&]() {
+      exchanged =
+          ExchangeDeviceRequest(socket_path, "--host=0.0.0.0", &status, &debug);
+    });
+    EXPECT_TRUE(server.ServeOne(2000, &error)) << error;
+    client.join();
+    EXPECT_TRUE(exchanged);
+    EXPECT_EQ(status, kZenzWireStatusError);
+    EXPECT_EQ(debug, "invalid_backend_device");
+    EXPECT_FALSE(backend_called);
   }
   Cleanup(directory);
 }

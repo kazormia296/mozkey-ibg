@@ -205,6 +205,11 @@ void PopulateZenzBackendDeviceComboBox(QComboBox *combo_box,
 #if defined(_WIN32)
   const QString llama_server_path =
       QDir(server_directory_qt).filePath(QStringLiteral("llama-server.exe"));
+#elif defined(__APPLE__)
+  // Same location session/zenz_client_factory.cc launches the scorer from.
+  const QString llama_server_path = QDir(server_directory_qt)
+                                        .filePath(QStringLiteral(
+                                            "ZenzRuntime/llama-server"));
 #else
   const QString llama_server_path =
       QDir(server_directory_qt).filePath(QStringLiteral("llama-server"));

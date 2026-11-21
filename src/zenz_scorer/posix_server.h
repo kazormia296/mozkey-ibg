@@ -13,6 +13,8 @@ struct PosixZenzRequest {
   uint32_t timeout_msec = 0;
   uint32_t max_output_chars = 0;
   std::string prompt;
+  // llama-server --device value; empty selects the device automatically.
+  std::string backend_device;
 };
 
 struct PosixZenzResponse {
