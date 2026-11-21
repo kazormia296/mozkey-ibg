@@ -287,7 +287,12 @@ jobs:
           expanded="$RUNNER_TEMP/mozkey-ibg-zenz-package-verify/expanded"
           preinstall="$(find "$expanded" -type f -name preinstall -print)"
           test "$(printf '%s\n' "$preinstall" | grep -c .)" -eq 1
-          cmp "$preinstall" src/bazel-bin/mac/preflight.sh
+          # The installer files are built in the package's transitioned
+          # (arm64) configuration, so preflight.sh is not under bazel-bin.
+          built_preflight="$(find -L src/bazel-out/ -mindepth 4 -maxdepth 4 \
+            -path '*/bin/mac/preflight.sh' -type f -print)"
+          test "$(printf '%s\n' "$built_preflight" | grep -c .)" -eq 1
+          cmp "$preinstall" "$built_preflight"
           if grep -F -q 'PKG is NOT INSTALLABLE' "$preinstall"; then
             echo "::error::The stage-1 non-installable preflight was packaged." >&2
             exit 1
