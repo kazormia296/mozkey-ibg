@@ -5239,7 +5239,7 @@ TEST_F(SessionTest, LiveConversionPreservesClientContext) {
   InitSessionToPrecomposition(&session);
 
   config::Config config;
-  config::ConfigHandler::GetDefaultConfig(&config);
+  GetSessionTestConfig(&config);
   config.set_use_live_conversion(false);
   config.set_use_zenz_live_correction(false);
   config.set_session_keymap(config::Config::MSIME);
@@ -26432,7 +26432,7 @@ TEST_F(SessionTest, ZenzNumericLiteralProtectionFollowsReading) {
     InitSessionToPrecomposition(&session);
 
     config::Config config;
-    config::ConfigHandler::GetDefaultConfig(&config);
+    GetSessionTestConfig(&config);
     config.set_use_live_conversion(false);
     config.set_live_conversion_min_key_length(1);
     config.set_use_zenz_live_correction(true);
@@ -26509,7 +26509,7 @@ TEST_F(SessionTest, ZenzMixedNumericIdenticalSurfacePreservesLiteralEdge) {
   InitSessionToPrecomposition(&session);
 
   config::Config config;
-  config::ConfigHandler::GetDefaultConfig(&config);
+  GetSessionTestConfig(&config);
   config.set_use_live_conversion(false);
   config.set_live_conversion_min_key_length(1);
   config.set_use_zenz_live_correction(true);
@@ -26614,7 +26614,7 @@ void ZenzNameProxySetupSession(
     const std::shared_ptr<MockConverter>& converter,
     commands::Command* command) {
   config::Config config;
-  config::ConfigHandler::GetDefaultConfig(&config);
+  GetSessionTestConfig(&config);
   config.set_use_live_conversion(false);
   config.set_live_conversion_delay_msec(0);
   config.set_live_conversion_min_key_length(2);

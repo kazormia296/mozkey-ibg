@@ -45,14 +45,17 @@ TEST(ZenzPromptBuilderCharacterizationTest,
 }
 
 TEST(ZenzPromptBuilderCharacterizationTest,
-     CurrentCrLfNormalizationProducesTwoSpaces) {
+     CrLfBecomesOneIdeographicSpace) {
+  // Mozkey IbG follows the reference Zenz tokenizer preparation (fork #37):
+  // CR becomes a space, LF is deleted, and the tokenizer whitespace pass
+  // maps ASCII space to U+3000.
   ZenzPromptOptions options;
   options.left_context = "left\r\nright";
 
   const ZenzPromptBuilder builder;
 
   EXPECT_EQ(
-      std::string(kZenzContextBegin) + "left  right" +
+      std::string(kZenzContextBegin) + "left\xE3\x80\x80right" +
           kZenzReadingBegin + "reading" +
           kZenzOutputBegin,
       builder.Build("reading", options));
@@ -80,7 +83,8 @@ TEST(ZenzPromptBuilderCharacterizationTest,
 }
 
 TEST(ZenzPromptBuilderCharacterizationTest,
-     CurrentUnsafeControlHandlingPreservesWhitespaceAsSpaces) {
+     UnsafeControlHandlingMapsSeparatorsToIdeographicSpace) {
+  // Tab and CR become U+3000, LF is deleted, other controls are dropped.
   ZenzPromptOptions options;
   options.left_context =
       std::string("a\tb\nc\rd") +
@@ -92,7 +96,7 @@ TEST(ZenzPromptBuilderCharacterizationTest,
   const ZenzPromptBuilder builder;
 
   EXPECT_EQ(
-      std::string(kZenzContextBegin) + "a b c def" +
+      std::string(kZenzContextBegin) + "a\xE3\x80\x80" "bc\xE3\x80\x80" "def" +
           kZenzReadingBegin + "reading" +
           kZenzOutputBegin,
       builder.Build("reading", options));

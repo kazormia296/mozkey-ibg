@@ -943,8 +943,8 @@ bool EngineConverter::SwitchKanaType(const composer::Composer& composer) {
               .SetComposer(composer)
               .SetRequestView(*request_)
               .SetConfigView(*config_)
-              .SetRequestType(ConversionRequest::CONVERSION)
               .SetProjectDictionary(PinnedProjectDictionary())
+              .SetRequestType(ConversionRequest::CONVERSION)
               .Build();
       if (!converter_->ResizeSegments(&segments_, conversion_request, 0,
                                       {offset})) {
@@ -2209,8 +2209,8 @@ void EngineConverter::ResizeSegmentWidth(const composer::Composer& composer,
           .SetComposer(composer)
           .SetRequestView(*request_)
           .SetConfigView(*config_)
-          .SetRequestType(ConversionRequest::CONVERSION)
           .SetProjectDictionary(PinnedProjectDictionary())
+          .SetRequestType(ConversionRequest::CONVERSION)
           .Build();
   const Segment& segment = segments_.conversion_segment(segment_index_);
   const converter::Candidate& candidate = GetSelectedCandidate(segment_index_);
@@ -2789,8 +2789,8 @@ bool EngineConverter::ApplySegmentation(
           .SetComposer(composer)
           .SetRequestView(*request_)
           .SetConfigView(*config_)
-          .SetRequestType(ConversionRequest::CONVERSION)
           .SetProjectDictionary(PinnedProjectDictionary())
+          .SetRequestType(ConversionRequest::CONVERSION)
           .Build();
 
   Segments resized_segments = segments_;
