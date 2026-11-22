@@ -324,6 +324,18 @@ jobs:
           set -euo pipefail
           PACKAGE_FILES="$GITHUB_WORKSPACE/src/bazel-bin/mac/package_files.zip"
           test -s "$PACKAGE_FILES"
+          # build_package.py --oss derives the installer version from the
+          # same mozc_version.txt that the unsigned package used.
+          release_flags="--macos_cpus=arm64 --config release_build --define=mozkey_dictionary_profile=release-approved-only --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1"
+          (cd src && bazelisk build $release_flags //base:mozc_version_txt)
+          built_version_file="$(cd src && bazelisk cquery $release_flags --output=files //base:mozc_version_txt)"
+          if [ ! -s "src/$built_version_file" ]; then
+            echo "::error::Bazel did not produce base/mozc_version.txt at src/$built_version_file." >&2
+            exit 1
+          fi
+          MOZKEY_VERSION_FILE="$RUNNER_TEMP/mozkey-mozc_version.txt"
+          cp "src/$built_version_file" "$MOZKEY_VERSION_FILE"
+          printf 'MOZKEY_VERSION_FILE=%s\n' "$MOZKEY_VERSION_FILE" >> "$GITHUB_ENV"
           SIGNING_TREE="$RUNNER_TEMP/mozkey-signing-tree"
           SIGNED_PACKAGE_FILES="$RUNNER_TEMP/mozkey-signed-package-files.zip"
           mkdir "$SIGNING_TREE"
@@ -442,6 +454,13 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="$GITHUB_WORKSPACE/src"
+          python3 - "$MOZKEY_VERSION_FILE" "$RELEASE_VERSION" <<'PY'
+          import sys
+          from build_tools import mozc_version
+          built = mozc_version.MozcVersion(sys.argv[1]).GetMozkeyReleaseVersionString()
+          if built != sys.argv[2]:
+              raise SystemExit(f"mozc_version.txt names {built}, release is {sys.argv[2]}")
+          PY
           python3 - <<'PY'
           import os
           from mac import tweak_installer_files
@@ -460,6 +479,7 @@ jobs:
           PKG_PATH="$GITHUB_WORKSPACE/MozkeyIbG_v${RELEASE_VERSION}_macos_arm64.pkg"
           python3 src/mac/build_package.py \
             --oss \
+            --version_file "$MOZKEY_VERSION_FILE" \
             --input "$SIGNED_PACKAGE_FILES" \
             --output "$PKG_PATH" \
             --codesign_identity "$INSTALLER_SIGN_IDENTITY" \

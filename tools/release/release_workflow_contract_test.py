@@ -491,6 +491,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             workflow,
             r"python3 src/mac/build_package\.py \\\n\s+--oss \\",
         )
+        self.assertIn('--version_file "$MOZKEY_VERSION_FILE"', workflow)
         self.assertIn("xcrun notarytool submit", workflow)
         self.assertIn("xcrun stapler staple", workflow)
         self.assertIn("spctl --assess --type install", workflow)
