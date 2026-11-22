@@ -287,26 +287,21 @@ jobs:
           expanded="$RUNNER_TEMP/mozkey-ibg-zenz-package-verify/expanded"
           preinstall="$(find "$expanded" -type f -name preinstall -print)"
           test "$(printf '%s\n' "$preinstall" | grep -c .)" -eq 1
-          # The installer files are built in the package's transitioned
-          # (arm64) configuration, so preflight.sh is not under bazel-bin.
-          # More than one configuration may build it; every copy must be the
-          # file that was packaged.  This step runs under macOS /bin/bash 3.2,
-          # so it avoids mapfile and arrays.
-          built_preflights="$(find -L src/bazel-out/ -mindepth 4 -maxdepth 4 \
-            -path '*/bin/mac/preflight.sh' -type f -print | sort)"
-          printf 'built preflight: %s\n' "$built_preflights"
-          if [ -z "$built_preflights" ]; then
-            echo "::error::No built mac/preflight.sh was found under bazel-out." >&2
+          # Build the preflight genrule with the package's flags and ask Bazel
+          # where it is: the package's own copy lives in a transitioned
+          # configuration whose output path is not stable to guess.
+          release_flags="--macos_cpus=arm64 --config release_build --define=mozkey_dictionary_profile=release-approved-only --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1"
+          (cd src && bazelisk build $release_flags //mac:tweak_preflight)
+          built_preflight="$(cd src && bazelisk cquery $release_flags --output=files //mac:tweak_preflight)"
+          echo "built preflight: src/$built_preflight"
+          if [ ! -f "src/$built_preflight" ]; then
+            echo "::error::Bazel did not produce mac/preflight.sh at src/$built_preflight." >&2
             exit 1
           fi
-          while IFS= read -r built_preflight; do
-            if ! cmp "$preinstall" "$built_preflight"; then
-              echo "::error::The packaged preinstall differs from $built_preflight." >&2
-              exit 1
-            fi
-          done <<EOF_PREFLIGHTS
-          $built_preflights
-          EOF_PREFLIGHTS
+          if ! cmp "$preinstall" "src/$built_preflight"; then
+            echo "::error::The packaged preinstall differs from the built mac/preflight.sh." >&2
+            exit 1
+          fi
           if grep -F -q 'PKG is NOT INSTALLABLE' "$preinstall"; then
             echo "::error::The stage-1 non-installable preflight was packaged." >&2
             exit 1
