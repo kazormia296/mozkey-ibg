@@ -287,21 +287,7 @@ jobs:
           expanded="$RUNNER_TEMP/mozkey-ibg-zenz-package-verify/expanded"
           preinstall="$(find "$expanded" -type f -name preinstall -print)"
           test "$(printf '%s\n' "$preinstall" | grep -c .)" -eq 1
-          # Build the preflight genrule with the package's flags and ask Bazel
-          # where it is: the package's own copy lives in a transitioned
-          # configuration whose output path is not stable to guess.
-          release_flags="--macos_cpus=arm64 --config release_build --define=mozkey_dictionary_profile=release-approved-only --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1"
-          (cd src && bazelisk build $release_flags //mac:tweak_preflight)
-          built_preflight="$(cd src && bazelisk cquery $release_flags --output=files //mac:tweak_preflight)"
-          echo "built preflight: src/$built_preflight"
-          if [ ! -f "src/$built_preflight" ]; then
-            echo "::error::Bazel did not produce mac/preflight.sh at src/$built_preflight." >&2
-            exit 1
-          fi
-          if ! cmp "$preinstall" "src/$built_preflight"; then
-            echo "::error::The packaged preinstall differs from the built mac/preflight.sh." >&2
-            exit 1
-          fi
+          # The guarantees are checked on the shipped file first.
           if grep -F -q 'PKG is NOT INSTALLABLE' "$preinstall"; then
             echo "::error::The stage-1 non-installable preflight was packaged." >&2
             exit 1
@@ -312,6 +298,24 @@ jobs:
           fi
           if ! grep -F -q "io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput" "$preinstall"; then
             echo "::error::The packaged preinstall does not name the Mozkey IbG package." >&2
+            exit 1
+          fi
+          # Then confirm it is exactly what the build produces.  Build the
+          # preflight genrule with the package's flags and ask Bazel where it
+          # is: the package's own copy lives in a transitioned configuration
+          # whose output path is not stable to guess.  The genrule depends
+          # only on the TARGET and MOZKEY_INSTALLABLE defines.
+          release_flags="--macos_cpus=arm64 --config release_build --define=mozkey_dictionary_profile=release-approved-only --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1"
+          (cd src && bazelisk build $release_flags //mac:tweak_preflight)
+          built_preflight="$(cd src && bazelisk cquery $release_flags --output=files //mac:tweak_preflight)"
+          echo "built preflight: src/$built_preflight"
+          if [ ! -f "src/$built_preflight" ]; then
+            echo "::error::Bazel did not produce mac/preflight.sh at src/$built_preflight." >&2
+            exit 1
+          fi
+          if ! cmp "$preinstall" "src/$built_preflight"; then
+            diff -u "src/$built_preflight" "$preinstall" | head -40 || true
+            echo "::error::The packaged preinstall differs from the built mac/preflight.sh." >&2
             exit 1
           fi
 
