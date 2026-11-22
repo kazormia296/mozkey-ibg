@@ -577,6 +577,21 @@ jobs:
         run: |
           python3 build_tools/update_deps.py
 
+      - name: TEMPORARY probe of the release preflight lookup (do not merge)
+        run: |
+          set -euo pipefail
+          release_flags="--macos_cpus=arm64 --config release_build --define=mozkey_dictionary_profile=release-approved-only --define=macos_zenz_runtime=1 --define=MOZKEY_INSTALLABLE=1"
+          (cd src && bazelisk build $release_flags //mac:tweak_preflight)
+          built_preflight="$(cd src && bazelisk cquery $release_flags --output=files //mac:tweak_preflight)"
+          echo "built preflight: src/$built_preflight"
+          ls -l "src/$built_preflight"
+          shasum -a 256 "src/$built_preflight"
+          echo "bash: $BASH_VERSION"
+          echo "stage1: $(grep -F -c 'PKG is NOT INSTALLABLE' "src/$built_preflight" || true)"
+          echo "placeholder: $(grep -F -c '@@@MOZKEY_INSTALL_VERSION@@@' "src/$built_preflight" || true)"
+          echo "pkg id: $(grep -F -c 'io.github.kazormia296.mozkey-ibg.pkg.JapaneseInput' "src/$built_preflight" || true)"
+          grep -n "_mozkey_target=" "src/$built_preflight"
+
       - name: bazel test
         working-directory: ./src
         run: |
